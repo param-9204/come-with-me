@@ -127,7 +127,8 @@ export class DbService {
     transcript: string,
     placeIds: string[],
     sourceUrl: string,
-    userId?: string
+    userId?: string,
+    socialPostId?: string
   ): Promise<string | null> {
     console.log(`[DB] Saving full social post for ${content.platform}/${content.contentId}...`);
 
@@ -232,13 +233,60 @@ export class DbService {
       ai_analysis: aiAnalysis || null,
     };
 
-    const { data, error } = await supabaseAdmin
-      .from('social_posts')
-      .upsert(payload, { onConflict: 'platform, content_id' })
+    const finalPayload = {
+      ...payload,
+      status: 'completed',
+      error_message: null
+    };
+
+    let query;
+    if (socialPostId) {
+      query = supabaseAdmin
+        .from('social_posts')
+        .update(finalPayload)
+        .eq('id', socialPostId);
+    } else {
+      query = supabaseAdmin
+        .from('social_posts')
+        .upsert(finalPayload, { onConflict: 'platform, content_id' });
+    }
+
+    const { data, error } = await query
       .select('id')
       .single();
 
     if (error) {
+      // Handle unique constraint duplicate violation by updating canonical row and resolving placeholder
+      if (error.code === '23505' && socialPostId) {
+        console.log(`[DB] Social post already exists. Merging payload into existing post...`);
+        const { data: existingPost } = await supabaseAdmin
+          .from('social_posts')
+          .select('id')
+          .eq('platform', payload.platform)
+          .eq('content_id', payload.content_id)
+          .single();
+
+        if (existingPost) {
+          // Update the existing canonical post
+          await supabaseAdmin
+            .from('social_posts')
+            .update(finalPayload)
+            .eq('id', existingPost.id);
+
+          // Update the placeholder row to completed so the client gets status success
+          await supabaseAdmin
+            .from('social_posts')
+            .update({
+              status: 'completed',
+              ai_analysis: aiAnalysis,
+              whisper_transcript: transcript || null,
+            })
+            .eq('id', socialPostId);
+
+          return existingPost.id;
+        }
+      }
+
       console.error('[DB] Social post upsert error:', error);
       throw new Error(`Failed to save social post: ${error.message}`);
     }

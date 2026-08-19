@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS public.social_posts (
   target_audience text,
   call_to_actions text[],
   post_url text,
+  status text DEFAULT 'pending',
+  error_message text,
   UNIQUE(platform, content_id)
 );
 

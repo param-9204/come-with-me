@@ -1,14 +1,18 @@
 import { NextResponse } from 'next/server';
-import * as nextServer from 'next/server';
+import { supabaseAdmin } from '@/lib/supabase';
+import { v4 as uuidv4 } from 'uuid';
 
-// Resolve waitUntil safely without triggering TypeScript or Turbopack module resolution warnings
-const waitUntil = (nextServer as any).waitUntil || ((promise: Promise<any>) => {
-  promise.catch((err) => console.error('[Background Pipeline] Uncaught error:', err));
-});
+export const maxDuration = 60; // Allow Vercel function to run up to 60 seconds (requires Pro tier or compatible runtime)
 
-async function runBackgroundPipeline(origin: string, url: string, userId?: string) {
-  console.log(`[Background Pipeline] Starting process-url for: ${url} (origin: ${origin})`);
+async function runSynchronousPipeline(origin: string, url: string, socialPostId: string, userId?: string): Promise<string> {
+  console.log(`[Synchronous Pipeline] Starting process-url for: ${url} (origin: ${origin})`);
   try {
+    // Update status to scraping
+    await supabaseAdmin
+      .from('social_posts')
+      .update({ status: 'scraping' })
+      .eq('id', socialPostId);
+
     // 1. Initiate Scrape
     const initRes = await fetch(`${origin}/api/process-url/scrape/initiate`, {
       method: 'POST',
@@ -51,6 +55,12 @@ async function runBackgroundPipeline(origin: string, url: string, userId?: strin
       throw new Error('No content returned from scraper');
     }
 
+    // Update status to processing
+    await supabaseAdmin
+      .from('social_posts')
+      .update({ status: 'processing' })
+      .eq('id', socialPostId);
+
     const isVideo =
       !!contentData.videoUrl &&
       (contentData.contentType === 'video' ||
@@ -60,7 +70,7 @@ async function runBackgroundPipeline(origin: string, url: string, userId?: strin
     let audioUploadObj: any = null;
     let ocrResultsList: any[] = [];
 
-    // 2. Transcribe (if video)
+    // 2. Transcribe (if video) and OCR in parallel
     const transcriptionPromise = (async () => {
       if (isVideo) {
         try {
@@ -75,12 +85,11 @@ async function runBackgroundPipeline(origin: string, url: string, userId?: strin
             audioUploadObj = transcribeData.audioUpload;
           }
         } catch (err: any) {
-          console.warn('[Background Pipeline] Transcription failed, proceeding:', err.message);
+          console.warn('[Synchronous Pipeline] Transcription failed, proceeding:', err.message);
         }
       }
     })();
 
-    // 3. OCR Promise
     const ocrPromise = (async () => {
       if (isVideo) {
         const duration = contentData.videoDuration || 15;
@@ -152,7 +161,6 @@ async function runBackgroundPipeline(origin: string, url: string, userId?: strin
       }
     })();
 
-    // Run transcribe and OCR in parallel
     await Promise.all([transcriptionPromise, ocrPromise]);
 
     // 4. Final synthesis and analysis
@@ -167,6 +175,7 @@ async function runBackgroundPipeline(origin: string, url: string, userId?: strin
         url,
         audioUploadId: audioUploadObj?.id,
         userId: userId || null,
+        socialPostId: socialPostId
       }),
     });
 
@@ -175,9 +184,22 @@ async function runBackgroundPipeline(origin: string, url: string, userId?: strin
       throw new Error(analyzeData.error || 'Failed to complete analysis');
     }
 
-    console.log(`[Background Pipeline] Finished processing successfully for: ${url}`);
+    console.log(`[Synchronous Pipeline] Finished processing successfully for: ${url}`);
+    return analyzeData.socialPostId || socialPostId;
   } catch (err: any) {
-    console.error(`[Background Pipeline] Error processing: ${url}`, err.message);
+    console.error(`[Synchronous Pipeline] Error processing: ${url}`, err.message);
+    try {
+      await supabaseAdmin
+        .from('social_posts')
+        .update({
+          status: 'failed',
+          error_message: err.message || 'Unknown processing error'
+        })
+        .eq('id', socialPostId);
+    } catch (dbErr) {
+      console.error('[Synchronous Pipeline] Failed to log failure state to DB:', dbErr);
+    }
+    throw err;
   }
 }
 
@@ -189,21 +211,82 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'URL is required' }, { status: 400 });
     }
 
+    // Clean URL (strip query parameters)
+    let cleanUrl = url;
+    try {
+      const parsedUrl = new URL(url);
+      cleanUrl = `${parsedUrl.origin}${parsedUrl.pathname}`;
+    } catch (_) {}
+
     let origin = new URL(request.url).origin;
-    // Force HTTP on localhost (since Next.js dev server only listens on HTTP)
     if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
       origin = origin.replace('https://', 'http://');
     }
 
-    // Run the pipeline asynchronously in the background
-    waitUntil(runBackgroundPipeline(origin, url, userId));
+    // Check if the URL has already been processed and is complete
+    const { data: existingPost } = await supabaseAdmin
+      .from('social_posts')
+      .select('*')
+      .eq('post_url', cleanUrl)
+      .maybeSingle();
+
+    if (existingPost && existingPost.status === 'completed') {
+      return NextResponse.json({
+        success: true,
+        socialPostId: existingPost.id,
+        data: existingPost
+      });
+    }
+
+    // Setup temporary placeholder
+    const platform = cleanUrl.includes('tiktok.com') ? 'tiktok' : 'instagram';
+    const tempContentId = `pending_${uuidv4()}`;
+
+    // Get placeholder ID to track database execution
+    let socialPostId = existingPost?.id;
+    if (!socialPostId) {
+      const { data: socialPost, error: dbError } = await supabaseAdmin
+        .from('social_posts')
+        .insert({
+          post_url: cleanUrl,
+          status: 'pending',
+          platform,
+          content_id: tempContentId,
+          user_id: userId || null
+        })
+        .select('id')
+        .single();
+
+      if (dbError || !socialPost) {
+        throw new Error(`Failed to create database placeholder: ${dbError?.message}`);
+      }
+      socialPostId = socialPost.id;
+    }
+
+    // Execute the pipeline synchronously and await completion
+    const finalPostId = await runSynchronousPipeline(origin, cleanUrl, socialPostId, userId);
+
+    // Fetch and return the completed social post record
+    const { data: completedPost, error: fetchErr } = await supabaseAdmin
+      .from('social_posts')
+      .select('*')
+      .eq('id', finalPostId)
+      .single();
+
+    if (fetchErr || !completedPost) {
+      throw new Error(`Failed to fetch completed post: ${fetchErr?.message}`);
+    }
 
     return NextResponse.json({
       success: true,
-      message: 'Processing started in the background.'
+      socialPostId: completedPost.id,
+      data: completedPost
     });
   } catch (error: any) {
     console.error('[Process URL API] Error:', error);
-    return NextResponse.json({ error: error.message || 'Internal server error' }, { status: 500 });
+    return NextResponse.json({
+      success: false,
+      error: error.message || 'Processing failed'
+    }, { status: 500 });
   }
 }

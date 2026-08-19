@@ -20,6 +20,7 @@ export async function POST(request: Request) {
       url,
       userId,
       audioUploadId,
+      socialPostId: inputSocialPostId,
     } = body;
 
     const finalUserId = userId || resolvedUserId;
@@ -77,7 +78,8 @@ export async function POST(request: Request) {
         transcript || '',
         placeIds,
         url,
-        finalUserId
+        finalUserId,
+        inputSocialPostId
       );
     } catch (dbErr: any) {
       console.error('[API Analyze] Error saving social post to DB:', dbErr.message);
