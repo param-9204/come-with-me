@@ -185,6 +185,8 @@ CREATE TABLE IF NOT EXISTS public.waitlist (
 CREATE TABLE IF NOT EXISTS public.cities (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   name text NOT null UNIQUE,
+  latitude double precision,
+  longitude double precision,
   created_at timestamptz DEFAULT now()
 );
 

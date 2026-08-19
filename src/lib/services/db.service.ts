@@ -34,7 +34,7 @@ export class DbService {
     let neighborhood = placeData.neighborhood;
     let address = placeData.address;
 
-    const coords = await LocationService.geocodePlace(placeData.name, placeData.city || 'New York', placeData.address);
+    const coords = await LocationService.geocodePlace(placeData.name, placeData.city || '', placeData.address);
     lat = coords.lat;
     lng = coords.lng;
     if (coords.formattedAddress && !address) {
@@ -46,12 +46,28 @@ export class DbService {
     }
 
     // Ensure the city is recorded in our cities table
-    const cityName = (placeData.city || 'New York').trim();
+    const cityName = (placeData.city || '').trim();
     if (cityName) {
       try {
+        let cityLat: number | null = null;
+        let cityLng: number | null = null;
+        try {
+          const cityCoords = await LocationService.geocodePlace('', cityName);
+          if (cityCoords.lat && cityCoords.lng) {
+            cityLat = cityCoords.lat;
+            cityLng = cityCoords.lng;
+          }
+        } catch (geoErr) {
+          console.warn('[DB] Failed to geocode city center coordinates:', geoErr);
+        }
+
         await supabaseAdmin
           .from('cities')
-          .upsert({ name: cityName }, { onConflict: 'name' });
+          .upsert({ 
+            name: cityName,
+            latitude: cityLat,
+            longitude: cityLng
+          }, { onConflict: 'name' });
       } catch (err) {
         console.error('[DB] Failed to upsert city:', err);
       }
@@ -62,7 +78,7 @@ export class DbService {
       .from('places')
       .select('id')
       .ilike('name', placeData.name.trim())
-      .ilike('city', (placeData.city || 'New York').trim())
+      .ilike('city', (placeData.city || '').trim())
       .maybeSingle();
 
     if (existing) {
@@ -75,7 +91,7 @@ export class DbService {
       .insert({
         name: placeData.name.trim(),
         address: address || '',
-        city: placeData.city || 'New York',
+        city: placeData.city || '',
         neighborhood,
         category: placeData.category || 'Restaurants',
         description: placeData.description || '',

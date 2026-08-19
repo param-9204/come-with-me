@@ -40,7 +40,7 @@ Determine a highly precise, hyper-specific category for each place by analyzing 
 4. ATTRIBUTES:
    - category: Use the dynamic category derived using the DYNAMIC CATEGORIZATION GUIDE above.
    - confidence: 0.0 to 1.0 (1.0 = explicit, 0.5 = handle inference).
-   - city: Best guess (e.g. from context or handle suffix). Default to "New York" if unclear. Do NOT default if evidence points elsewhere.
+   - city: Best guess (e.g. from context or handle suffix). Leave blank/null if unclear. Do NOT guess or default.
    - neighborhood & address: Extract ONLY if explicitly supported by inputs. Do not guess/hallucinate.
    - creator_handle: Prefix with @. Use the post author's username, NOT the venue's handle.
 5. PLACE VS CITY/FOOD:
@@ -88,7 +88,7 @@ Determine a highly precise, hyper-specific category for each place by analyzing 
 6. OCR NOISE: Ignore technical metadata, HTML tags, scripts, base64 strings, or single-character noise. Synthesize text fragments across frames.
 7. SOCIAL HANDLE INFERENCE: If a venue is referenced only as a handle (e.g. @tashca.nyc, @carbone_la), extract it as the venue (e.g. "Tashca", "Carbone") and map the suffix to the city (.nyc -> New York, .la -> Los Angeles, .miami -> Miami, .chi -> Chicago, .sf -> San Francisco, .dc -> Washington DC, .nola -> New Orleans, .atx -> Austin, .london/.uk -> London, .delhi -> Delhi, .bom/.mumbai -> Mumbai, .blr -> Bengaluru). Inferred places have confidence = 0.5.
 8. CREATOR & METRICS: Calculate engagement_rate = ((likes + comments) / views) * 100 if those metrics are valid. If likesCount is -1, likes = null. paidPartnership status is authoritative. creator_handle must map to the author's username (prefixed with @), NOT a venue handle.
-9. CITY RESOLUTION: Determine city using address, audio, OCR, metadata, caption, or handle suffix. Default to "New York" if it cannot be determined.
+9. CITY RESOLUTION: Determine city using address, audio, OCR, metadata, caption, or handle suffix. Leave blank/null if it cannot be determined.
 10. NO HALLUCINATION: Never fabricate details. Use null for unavailable optional scalars, [] for arrays, and "" for empty strings.
 11. DEDUPLICATION: Merge identical places into one, but keep different branches of the same business separate.
  

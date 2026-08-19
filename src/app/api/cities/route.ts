@@ -28,7 +28,7 @@ export async function GET(request: Request) {
     // ── Build query ─────────────────────────────────────────────────
     let query = supabaseAdmin
       .from('cities')
-      .select('id, name, created_at', { count: 'exact' })
+      .select('id, name, latitude, longitude, created_at', { count: 'exact' })
       .order('name', { ascending })
       .range(offset, offset + limit - 1);
 
@@ -43,7 +43,13 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
-    const cities = (data ?? []).map((item: any) => item.name);
+    const cities = (data ?? []).map((item: any) => ({
+      id: item.id,
+      name: item.name,
+      latitude: item.latitude,
+      longitude: item.longitude,
+      created_at: item.created_at,
+    }));
     const totalItems = count ?? 0;
     const totalPages = Math.ceil(totalItems / limit);
 
