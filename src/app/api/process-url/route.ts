@@ -131,8 +131,8 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
           contentData.images && contentData.images.length > 0
             ? contentData.images
             : [contentData.displayUrl || contentData.videoUrl].filter(
-                Boolean
-              ) as string[];
+              Boolean
+            ) as string[];
 
         if (imageUrls.length > 0) {
           const ocrPromises = imageUrls.map(async (imageUrl: string, index: number) => {
@@ -216,25 +216,58 @@ export async function POST(request: Request) {
     try {
       const parsedUrl = new URL(url);
       cleanUrl = `${parsedUrl.origin}${parsedUrl.pathname}`;
-    } catch (_) {}
+    } catch (_) { }
 
     let origin = new URL(request.url).origin;
     if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
       origin = origin.replace('https://', 'http://');
     }
 
+    const cleanUrlNoSlash = cleanUrl.endsWith('/') ? cleanUrl.slice(0, -1) : cleanUrl;
+    const cleanUrlWithSlash = cleanUrlNoSlash + '/';
+
     // Check if the URL has already been processed and is complete
-    const { data: existingPost } = await supabaseAdmin
+    const { data: existingPosts } = await supabaseAdmin
       .from('social_posts')
       .select('*')
-      .eq('post_url', cleanUrl)
-      .maybeSingle();
+      .in('post_url', [cleanUrlNoSlash, cleanUrlWithSlash])
+      .order('created_at', { ascending: false });
+
+    const foundCompletedPost = existingPosts?.find(p => p.status === 'completed');
+    const existingPost = foundCompletedPost || (existingPosts && existingPosts.length > 0 ? existingPosts[0] : null);
 
     if (existingPost && existingPost.status === 'completed') {
+      let places: any[] = [];
+      if (existingPost.place_id) {
+        const { data: primaryData } = await supabaseAdmin
+          .from('places')
+          .select('*')
+          .eq('id', existingPost.place_id)
+          .maybeSingle();
+        if (primaryData) {
+          places.push(primaryData);
+        }
+      }
+
+      if (existingPost.post_url) {
+        const { data: secondaryData } = await supabaseAdmin
+          .from('places')
+          .select('*')
+          .eq('source_url', existingPost.post_url);
+        if (secondaryData) {
+          for (const p of secondaryData) {
+            if (!places.some(x => x.id === p.id)) {
+              places.push(p);
+            }
+          }
+        }
+      }
+
       return NextResponse.json({
         success: true,
         socialPostId: existingPost.id,
-        data: existingPost
+        data: existingPost,
+        places
       });
     }
 
@@ -277,10 +310,37 @@ export async function POST(request: Request) {
       throw new Error(`Failed to fetch completed post: ${fetchErr?.message}`);
     }
 
+    let places: any[] = [];
+    if (completedPost.place_id) {
+      const { data: primaryData } = await supabaseAdmin
+        .from('places')
+        .select('*')
+        .eq('id', completedPost.place_id)
+        .maybeSingle();
+      if (primaryData) {
+        places.push(primaryData);
+      }
+    }
+
+    if (completedPost.post_url) {
+      const { data: secondaryData } = await supabaseAdmin
+        .from('places')
+        .select('*')
+        .eq('source_url', completedPost.post_url);
+      if (secondaryData) {
+        for (const p of secondaryData) {
+          if (!places.some(x => x.id === p.id)) {
+            places.push(p);
+          }
+        }
+      }
+    }
+
     return NextResponse.json({
       success: true,
       socialPostId: completedPost.id,
-      data: completedPost
+      data: completedPost,
+      places
     });
   } catch (error: any) {
     console.error('[Process URL API] Error:', error);
@@ -288,5 +348,80 @@ export async function POST(request: Request) {
       success: false,
       error: error.message || 'Processing failed'
     }, { status: 500 });
+  }
+}
+
+export async function GET(request: Request) {
+  try {
+    const { searchParams } = new URL(request.url);
+    const id = searchParams.get('id');
+    const url = searchParams.get('url');
+
+    if (!id && !url) {
+      return NextResponse.json({ error: 'id or url is required' }, { status: 400 });
+    }
+
+    let query = supabaseAdmin.from('social_posts').select('*');
+
+    if (id) {
+      query = query.eq('id', id);
+    } else if (url) {
+      let cleanUrl = url;
+      try {
+        const parsed = new URL(url);
+        cleanUrl = `${parsed.origin}${parsed.pathname}`;
+      } catch (_) { }
+      const cleanUrlNoSlash = cleanUrl.endsWith('/') ? cleanUrl.slice(0, -1) : cleanUrl;
+      const cleanUrlWithSlash = cleanUrlNoSlash + '/';
+      query = query.in('post_url', [cleanUrlNoSlash, cleanUrlWithSlash]);
+    }
+
+    const { data: posts, error } = await query.order('created_at', { ascending: false });
+
+    if (error) {
+      return NextResponse.json({ error: error.message }, { status: 500 });
+    }
+
+    if (!posts || posts.length === 0) {
+      return NextResponse.json({ success: false, error: 'Post not found' }, { status: 404 });
+    }
+
+    const post = posts.find(p => p.status === 'completed') || posts[0];
+
+    // Fetch all places linked to this post (primary place_id + secondary post_url matches)
+    let places: any[] = [];
+    if (post.place_id) {
+      const { data: primaryData } = await supabaseAdmin
+        .from('places')
+        .select('*')
+        .eq('id', post.place_id)
+        .maybeSingle();
+      if (primaryData) {
+        places.push(primaryData);
+      }
+    }
+
+    if (post.post_url) {
+      const { data: secondaryData } = await supabaseAdmin
+        .from('places')
+        .select('*')
+        .eq('source_url', post.post_url);
+      if (secondaryData) {
+        for (const p of secondaryData) {
+          if (!places.some(x => x.id === p.id)) {
+            places.push(p);
+          }
+        }
+      }
+    }
+
+    return NextResponse.json({
+      success: true,
+      status: post.status,
+      data: post,
+      places
+    });
+  } catch (error: any) {
+    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   }
 }

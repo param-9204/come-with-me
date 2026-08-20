@@ -391,6 +391,7 @@ export interface PlaceExtraction {
   description: string;
   creator_handle: string;
   confidence: number;
+  social_post_id?: string;
 }
 
 // Legacy compat

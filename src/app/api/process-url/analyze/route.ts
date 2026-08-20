@@ -35,35 +35,44 @@ export async function POST(request: Request) {
     const gptAggregated = GptVisionOcrService.aggregateResults([]);
     const apifyAllTexts = ApifyOcrService.deduplicateAcrossFrames(apifyOcrFrames);
 
-    // 2. Run OpenAI 32-Section AI analysis and Place Extraction in parallel
-    const [aiAnalysis, placeAnalysis] = await Promise.all([
-      AiEnrichmentService.analyzeContent(
-        content,
-        rawApifyData,
-        transcript || '',
-        gptAggregated.allTexts,
-        apifyAllTexts
-      ),
-      AiEnrichmentService.extractPlace(
-        content,
-        transcript || '',
-        [...gptAggregated.allTexts, ...apifyAllTexts]
-      )
-    ]);
+    // 2. Run OpenAI consolidated AI analysis (32-Section & Place Extraction in one call)
+    const enrichmentResult = await AiEnrichmentService.analyzeContent(
+      content,
+      rawApifyData,
+      transcript || '',
+      gptAggregated.allTexts,
+      apifyAllTexts
+    );
 
-    // 4. Save places to DB
+    const aiAnalysis = enrichmentResult?.analysis || null;
+    const placeAnalysis = enrichmentResult?.places || [];
+
+    // 4. Save places to DB (Parallelized geocoding & saving)
     let placeIds: string[] = [];
     if (placeAnalysis && placeAnalysis.length > 0) {
-      for (const place of placeAnalysis) {
-        if (place.name) {
-          try {
-            const id = await DbService.savePlace(place, url, content.platform, transcript || '', finalUserId);
-            if (id) placeIds.push(id);
-          } catch (placeErr: any) {
-            console.error('[API Analyze] Error saving individual place:', place.name, placeErr.message);
-          }
+      // In-memory deduplication by name and city
+      const seenPlaces = new Set<string>();
+      const uniquePlaces = placeAnalysis.filter((place) => {
+        if (!place.name) return false;
+        const key = `${place.name.toLowerCase().trim()}_${(place.city || '').toLowerCase().trim()}`;
+        if (seenPlaces.has(key)) {
+          console.log(`[API Analyze] Skipping duplicate place extraction in-memory: "${place.name}" in "${place.city}"`);
+          return false;
         }
-      }
+        seenPlaces.add(key);
+        return true;
+      });
+
+      const savePlacePromises = uniquePlaces.map(async (place) => {
+        try {
+          return await DbService.savePlace(place, url, content.platform, transcript || '', finalUserId, inputSocialPostId);
+        } catch (placeErr: any) {
+          console.error('[API Analyze] Error saving individual place:', place.name, placeErr.message);
+          return null;
+        }
+      });
+      const resolvedIds = await Promise.all(savePlacePromises);
+      placeIds = resolvedIds.filter(Boolean) as string[];
     }
 
     // 5. Save full social post record to DB

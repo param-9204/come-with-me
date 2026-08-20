@@ -30,10 +30,11 @@ export async function GET(request: Request) {
     const ascending = (searchParams.get('sort_order') ?? 'desc') === 'asc';
 
     // ── Filters ─────────────────────────────────────────────────────
-    const search    = searchParams.get('search')?.trim()   ?? '';
-    const category  = searchParams.get('category')?.trim() ?? '';
-    const city      = searchParams.get('city')?.trim()     ?? '';
-    const myPlaces  = searchParams.get('my_places') === 'true';
+    const search       = searchParams.get('search')?.trim()   ?? '';
+    const category     = searchParams.get('category')?.trim() ?? '';
+    const city         = searchParams.get('city')?.trim()     ?? '';
+    const socialPostId = searchParams.get('social_post_id')?.trim() ?? '';
+    const myPlaces     = searchParams.get('my_places') === 'true';
 
     // ── Build query ─────────────────────────────────────────────────
     let query = supabaseAdmin
@@ -48,8 +49,9 @@ export async function GET(request: Request) {
       );
     }
 
-    if (category) query = query.ilike('category', category);
-    if (city)     query = query.ilike('city', `%${city}%`);
+    if (category)     query = query.ilike('category', category);
+    if (city)         query = query.ilike('city', `%${city}%`);
+    if (socialPostId) query = query.eq('social_post_id', socialPostId);
 
     if (myPlaces) {
       const user = await getAuthUser(request);

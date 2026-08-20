@@ -6,9 +6,6 @@ export class ScraperService {
     return new ApifyClient({ token: process.env.APIFY_API_TOKEN });
   }
 
-  // ──────────────────────────────────────────────────────────────────
-  // TikTok — clockworks/tiktok-scraper
-  // ──────────────────────────────────────────────────────────────────
   static normalizeTikTokRaw(raw: ApifyTikTokPost): { normalized: SocialContent; raw: ApifyTikTokPost } {
     // Try to extract image URLs from various possible fields for slideshow/photo-mode posts
     let images: string[] = [];
@@ -80,21 +77,6 @@ export class ScraperService {
     return { normalized, raw };
   }
 
-
-
-  // ──────────────────────────────────────────────────────────────────
-  // Instagram — apify/instagram-scraper
-  // ──────────────────────────────────────────────────────────────────
-
-  /**
-   * Normalize an Instagram URL to match Apify's strict pattern:
-   *   ^(https://)?(www\.)?instagram\.com/[A-Za-z0-9._-]+(\/.*)?$
-   *
-   * Handles:
-   *  - Mobile share links: instagram.com/reel/ABC/?igsh=xyz  → strips ?igsh=...
-   *  - Fragment URLs: instagram.com/p/ABC/#comment  → strips #...
-   *  - Missing https:// — ensures https://www.instagram.com/...
-   */
   private static normalizeInstagramUrl(url: string): string {
     let cleaned = url.trim();
 
@@ -188,19 +170,36 @@ export class ScraperService {
     return { normalized, raw };
   }
 
-
-
-  // ──────────────────────────────────────────────────────────────────
-  // Async operations
-  // ──────────────────────────────────────────────────────────────────
-  static async initiateScrape(url: string): Promise<{ runId: string; actorId: string }> {
+  static async initiateScrape(
+    url: string,
+    webhookUrl?: string,
+    socialPostId?: string
+  ): Promise<{ runId: string; actorId: string }> {
     const client = this.getClient();
+    const startOptions: any = {};
+
+    if (webhookUrl && socialPostId) {
+      startOptions.webhooks = [
+        {
+          eventTypes: ['ACTOR.RUN.SUCCEEDED', 'ACTOR.RUN.FAILED', 'ACTOR.RUN.ABORTED', 'ACTOR.RUN.TIMED_OUT'],
+          requestUrl: webhookUrl,
+          shouldInterpolateStrings: true,
+          payloadTemplate: `{
+            "runId": "{{resource.id}}",
+            "status": "{{resource.status}}",
+            "defaultDatasetId": "{{resource.defaultDatasetId}}",
+            "socialPostId": "${socialPostId}"
+          }`
+        }
+      ];
+    }
+
     if (url.includes('tiktok.com')) {
       console.log(`[Apify TikTok] Initiating async run: ${url}`);
       const run = await client.actor('clockworks/tiktok-scraper').start({
         postURLs: [url],
         maxItems: 1,
-      });
+      }, startOptions);
       return { runId: run.id, actorId: 'clockworks/tiktok-scraper' };
     } else if (url.includes('instagram.com')) {
       const cleanUrl = this.normalizeInstagramUrl(url);
@@ -208,7 +207,7 @@ export class ScraperService {
       const run = await client.actor('apify/instagram-scraper').start({
         directUrls: [cleanUrl],
         resultsType: 'details',
-      });
+      }, startOptions);
       return { runId: run.id, actorId: 'apify/instagram-scraper' };
     } else {
       throw new Error('Unsupported URL. Must be TikTok or Instagram.');
@@ -227,18 +226,13 @@ export class ScraperService {
 
   static async fetchAndNormalize(datasetId: string, actorId: string): Promise<{ normalized: SocialContent; raw: any }> {
     const client = this.getClient();
-    const { items } = await client.dataset(datasetId).listItems();
+    const { items } = await client.dataset(datasetId).listItems({ limit: 1 });
     if (!items || items.length === 0) throw new Error('No items returned in dataset.');
-    
+
     if (actorId.includes('tiktok')) {
       return this.normalizeTikTokRaw(items[0] as unknown as ApifyTikTokPost);
     } else {
       return this.normalizeInstagramRaw(items[0] as unknown as ApifyInstagramPost);
     }
   }
-
-  // ──────────────────────────────────────────────────────────────────
-  // Router
-  // ──────────────────────────────────────────────────────────────────
-
 }

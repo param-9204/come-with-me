@@ -10,13 +10,13 @@ export async function getAuthUser(request: Request) {
     return null;
   }
   const token = authHeader.split(' ')[1];
-  
+
   // Note: We use a standard client to check authorization token authenticity.
   const supabase = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
   );
-  
+
   const { data: { user }, error } = await supabase.auth.getUser(token);
   if (error || !user) return null;
   return user;

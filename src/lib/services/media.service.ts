@@ -9,22 +9,12 @@ import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
 export class MediaService {
-  /**
-   * Downloads a video from a URL to a temporary local file.
-   * Note: In a production R&D setup, this might use ytdl-core or fetch
-   * depending on the scraped video source. For this basic setup,
-   * we'll simulate downloading by assuming the URL is a direct MP4 link
-   * and fetching it.
-   */
   static async downloadVideo(url: string): Promise<string> {
     const response = await fetch(url);
-    if (!response.ok) {
+    if (!response.ok || !response.body) {
       throw new Error(`Failed to fetch video from ${url}`);
     }
 
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    
     const tempDir = os.tmpdir();
     if (!fs.existsSync(tempDir)) {
       fs.mkdirSync(tempDir, { recursive: true });
@@ -32,8 +22,25 @@ export class MediaService {
 
     const videoId = uuidv4();
     const filePath = path.join(tempDir, `${videoId}.mp4`);
-    
-    fs.writeFileSync(filePath, buffer);
+
+    const fileStream = fs.createWriteStream(filePath);
+    const reader = response.body.getReader();
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        fileStream.write(Buffer.from(value));
+      }
+    } finally {
+      fileStream.end();
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      fileStream.on('finish', () => resolve());
+      fileStream.on('error', (err) => reject(err));
+    });
+
     return filePath;
   }
 
@@ -42,13 +49,10 @@ export class MediaService {
    */
   static async downloadImage(url: string): Promise<string> {
     const response = await fetch(url);
-    if (!response.ok) {
+    if (!response.ok || !response.body) {
       throw new Error(`Failed to fetch image from ${url}`);
     }
 
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    
     const tempDir = os.tmpdir();
     if (!fs.existsSync(tempDir)) {
       fs.mkdirSync(tempDir, { recursive: true });
@@ -56,8 +60,25 @@ export class MediaService {
 
     const imageId = uuidv4();
     const filePath = path.join(tempDir, `${imageId}.jpg`);
-    
-    fs.writeFileSync(filePath, buffer);
+
+    const fileStream = fs.createWriteStream(filePath);
+    const reader = response.body.getReader();
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        fileStream.write(Buffer.from(value));
+      }
+    } finally {
+      fileStream.end();
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      fileStream.on('finish', () => resolve());
+      fileStream.on('error', (err) => reject(err));
+    });
+
     return filePath;
   }
 

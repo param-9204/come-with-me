@@ -1,30 +1,10 @@
-/**
- * ApifyOcrService  (local Tesseract.js OCR — TSV confidence filtering)
- *
- * Core fix: PSM.SPARSE_TEXT does NOT populate data.blocks (wordCount=0 bug).
- * Instead we request TSV output, which Tesseract ALWAYS fills with per-word
- * confidence scores, then filter aggressively to remove noise.
- */
-
 import type { VideoFrame, ApifyOcrFrameResult } from '../types/social';
 
 const MAX_FRAMES_FOR_OCR = 60;
 
-// Confidence threshold per word (0–100 Tesseract scale)
 const WORD_CONF_THRESHOLD = 60;
 
-// Min characters for a token — 2 allows 'To', 'in', '5', 'of', etc.
 const MIN_TOKEN_LENGTH = 2;
-
-/**
- * Parse Tesseract TSV output into confident words grouped by line.
- *
- * TSV columns (tab-separated):
- *   level  page_num  block_num  par_num  line_num  word_num  left  top  width  height  conf  text
- *
- * level=5 → individual word entry
- * conf=-1 → space/end-of-line marker (skip)
- */
 interface TsvWord {
   blockNum: number;
   parNum: number;
@@ -61,13 +41,6 @@ function parseTsv(tsv: string): TsvWord[] {
   return words;
 }
 
-/**
- * Noise pattern — rejects tokens that are clearly garbage:
- *  - Purely symbolic: `= |`, `Xa`, `lf |`
- *  - Contains known garbage chars: §, \, {, }, *, |
- *  - Pure Roman numerals alone: II, III (but not words like 'Visit')
- *  - No alphanumeric characters at all
- */
 function isNoise(word: string): boolean {
   const t = word.trim();
   if (t.length < MIN_TOKEN_LENGTH) return true;

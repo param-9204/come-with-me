@@ -29,33 +29,31 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url);
 
     // ── Pagination ──────────────────────────────────────────────────
-    const limit  = Math.min(parseInt(searchParams.get('limit') ?? '10', 10), 100);
-    const page   = Math.max(parseInt(searchParams.get('page')  ?? '1',  10), 1);
+    const limit = Math.min(parseInt(searchParams.get('limit') ?? '10', 10), 100);
+    const page = Math.max(parseInt(searchParams.get('page') ?? '1', 10), 1);
     const offset = (page - 1) * limit;
 
     // ── Sorting ─────────────────────────────────────────────────────
     const ALLOWED_SORT = ['name', 'category', 'city', 'saved_at'];
-    const sortByParam  = searchParams.get('sort_by') ?? 'saved_at';
-    const sortBy       = ALLOWED_SORT.includes(sortByParam) ? sortByParam : 'saved_at';
-    const ascending    = (searchParams.get('sort_order') ?? 'desc') === 'asc';
+    const sortByParam = searchParams.get('sort_by') ?? 'saved_at';
+    const sortBy = ALLOWED_SORT.includes(sortByParam) ? sortByParam : 'saved_at';
+    const ascending = (searchParams.get('sort_order') ?? 'desc') === 'asc';
 
     // Map sort_by=saved_at → order on saved_places.created_at
     const orderCol = sortBy === 'saved_at' ? 'created_at' : `place.${sortBy}`;
 
     // ── Filters ─────────────────────────────────────────────────────
-    const search   = searchParams.get('search')?.trim()   ?? '';
+    const search = searchParams.get('search')?.trim() ?? '';
     const category = searchParams.get('category')?.trim() ?? '';
-    const city     = searchParams.get('city')?.trim()     ?? '';
+    const city = searchParams.get('city')?.trim() ?? '';
 
     // ── Fetch saved place IDs for user ──────────────────────────────
-    let savedQuery = supabaseAdmin
+    const { data: savedEntries, error: savedError, count } = await supabaseAdmin
       .from('saved_places')
       .select('created_at, place_id', { count: 'exact' })
       .eq('user_id', user.id)
       .order('created_at', { ascending })
       .range(offset, offset + limit - 1);
-
-    const { data: savedEntries, error: savedError, count } = await savedQuery;
 
     if (savedError) {
       console.error('[Saved Places GET] Query error:', savedError);
@@ -87,7 +85,7 @@ export async function GET(request: Request) {
       );
     }
     if (category) placesQuery = placesQuery.ilike('category', category);
-    if (city)     placesQuery = placesQuery.ilike('city', `%${city}%`);
+    if (city) placesQuery = placesQuery.ilike('city', `%${city}%`);
 
     // Sort by place columns if not sorting by saved_at
     if (sortBy !== 'saved_at') {
@@ -211,3 +209,4 @@ export async function DELETE(request: Request) {
     return NextResponse.json({ error: error.message || 'Internal server error' }, { status: 500 });
   }
 }
+

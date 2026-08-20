@@ -7,12 +7,8 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- 2. PROFILES TABLE
 CREATE TABLE IF NOT EXISTS public.profiles (
   id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-  handle text UNIQUE,
   display_name text,
-  avatar_url text,
-  role text DEFAULT 'explorer', -- explorer | creator | brand
-  home_city text DEFAULT 'New York',
-  bio text,
+  phone text,
   created_at timestamptz DEFAULT now()
 );
 
@@ -32,6 +28,7 @@ CREATE TABLE IF NOT EXISTS public.places (
   source_url text,
   user_id uuid REFERENCES auth.users(id) ON DELETE SET NULL,
   audio_transcript text,
+  social_post_id uuid REFERENCES public.social_posts(id) ON DELETE CASCADE,
   created_at timestamptz DEFAULT now()
 );
 
@@ -99,22 +96,22 @@ CREATE TABLE IF NOT EXISTS public.saved_places (
 -- 6. LISTS TABLE
 CREATE TABLE IF NOT EXISTS public.lists (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  owner_id uuid REFERENCES auth.users(id) ON DELETE CASCADE NOT null,
-  name text NOT null,
+  user_id uuid REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
+  title text NOT NULL,
   description text,
-  is_private boolean DEFAULT false,
-  gradient text DEFAULT 'from-purple-800 to-indigo-900',
-  emoji text DEFAULT '📍',
-  created_at timestamptz DEFAULT now(),
-  updated_at timestamptz DEFAULT now()
+  city text DEFAULT 'New York',
+  cover_emoji text DEFAULT '📍',
+  is_public boolean DEFAULT true,
+  slug text,
+  created_at timestamptz DEFAULT now()
 );
 
 -- 7. LIST PLACES JUNCTION TABLE
 CREATE TABLE IF NOT EXISTS public.list_places (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  list_id uuid REFERENCES public.lists(id) ON DELETE CASCADE NOT null,
-  place_id uuid REFERENCES public.places(id) ON DELETE CASCADE NOT null,
-  added_by uuid REFERENCES auth.users(id) ON DELETE SET NULL,
+  list_id uuid REFERENCES public.lists(id) ON DELETE CASCADE NOT NULL,
+  place_id uuid REFERENCES public.places(id) ON DELETE CASCADE NOT NULL,
+  position integer DEFAULT 0,
   created_at timestamptz DEFAULT now(),
   UNIQUE(list_id, place_id)
 );
@@ -122,8 +119,8 @@ CREATE TABLE IF NOT EXISTS public.list_places (
 -- 8. LIST COLLABORATORS TABLE
 CREATE TABLE IF NOT EXISTS public.list_collaborators (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  list_id uuid REFERENCES public.lists(id) ON DELETE CASCADE NOT null,
-  user_id uuid REFERENCES auth.users(id) ON DELETE CASCADE NOT null,
+  list_id uuid REFERENCES public.lists(id) ON DELETE CASCADE NOT NULL,
+  user_id uuid REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
   role text DEFAULT 'editor', -- editor | viewer
   created_at timestamptz DEFAULT now(),
   UNIQUE(list_id, user_id)
@@ -268,35 +265,35 @@ CREATE POLICY "Users can delete their saved places" ON public.saved_places FOR D
 -- lists policies
 DROP POLICY IF EXISTS "Users can view their own lists and shared lists" ON public.lists;
 CREATE POLICY "Users can view their own lists and shared lists" ON public.lists FOR SELECT USING (
-  owner_id = auth.uid()
+  user_id = auth.uid()
   OR id IN (SELECT list_id FROM public.list_collaborators WHERE user_id = auth.uid())
-  OR is_private = false
+  OR is_public = true
 );
 
 DROP POLICY IF EXISTS "Users can create their own lists" ON public.lists;
-CREATE POLICY "Users can create their own lists" ON public.lists FOR INSERT WITH CHECK (owner_id = auth.uid());
+CREATE POLICY "Users can create their own lists" ON public.lists FOR INSERT WITH CHECK (user_id = auth.uid());
 
 DROP POLICY IF EXISTS "Owners can update their lists" ON public.lists;
-CREATE POLICY "Owners can update their lists" ON public.lists FOR UPDATE USING (owner_id = auth.uid());
+CREATE POLICY "Owners can update their lists" ON public.lists FOR UPDATE USING (user_id = auth.uid());
 
 DROP POLICY IF EXISTS "Owners can delete their lists" ON public.lists;
-CREATE POLICY "Owners can delete their lists" ON public.lists FOR DELETE USING (owner_id = auth.uid());
+CREATE POLICY "Owners can delete their lists" ON public.lists FOR DELETE USING (user_id = auth.uid());
 
 -- list_places policies
 DROP POLICY IF EXISTS "Users can view places in accessible lists" ON public.list_places;
 CREATE POLICY "Users can view places in accessible lists" ON public.list_places FOR SELECT USING (
   list_id IN (
     SELECT id FROM public.lists WHERE
-      owner_id = auth.uid()
+      user_id = auth.uid()
       OR id IN (SELECT list_id FROM public.list_collaborators WHERE user_id = auth.uid())
-      OR is_private = false
+      OR is_public = true
   )
 );
 
 DROP POLICY IF EXISTS "List owners and collaborators can add places" ON public.list_places;
 CREATE POLICY "List owners and collaborators can add places" ON public.list_places FOR INSERT WITH CHECK (
   list_id IN (
-    SELECT id FROM public.lists WHERE owner_id = auth.uid()
+    SELECT id FROM public.lists WHERE user_id = auth.uid()
     UNION
     SELECT list_id FROM public.list_collaborators WHERE user_id = auth.uid() AND role = 'editor'
   )
@@ -305,7 +302,7 @@ CREATE POLICY "List owners and collaborators can add places" ON public.list_plac
 DROP POLICY IF EXISTS "List owners and collaborators can remove places" ON public.list_places;
 CREATE POLICY "List owners and collaborators can remove places" ON public.list_places FOR DELETE USING (
   list_id IN (
-    SELECT id FROM public.lists WHERE owner_id = auth.uid()
+    SELECT id FROM public.lists WHERE user_id = auth.uid()
     UNION
     SELECT list_id FROM public.list_collaborators WHERE user_id = auth.uid() AND role = 'editor'
   )
@@ -314,18 +311,18 @@ CREATE POLICY "List owners and collaborators can remove places" ON public.list_p
 -- list_collaborators policies
 DROP POLICY IF EXISTS "Users can view list collaborators" ON public.list_collaborators;
 CREATE POLICY "Users can view list collaborators" ON public.list_collaborators FOR SELECT USING (
-  list_id IN (SELECT id FROM public.lists WHERE owner_id = auth.uid())
+  list_id IN (SELECT id FROM public.lists WHERE user_id = auth.uid())
   OR user_id = auth.uid()
 );
 
 DROP POLICY IF EXISTS "Owners can invite collaborators" ON public.list_collaborators;
 CREATE POLICY "Owners can invite collaborators" ON public.list_collaborators FOR INSERT WITH CHECK (
-  list_id IN (SELECT id FROM public.lists WHERE owner_id = auth.uid())
+  list_id IN (SELECT id FROM public.lists WHERE user_id = auth.uid())
 );
 
 DROP POLICY IF EXISTS "Owners can remove collaborators" ON public.list_collaborators;
 CREATE POLICY "Owners can remove collaborators" ON public.list_collaborators FOR DELETE USING (
-  list_id IN (SELECT id FROM public.lists WHERE owner_id = auth.uid())
+  list_id IN (SELECT id FROM public.lists WHERE user_id = auth.uid())
 );
 
 -- guides policies
@@ -359,9 +356,9 @@ DROP POLICY IF EXISTS "Anyone can join waitlist" ON public.waitlist;
 CREATE POLICY "Anyone can join waitlist" ON public.waitlist FOR INSERT WITH CHECK (true);
 
 DROP POLICY IF EXISTS "Only admin can view waitlist details" ON public.waitlist;
-CREATE POLICY "Only admin can view waitlist details" ON public.waitlist FOR SELECT USING (auth.uid() IN (
-  SELECT id FROM public.profiles WHERE handle = 'admin'
-));
+CREATE POLICY "Only admin can view waitlist details" ON public.waitlist FOR SELECT USING (
+  auth.jwt() ->> 'email' LIKE '%admin%'
+);
 
 
 -- ── 15. TRIGGERS & PL/PGSQL FUNCTIONS ──
@@ -370,11 +367,11 @@ CREATE POLICY "Only admin can view waitlist details" ON public.waitlist FOR SELE
 CREATE OR REPLACE FUNCTION public.handle_new_user()
 RETURNS trigger AS $$
 BEGIN
-  INSERT INTO public.profiles (id, display_name, role)
+  INSERT INTO public.profiles (id, display_name, phone)
   VALUES (
     new.id,
     coalesce(new.raw_user_meta_data->>'full_name', 'Explorer'),
-    coalesce(new.raw_user_meta_data->>'role', 'explorer')
+    new.phone
   );
   RETURN new;
 END;

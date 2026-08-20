@@ -11,6 +11,7 @@ export interface PlaceInput {
   description: string;
   creator_handle: string;
   confidence: number;
+  social_post_id?: string;
 }
 
 export class DbService {
@@ -22,58 +23,15 @@ export class DbService {
     sourceUrl: string,
     sourcePlatform: string,
     audioTranscript?: string,
-    userId?: string
+    userId?: string,
+    socialPostId?: string
   ): Promise<string | null> {
     if (!placeData.name) {
       console.warn('[DB] Place name is null — skipping insert.');
       return null;
     }
 
-    let lat: number | null = null;
-    let lng: number | null = null;
-    let neighborhood = placeData.neighborhood;
-    let address = placeData.address;
-
-    const coords = await LocationService.geocodePlace(placeData.name, placeData.city || '', placeData.address);
-    lat = coords.lat;
-    lng = coords.lng;
-    if (coords.formattedAddress && !address) {
-      address = coords.formattedAddress;
-    }
-
-    if (!neighborhood && lat && lng) {
-      neighborhood = await LocationService.getNeighborhood(lat, lng);
-    }
-
-    // Ensure the city is recorded in our cities table
-    const cityName = (placeData.city || '').trim();
-    if (cityName) {
-      try {
-        let cityLat: number | null = null;
-        let cityLng: number | null = null;
-        try {
-          const cityCoords = await LocationService.geocodePlace('', cityName);
-          if (cityCoords.lat && cityCoords.lng) {
-            cityLat = cityCoords.lat;
-            cityLng = cityCoords.lng;
-          }
-        } catch (geoErr) {
-          console.warn('[DB] Failed to geocode city center coordinates:', geoErr);
-        }
-
-        await supabaseAdmin
-          .from('cities')
-          .upsert({ 
-            name: cityName,
-            latitude: cityLat,
-            longitude: cityLng
-          }, { onConflict: 'name' });
-      } catch (err) {
-        console.error('[DB] Failed to upsert city:', err);
-      }
-    }
-
-    // Idempotent: skip if place already exists
+    // Idempotent: skip geocoding and insertion if place already exists
     const { data: existing } = await supabaseAdmin
       .from('places')
       .select('id')
@@ -83,7 +41,83 @@ export class DbService {
 
     if (existing) {
       console.log(`[DB] Place already exists: ${existing.id}`);
+      if (socialPostId) {
+        await supabaseAdmin
+          .from('places')
+          .update({ social_post_id: socialPostId })
+          .eq('id', existing.id);
+      }
       return existing.id;
+    }
+
+    let lat: number | null = null;
+    let lng: number | null = null;
+    let neighborhood = placeData.neighborhood;
+    let address = placeData.address;
+
+    try {
+      const coords = await LocationService.geocodePlace(placeData.name, placeData.city || '', placeData.address);
+      lat = coords.lat;
+      lng = coords.lng;
+      if (coords.formattedAddress && !address) {
+        address = coords.formattedAddress;
+      }
+      // Use neighborhood from forward geocode context if not already known
+      if (!neighborhood && coords.neighborhood) {
+        neighborhood = coords.neighborhood;
+        console.log(`[DB] Neighborhood from forward geocode: ${neighborhood}`);
+      }
+
+      // Only call reverse geocode if neighborhood is STILL missing
+      if (!neighborhood && lat && lng) {
+        console.log(`[DB] Neighborhood not in forward geocode — falling back to reverse geocode...`);
+        try {
+          neighborhood = await LocationService.getNeighborhood(lat, lng);
+        } catch (revErr: any) {
+          console.warn('[DB] Reverse geocoding failed (non-fatal):', revErr.message);
+        }
+      }
+    } catch (geoErr: any) {
+      console.warn(`[DB] Forward geocoding failed (non-fatal) for place "${placeData.name}":`, geoErr.message);
+    }
+
+    // Ensure the city is recorded in our cities table
+    const cityName = (placeData.city || '').trim();
+    if (cityName) {
+      try {
+        // Query cities table first to avoid redundant geocoding & upsert
+        const { data: existingCity } = await supabaseAdmin
+          .from('cities')
+          .select('name')
+          .eq('name', cityName)
+          .maybeSingle();
+
+        if (!existingCity) {
+          let cityLat: number | null = null;
+          let cityLng: number | null = null;
+          try {
+            const cityCoords = await LocationService.geocodePlace('', cityName);
+            if (cityCoords.lat && cityCoords.lng) {
+              cityLat = cityCoords.lat;
+              cityLng = cityCoords.lng;
+            }
+          } catch (geoErr) {
+            console.warn('[DB] Failed to geocode city center coordinates:', geoErr);
+          }
+
+          await supabaseAdmin
+            .from('cities')
+            .upsert({
+              name: cityName,
+              latitude: cityLat,
+              longitude: cityLng
+            }, { onConflict: 'name' });
+        } else {
+          console.log(`[DB] City "${cityName}" already exists in the cities cache.`);
+        }
+      } catch (err) {
+        console.error('[DB] Failed to upsert city:', err);
+      }
     }
 
     const { data: newPlace, error } = await supabaseAdmin
@@ -102,6 +136,7 @@ export class DbService {
         latitude: lat,
         longitude: lng,
         user_id: userId || null,
+        social_post_id: socialPostId || null,
       })
       .select('id')
       .single();

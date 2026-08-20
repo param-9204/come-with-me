@@ -26,7 +26,46 @@ export async function GET(
     }
 
     if (!place) {
-      return NextResponse.json({ error: 'Place not found' }, { status: 404 });
+      // Fallback: Query places by social_post_id = id
+      const { data: placesByPost, error: postPlacesError } = await supabaseAdmin
+        .from('places')
+        .select('*')
+        .eq('social_post_id', id);
+
+      if (postPlacesError) {
+        console.error('[Place Details API] Fetch places by post ID error:', postPlacesError);
+        return NextResponse.json({ error: postPlacesError.message }, { status: 500 });
+      }
+
+      if (!placesByPost || placesByPost.length === 0) {
+        return NextResponse.json({ error: 'Place or Social Post not found' }, { status: 404 });
+      }
+
+      // Enrich places with creator details
+      const userIds = [...new Set(placesByPost.map((p) => p.user_id).filter(Boolean))];
+      let profilesMap: Record<string, string> = {};
+      if (userIds.length > 0) {
+        const { data: profiles } = await supabaseAdmin
+          .from('profiles')
+          .select('id, display_name')
+          .in('id', userIds);
+        if (profiles) {
+          profilesMap = Object.fromEntries(
+            profiles.map((p) => [p.id, p.display_name || 'Anonymous'])
+          );
+        }
+      }
+
+      const enrichedPlaces = placesByPost.map((p) => ({
+        ...p,
+        created_by: p.user_id ? (profilesMap[p.user_id] || 'Anonymous') : 'Anonymous',
+      }));
+
+      return NextResponse.json({
+        success: true,
+        message: 'Places for social post retrieved successfully',
+        places: enrichedPlaces,
+      });
     }
 
     // Retrieve creator details from profiles table

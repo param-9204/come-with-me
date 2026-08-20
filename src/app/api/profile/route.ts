@@ -7,11 +7,7 @@ import { getAuthUser } from '@/lib/auth';
  *
  * Request Body:
  *   displayName? : string
- *   handle?      : string (alphanumeric, periods, or underscores, lowercase, 3-30 chars)
- *   avatarUrl?   : string
- *   role?        : 'explorer' | 'creator' | 'brand'
- *   homeCity?    : string
- *   bio?         : string
+ *   phone?       : string
  */
 export async function PUT(request: Request) {
   try {
@@ -35,7 +31,7 @@ export async function PUT(request: Request) {
       );
     }
 
-    const { displayName, handle, avatarUrl, role, homeCity, bio } = body;
+    const { displayName, phone } = body;
 
     // 3. Prepare the database update object
     const updateData: Record<string, any> = {};
@@ -45,59 +41,8 @@ export async function PUT(request: Request) {
       updateData.display_name = typeof displayName === 'string' ? displayName.trim() : displayName;
     }
 
-    if (handle !== undefined) {
-      if (handle === null) {
-        updateData.handle = null;
-      } else if (typeof handle !== 'string') {
-        return NextResponse.json(
-          { error: 'Profile handle must be a string' },
-          { status: 400 }
-        );
-      } else {
-        const cleanedHandle = handle.trim().toLowerCase();
-        
-        // Validation: handle length between 3 and 30 characters
-        if (cleanedHandle.length < 3 || cleanedHandle.length > 30) {
-          return NextResponse.json(
-            { error: 'Profile handle must be between 3 and 30 characters long' },
-            { status: 400 }
-          );
-        }
-
-        // Validation: check allowed characters (alphanumeric, dots, underscores)
-        const handleRegex = /^[a-z0-9._]+$/;
-        if (!handleRegex.test(cleanedHandle)) {
-          return NextResponse.json(
-            { error: 'Profile handle can only contain lowercase letters, numbers, periods (.), and underscores (_)' },
-            { status: 400 }
-          );
-        }
-
-        updateData.handle = cleanedHandle;
-      }
-    }
-
-    if (avatarUrl !== undefined) {
-      updateData.avatar_url = typeof avatarUrl === 'string' ? avatarUrl.trim() : avatarUrl;
-    }
-
-    if (role !== undefined) {
-      const allowedRoles = ['explorer', 'creator', 'brand'];
-      if (!allowedRoles.includes(role)) {
-        return NextResponse.json(
-          { error: `Invalid role. Allowed roles: ${allowedRoles.join(', ')}` },
-          { status: 400 }
-        );
-      }
-      updateData.role = role;
-    }
-
-    if (homeCity !== undefined) {
-      updateData.home_city = typeof homeCity === 'string' ? homeCity.trim() : homeCity;
-    }
-
-    if (bio !== undefined) {
-      updateData.bio = typeof bio === 'string' ? bio.trim() : bio;
+    if (phone !== undefined) {
+      updateData.phone = typeof phone === 'string' ? phone.trim() : phone;
     }
 
     // Check if there are fields to update
@@ -117,14 +62,6 @@ export async function PUT(request: Request) {
       .maybeSingle();
 
     if (updateError) {
-      // Postgres UNIQUE constraint error code
-      if (updateError.code === '23505') {
-        return NextResponse.json(
-          { error: 'Username handle is already taken' },
-          { status: 400 }
-        );
-      }
-
       console.error('[Profile PUT API] Update error:', updateError);
       return NextResponse.json(
         { error: updateError.message },
@@ -145,12 +82,8 @@ export async function PUT(request: Request) {
       message: 'Profile updated successfully',
       profile: {
         id: updatedProfile.id,
-        handle: updatedProfile.handle,
         displayName: updatedProfile.display_name,
-        avatarUrl: updatedProfile.avatar_url,
-        role: updatedProfile.role,
-        homeCity: updatedProfile.home_city,
-        bio: updatedProfile.bio,
+        phone: updatedProfile.phone,
         createdAt: updatedProfile.created_at,
       },
     });
@@ -162,3 +95,4 @@ export async function PUT(request: Request) {
     );
   }
 }
+

@@ -57,9 +57,14 @@ Your job is to analyze social media scraper data, OCR frame results, and audio t
 
 === CRITICAL RULES & INSTRUCTIONS ===
 1. MULTI-ENTITY EXTRACTION: A single post can contain multiple places. Extract EVERY physical place, attraction, business, or destination. Do NOT select only the first or most prominent. Return all in the "places" array. If none are found, return "places": [].
-2. DATA TRIANGULATION: Synthesize all inputs. Transcripts (audio) and OCR (menus, signage) are highly accurate and override vague captions.
+2. DATA TRIANGULATION & CROSS-MODAL ENRICHMENT: Synthesize all inputs. Transcripts (audio) and OCR (menus, signage) are highly accurate and override vague captions. 
+   - If a place name is found (e.g. "Victoria Street" or "Old Town"), cross-reference the audio transcript translation or OCR texts to find the target city (e.g. "Edinburgh") and country (e.g. "Scotland"/"United Kingdom").
+   - Link the place to the correct city/region mentioned in the audio/OCR rather than leaving the city blank or defaulting it to New York.
 3. EVIDENCE PRIORITY: Trust evidence in this order: Visual Signage (OCR) > Spoken Words (Audio) > Location Metadata > Explicit Caption Names > Tagged Venue Handles > Hashtags.
-4. WHAT IS A PLACE: Physical destinations (states, islands, lakes), attractions (landmarks, historical sites, palaces), or businesses (restaurants, bars, shops). Use the dynamic category derived using the DYNAMIC CATEGORIZATION GUIDE below. Do NOT mix up specific attractions with their city (e.g. name="Taj Mahal", city="Agra", category="Historical Landmark", NOT name="Agra").
+4. WHAT IS A PLACE: Physical destinations (states, islands, lakes, streets), attractions (landmarks, historical sites, palaces), or businesses (restaurants, bars, shops). Use the dynamic category derived using the DYNAMIC CATEGORIZATION GUIDE below. Do NOT mix up specific attractions with their city (e.g. name="Taj Mahal", city="Agra", category="Historical Landmark", NOT name="Agra").
+5. ENRICHED DESCRIPTIONS:
+   - Generate rich, user-centric descriptions for each place. 
+   - Combine factual details with the context of why the creator is showcasing/recommending the place in the video/audio (e.g., "A historic and colorful street in Edinburgh's Old Town, recommended by the travel creator as a highlight of their scenic train trip from London").
 
 === DYNAMIC CATEGORIZATION GUIDE ===
 Determine a highly precise, hyper-specific category for each place by analyzing all video details (OCR text, audio transcripts, caption keywords, hashtags, and social handles):
@@ -77,7 +82,7 @@ Determine a highly precise, hyper-specific category for each place by analyzing 
      - Dining Styles: Use "Japanese Omakase Spot", "Italian Osteria", "Ramen & Gyoza Shop", "Argentine Steakhouse", "French Bistro", "Spanish Tapas Bar", "Greek Taverna", "Taco Stand", "Korean BBQ Restaurant", "Brunch Cafe", "Artisanal Dessert Parlor".
      - Beverage & Nightlife: Use "Rooftop Cocktail Bar", "Speakeasy Cocktail Lounge", "Natural Wine Bar", "Craft Brewery Taproom", "Specialty Matcha Bar", "Third-Wave Coffee Shop", "Specialty Boba Shop".
      - Specialized Retail: Use "Vintage Apparel Store", "Concept Lifestyle Store", "Aesthetic Stationery Shop", "Artisanal Pastry Shop", "Independent Bookstore", "Fine Cheese & Wine Shop".
-     - Sightseeing & Attractions: Use "Contemporary Art Gallery", "Scenic Lookout Point", "Botanical Garden", "Amusement Park Ride", "Historical Landmark Palace", "Public Beach & Boardwalk", "Hiking Trailhead".
+     - Sightseeing & Attractions: Use "Contemporary Art Gallery", "Scenic Lookout Point", "Botanical Garden", "Amusement Park Ride", "Historical Landmark Palace", "Public Beach & Boardwalk", "Hiking Trailhead", "Historic Shopping Street".
 3. COMBINED / MULTI-PURPOSE VENUES: If a place offers dual services (e.g., bookstore cafe or natural wine bar restaurant), use a descriptive combined name like "Bookstore & Cafe" or "Natural Wine Bar & Bistro".
 4. FORMATTING: Always capitalize each word of the category (e.g., "Speakeasy Cocktail Lounge", "Artisanal Bakery & Cafe").
 5. FALLBACK RULE: Only use basic broad categories ("Restaurant", "Cafe", "Bar", "Shop", "Hotel", "Attraction") if there is absolutely no specific context.
@@ -88,7 +93,7 @@ Determine a highly precise, hyper-specific category for each place by analyzing 
 6. OCR NOISE: Ignore technical metadata, HTML tags, scripts, base64 strings, or single-character noise. Synthesize text fragments across frames.
 7. SOCIAL HANDLE INFERENCE: If a venue is referenced only as a handle (e.g. @tashca.nyc, @carbone_la), extract it as the venue (e.g. "Tashca", "Carbone") and map the suffix to the city (.nyc -> New York, .la -> Los Angeles, .miami -> Miami, .chi -> Chicago, .sf -> San Francisco, .dc -> Washington DC, .nola -> New Orleans, .atx -> Austin, .london/.uk -> London, .delhi -> Delhi, .bom/.mumbai -> Mumbai, .blr -> Bengaluru). Inferred places have confidence = 0.5.
 8. CREATOR & METRICS: Calculate engagement_rate = ((likes + comments) / views) * 100 if those metrics are valid. If likesCount is -1, likes = null. paidPartnership status is authoritative. creator_handle must map to the author's username (prefixed with @), NOT a venue handle.
-9. CITY RESOLUTION: Determine city using address, audio, OCR, metadata, caption, or handle suffix. Leave blank/null if it cannot be determined.
+9. CITY RESOLUTION: Determine city using address, audio, OCR, metadata, caption, or handle suffix. Cross-reference geographic hints in transcripts (e.g., audio transcript mentions "Edinburgh" or "Scotland") to resolve place locations accurately. Leave blank/null if it cannot be determined.
 10. NO HALLUCINATION: Never fabricate details. Use null for unavailable optional scalars, [] for arrays, and "" for empty strings.
 11. DEDUPLICATION: Merge identical places into one, but keep different branches of the same business separate.
  
@@ -263,7 +268,7 @@ Extract all places/location details.`;
     transcript: string,
     gptOcrTexts: string[],
     apifyOcrTexts: string[]
-  ): Promise<AiAnalysisResult | null> {
+  ): Promise<{ analysis: AiAnalysisResult; places: PlaceExtraction[] } | null> {
     const openai = this.getClient();
 
     const ocrAvailable = gptOcrTexts.length > 0 || apifyOcrTexts.length > 0;
@@ -331,10 +336,12 @@ Return the full analysis JSON.`;
     const raw = response.choices[0].message.content || '{}';
 
     // Parse and validate — fill required top-level keys if missing
-    const parsed = JSON.parse(raw) as Partial<AiAnalysisResult>;
+    const parsedJson = JSON.parse(raw);
+    const parsed = (parsedJson || {}) as Partial<AiAnalysisResult>;
+    const places = (parsedJson.places || []) as PlaceExtraction[];
 
     // Ensure all sections exist with safe defaults and merge scraper metadata
-    return {
+    const analysis: AiAnalysisResult = {
       platform: parsed.platform || content.platform,
       content: {
         content_id: content.contentId,
@@ -431,5 +438,7 @@ Return the full analysis JSON.`;
       },
       extracted_information: parsed.extracted_information || [],
     };
+
+    return { analysis, places };
   }
 }
