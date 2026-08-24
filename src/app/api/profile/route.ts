@@ -3,6 +3,86 @@ import { supabaseAdmin } from '@/lib/supabase';
 import { getAuthUser } from '@/lib/auth';
 
 /**
+ * GET /api/profile
+ *
+ * Returns the authenticated user's profile details.
+ */
+export async function GET(request: Request) {
+  try {
+    // 1. Authenticate the request using the Bearer token
+    const user = await getAuthUser(request);
+    if (!user) {
+      return NextResponse.json(
+        { error: 'Unauthorized. Authenticated session required.' },
+        { status: 401 }
+      );
+    }
+
+    // 2. Fetch the profile from the database
+    const { data: profile, error: fetchError } = await supabaseAdmin
+      .from('profiles')
+      .select('*')
+      .eq('id', user.id)
+      .maybeSingle();
+
+    if (fetchError) {
+      console.error('[Profile GET API] Query error:', fetchError);
+      return NextResponse.json(
+        { error: fetchError.message },
+        { status: 500 }
+      );
+    }
+
+    // 3. Auto-initialize the profile if not found (self-healing fallback)
+    if (!profile) {
+      const { data: newProfile, error: insertError } = await supabaseAdmin
+        .from('profiles')
+        .insert({
+          id: user.id,
+          display_name: 'Explorer',
+        })
+        .select('*')
+        .single();
+
+      if (insertError) {
+        console.error('[Profile GET API] Auto-initialization error:', insertError);
+        return NextResponse.json(
+          { error: 'Profile not found and failed to initialize.' },
+          { status: 404 }
+        );
+      }
+
+      return NextResponse.json({
+        success: true,
+        profile: {
+          id: newProfile.id,
+          displayName: newProfile.display_name,
+          phone: newProfile.phone,
+          createdAt: newProfile.created_at,
+        },
+      });
+    }
+
+    // 4. Return profile
+    return NextResponse.json({
+      success: true,
+      profile: {
+        id: profile.id,
+        displayName: profile.display_name,
+        phone: profile.phone,
+        createdAt: profile.created_at,
+      },
+    });
+  } catch (error: any) {
+    console.error('[Profile GET API] Unhandled exception:', error);
+    return NextResponse.json(
+      { error: error.message || 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}
+
+/**
  * PUT /api/profile
  *
  * Request Body:

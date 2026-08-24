@@ -81,6 +81,31 @@ export class DbService {
       console.warn(`[DB] Forward geocoding failed (non-fatal) for place "${placeData.name}":`, geoErr.message);
     }
 
+    // Deduplicate by coordinate proximity (if geocoding succeeded)
+    if (lat && lng) {
+      const margin = 0.0001; // ~10m bounding box
+      const { data: existingByCoords } = await supabaseAdmin
+        .from('places')
+        .select('id, name')
+        .gte('latitude', lat - margin)
+        .lte('latitude', lat + margin)
+        .gte('longitude', lng - margin)
+        .lte('longitude', lng + margin)
+        .limit(1)
+        .maybeSingle();
+
+      if (existingByCoords) {
+        console.log(`[DB] Place already exists at coordinates (${lat}, ${lng}): "${existingByCoords.name}" (ID: ${existingByCoords.id}). Skipping insertion of "${placeData.name}".`);
+        if (socialPostId) {
+          await supabaseAdmin
+            .from('places')
+            .update({ social_post_id: socialPostId })
+            .eq('id', existingByCoords.id);
+        }
+        return existingByCoords.id;
+      }
+    }
+
     // Ensure the city is recorded in our cities table
     const cityName = (placeData.city || '').trim();
     if (cityName) {
@@ -318,6 +343,14 @@ export class DbService {
             })
             .eq('id', socialPostId);
 
+          // Link all extracted places to this canonical social post ID
+          if (placeIds.length > 0) {
+            await supabaseAdmin
+              .from('places')
+              .update({ social_post_id: existingPost.id })
+              .in('id', placeIds);
+          }
+
           return existingPost.id;
         }
       }
@@ -326,7 +359,15 @@ export class DbService {
       throw new Error(`Failed to save social post: ${error.message}`);
     }
 
-    console.log(`[DB] Social post saved: ${data?.id}`);
-    return data?.id || null;
+    const finalPostId = data?.id || null;
+    if (finalPostId && placeIds.length > 0) {
+      await supabaseAdmin
+        .from('places')
+        .update({ social_post_id: finalPostId })
+        .in('id', placeIds);
+    }
+
+    console.log(`[DB] Social post saved: ${finalPostId}`);
+    return finalPostId;
   }
 }
