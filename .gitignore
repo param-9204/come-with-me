@@ -44,3 +44,7 @@ next-env.d.ts
 /tmp/*
 !/tmp/.gitkeep
 skill-observations/
+
+# logs
+/logs/
+
