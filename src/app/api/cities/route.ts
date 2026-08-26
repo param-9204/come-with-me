@@ -24,8 +24,8 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url);
 
     // ── Pagination ──────────────────────────────────────────────────
-    const limit  = Math.min(parseInt(searchParams.get('limit') ?? '50', 10), 200);
-    const page   = Math.max(parseInt(searchParams.get('page')  ?? '1',  10), 1);
+    const limit = Math.min(parseInt(searchParams.get('limit') ?? '50', 10), 200);
+    const page = Math.max(parseInt(searchParams.get('page') ?? '1', 10), 1);
     const offset = (page - 1) * limit;
 
     // ── Sorting ─────────────────────────────────────────────────────
@@ -45,6 +45,7 @@ export async function GET(request: Request) {
     if (userId) {
       query = query.eq('user_id', userId);
     }
+
 
     if (search) {
       query = query.ilike('name', `%${search}%`);
