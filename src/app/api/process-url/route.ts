@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
+import { getAuthUser } from '@/lib/auth';
 import { v4 as uuidv4 } from 'uuid';
 
 export const maxDuration = 60; // Allow Vercel function to run up to 60 seconds (requires Pro tier or compatible runtime)
@@ -205,9 +206,16 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
 
 export async function POST(request: Request) {
   try {
+    // 1. Authenticate via Clerk JWT (Bearer token) or middleware-injected header
+    const authUser = await getAuthUser(request);
     const headerUserId = request.headers.get('x-user-id');
-    const { url, userId } = await request.json();
-    const finalUserId = userId || headerUserId;
+
+    // Clone the request so we can read the body (getAuthUser may have consumed nothing, but body is still untouched)
+    const body = await request.json();
+    const { url, userId: bodyUserId } = body;
+
+    // Prefer authenticated user ID from Clerk, then middleware header, then body fallback
+    const finalUserId = authUser?.id || headerUserId || bodyUserId || null;
 
     if (!finalUserId) {
       return NextResponse.json({ error: 'Unauthorized. Authenticated session required.' }, { status: 401 });
