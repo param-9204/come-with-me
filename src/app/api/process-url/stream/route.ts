@@ -1,7 +1,9 @@
 import { supabaseAdmin } from '@/lib/supabase';
+import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { v4 as uuidv4 } from 'uuid';
 import { after } from 'next/server';
 import { ScraperService } from '@/lib/services/scraper.service';
+
 
 export const maxDuration = 300; // Requires Vercel Pro / Fluid Compute
 
@@ -331,7 +333,15 @@ export async function POST(request: Request) {
 
   const { url, userId } = body;
 
+  const authUser = await getAuthUser(request);
+  const resolvedUserId = await resolveProfileId({
+    clerkId: authUser?.clerkId,
+    userIdInput: userId || authUser?.id,
+    email: authUser?.email,
+  });
+
   if (!url) {
+
     return new Response('data: {"error":"URL is required"}\n\n', { status: 400 });
   }
 
@@ -442,7 +452,8 @@ export async function POST(request: Request) {
               status: 'pending',
               platform,
               content_id: `pending_${uuidv4()}`,
-              user_id: userId || null,
+              user_id: resolvedUserId,
+
             })
             .select('id')
             .single();

@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
-import { getAuthUser } from '@/lib/auth';
+import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { v4 as uuidv4 } from 'uuid';
 
 export const maxDuration = 60; // Allow Vercel function to run up to 60 seconds (requires Pro tier or compatible runtime)
@@ -214,9 +214,14 @@ export async function POST(request: Request) {
     const body = await request.json();
     const { url, userId: bodyUserId } = body;
 
-    // Best-effort user ID resolution — null is fine (anonymous request)
-    const finalUserId = authUser?.id || headerUserId || bodyUserId || null;
-    console.log('[process-url] userId resolved:', finalUserId ?? '(anonymous)');
+    // Resolve profile identity against public.profiles to guarantee valid profile UUID
+    const finalUserId = await resolveProfileId({
+      clerkId: authUser?.clerkId,
+      userIdInput: headerUserId || bodyUserId || authUser?.id,
+      email: authUser?.email,
+    });
+    console.log('[process-url] profile user_id resolved:', finalUserId ?? '(anonymous)');
+
 
     if (!url) {
       return NextResponse.json({ error: 'URL is required' }, { status: 400 });
@@ -308,7 +313,8 @@ export async function POST(request: Request) {
     }
 
     // Execute the pipeline synchronously and await completion
-    const finalPostId = await runSynchronousPipeline(origin, cleanUrl, socialPostId, finalUserId);
+    const finalPostId = await runSynchronousPipeline(origin, cleanUrl, socialPostId, finalUserId || undefined);
+
 
     // Fetch and return the completed social post record
     const { data: completedPost, error: fetchErr } = await supabaseAdmin

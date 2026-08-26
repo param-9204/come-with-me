@@ -1,4 +1,5 @@
 import { supabaseAdmin } from '../supabase';
+import { resolveProfileId } from '../auth';
 import type { SocialContent, AiAnalysisResult, ApifyOcrFrameResult, GptVisionFrameResult, PlaceExtraction } from '../types/social';
 import { LocationService } from './location.service';
 
@@ -223,12 +224,17 @@ export class DbService {
       engagementRate = parseFloat(((likes + comments) / views * 100).toFixed(4));
     }
 
+    const resolvedUserId = userId
+      ? await resolveProfileId({ userIdInput: userId })
+      : null;
+
     const payload = {
       // ── Place link ──────────────────────────────
       place_id: placeIds.length > 0 ? placeIds[0] : null,
 
       // ── User association ────────────────────────
-      user_id: userId || null,
+      user_id: resolvedUserId,
+
 
       // ── Platform / type ─────────────────────────
       platform: content.platform,

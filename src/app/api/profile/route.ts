@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
-import { getAuthUser } from '@/lib/auth';
+import { getAuthUser, resolveProfileId } from '@/lib/auth';
 
 /**
  * GET /api/profile
@@ -18,11 +18,17 @@ export async function GET(request: Request) {
       );
     }
 
+    const profileId = await resolveProfileId({
+      clerkId: user.clerkId,
+      userIdInput: user.id,
+      email: user.email,
+    });
+
     // 2. Fetch the profile from the database
     const { data: profile, error: fetchError } = await supabaseAdmin
       .from('profiles')
       .select('*')
-      .eq('id', user.id)
+      .eq('id', profileId || user.id)
       .maybeSingle();
 
     if (fetchError) {
@@ -38,11 +44,13 @@ export async function GET(request: Request) {
       const { data: newProfile, error: insertError } = await supabaseAdmin
         .from('profiles')
         .insert({
-          id: user.id,
+          id: profileId || user.id,
+          clerk_user_id: user.clerkId || undefined,
           display_name: 'Explorer',
         })
         .select('*')
         .single();
+
 
       if (insertError) {
         console.error('[Profile GET API] Auto-initialization error:', insertError);
@@ -133,13 +141,20 @@ export async function PUT(request: Request) {
       );
     }
 
+    const profileId = await resolveProfileId({
+      clerkId: user.clerkId,
+      userIdInput: user.id,
+      email: user.email,
+    });
+
     // 5. Update user profile in database
     const { data: updatedProfile, error: updateError } = await supabaseAdmin
       .from('profiles')
       .update(updateData)
-      .eq('id', user.id)
+      .eq('id', profileId || user.id)
       .select('*')
       .maybeSingle();
+
 
     if (updateError) {
       console.error('[Profile PUT API] Update error:', updateError);

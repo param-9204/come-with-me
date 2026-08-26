@@ -162,3 +162,99 @@ export async function getAuthUser(request?: Request) {
   console.error('[Auth] ❌ All auth methods exhausted. Returning null.');
   return null;
 }
+
+function isUuid(val: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(val);
+}
+
+/**
+ * Resolves a given Clerk user ID or raw user ID input into a valid internal UUID
+ * from `public.profiles(id)`.
+ *
+ * Priority:
+ * 1. Check `profiles.clerk_user_id = clerkId` (or `userIdInput` if it starts with 'user_')
+ * 2. Check `profiles.id = userIdInput` (if `userIdInput` is a valid UUID)
+ * 3. Self-healing fallback: Auto-creates/upserts the profile row in `public.profiles` if missing.
+ */
+export async function resolveProfileId(params: {
+  clerkId?: string | null;
+  userIdInput?: string | null;
+  email?: string | null;
+}): Promise<string | null> {
+  const { clerkId, userIdInput, email } = params;
+
+  const { supabaseAdmin } = await import('@/lib/supabase');
+
+  const targetClerkId = clerkId || (userIdInput?.startsWith('user_') ? userIdInput : null);
+
+  // 1. Resolve via clerk_user_id match in profiles
+  if (targetClerkId) {
+    try {
+      const { data: profile } = await supabaseAdmin
+        .from('profiles')
+        .select('id')
+        .eq('clerk_user_id', targetClerkId)
+        .maybeSingle();
+
+      if (profile?.id) {
+        console.log(`[Auth] Resolved profile.id ${profile.id} for clerk_user_id ${targetClerkId}`);
+        return profile.id;
+      }
+    } catch (err: any) {
+      console.warn('[Auth] Profile lookup by clerk_user_id failed:', err.message);
+    }
+  }
+
+  // 2. If userIdInput is a valid UUID, check if it directly exists in profiles.id
+  if (userIdInput && isUuid(userIdInput)) {
+    try {
+      const { data: profile } = await supabaseAdmin
+        .from('profiles')
+        .select('id')
+        .eq('id', userIdInput)
+        .maybeSingle();
+
+      if (profile?.id) {
+        console.log(`[Auth] Resolved existing profile.id ${profile.id} directly`);
+        return profile.id;
+      }
+    } catch (err: any) {
+      console.warn('[Auth] Profile lookup by id failed:', err.message);
+    }
+  }
+
+  // 3. Self-healing fallback: Create/upsert a profile for the Clerk user if missing
+  if (targetClerkId) {
+    const userUuid = uuidv5(targetClerkId, CLERK_UUID_NAMESPACE);
+    const displayName = email ? email.split('@')[0] : 'Explorer';
+
+    try {
+      const { data: newProfile, error: upsertError } = await supabaseAdmin
+        .from('profiles')
+        .upsert(
+          {
+            id: userUuid,
+            clerk_user_id: targetClerkId,
+            display_name: displayName,
+          },
+          { onConflict: 'clerk_user_id' }
+        )
+        .select('id')
+        .single();
+
+      if (newProfile?.id) {
+        console.log(`[Auth] Auto-created/upserted profile.id ${newProfile.id} for clerk_user_id ${targetClerkId}`);
+        return newProfile.id;
+      }
+
+      if (upsertError) {
+        console.error('[Auth] Failed auto-creating profile:', upsertError.message);
+      }
+    } catch (err: any) {
+      console.error('[Auth] Exception auto-creating profile:', err.message);
+    }
+  }
+
+  return null;
+}
+
