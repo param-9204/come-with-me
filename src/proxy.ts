@@ -1,19 +1,29 @@
+import { clerkMiddleware } from '@clerk/nextjs/server';
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 import { getAuthUser } from '@/lib/auth';
 
-export async function middleware(request: NextRequest) {
+/**
+ * Next.js Proxy (formerly middleware).
+ *
+ * Wraps clerkMiddleware so that auth() works inside any route handler
+ * when a Clerk Bearer token or session cookie is present.
+ */
+export default clerkMiddleware(async (clerkAuth, request: NextRequest) => {
   const { pathname } = request.nextUrl;
 
-  const ip = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || '127.0.0.1';
+  const ip =
+    request.headers.get('x-forwarded-for') ||
+    request.headers.get('x-real-ip') ||
+    '127.0.0.1';
   const userAgent = request.headers.get('user-agent') || 'Unknown';
 
-  // 1. Bypass Clerk webhook and public asset requests
+  // 1. Bypass Clerk webhooks
   if (pathname.startsWith('/api/webhooks')) {
     return NextResponse.next();
   }
 
-  // 2. Process all other API routes
+  // 2. Authenticate and inject x-user-* headers for downstream route handlers
   const user = await getAuthUser(request);
 
   const requestHeaders = new Headers(request.headers);
@@ -27,20 +37,20 @@ export async function middleware(request: NextRequest) {
     requestHeaders.set('x-user-email', user.email || '');
   }
 
-  const response = await NextResponse.next({
+  const response = NextResponse.next({
     request: {
       headers: requestHeaders,
     },
   });
 
-  // 3. Log request & response status in the background (fire-and-forget)
+  // 3. Fire-and-forget request logging
   if (pathname !== '/api/logs/write') {
     let origin = request.nextUrl.origin;
     const hostHeader = request.headers.get('host') || '';
     if (hostHeader.includes('localhost') || hostHeader.includes('127.0.0.1')) {
       origin = `http://${hostHeader}`;
     } else {
-      // For proxies (like ngrok), route internally directly to local development port
+      // For proxies (like ngrok), route internally to local dev port
       origin = 'http://127.0.0.1:3000';
     }
 
@@ -54,15 +64,15 @@ export async function middleware(request: NextRequest) {
         userId: user?.id || null,
         ip,
         userAgent,
-        status: response.status
-      })
+        status: response.status,
+      }),
     }).catch((err) => {
-      console.error('[Middleware Logging Failure]', err.message);
+      console.error('[Proxy Logging Failure]', err.message);
     });
   }
 
   return response;
-}
+});
 
 // Target all API endpoints
 export const config = {

@@ -206,20 +206,17 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
 
 export async function POST(request: Request) {
   try {
-    // 1. Authenticate via Clerk JWT (Bearer token) or middleware-injected header
+    // 1. Optionally resolve user ID — process-url is PUBLIC (no auth required).
+    //    If the client sends a Clerk Bearer token, middleware header, or userId in
+    //    the body, capture it so we can attribute the post to that user.
     const authUser = await getAuthUser(request);
     const headerUserId = request.headers.get('x-user-id');
-
-    // Clone the request so we can read the body (getAuthUser may have consumed nothing, but body is still untouched)
     const body = await request.json();
     const { url, userId: bodyUserId } = body;
 
-    // Prefer authenticated user ID from Clerk, then middleware header, then body fallback
+    // Best-effort user ID resolution — null is fine (anonymous request)
     const finalUserId = authUser?.id || headerUserId || bodyUserId || null;
-
-    if (!finalUserId) {
-      return NextResponse.json({ error: 'Unauthorized. Authenticated session required.' }, { status: 401 });
-    }
+    console.log('[process-url] userId resolved:', finalUserId ?? '(anonymous)');
 
     if (!url) {
       return NextResponse.json({ error: 'URL is required' }, { status: 400 });
