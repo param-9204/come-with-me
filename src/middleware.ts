@@ -17,6 +17,10 @@ export async function middleware(request: NextRequest) {
   const user = await getAuthUser(request);
 
   const requestHeaders = new Headers(request.headers);
+  requestHeaders.delete('x-user-id');
+  requestHeaders.delete('x-user-clerk-id');
+  requestHeaders.delete('x-user-email');
+
   if (user) {
     requestHeaders.set('x-user-id', user.id);
     requestHeaders.set('x-user-clerk-id', user.clerkId || '');

@@ -20,26 +20,37 @@ export async function GET(request: Request) {
     const page   = Math.max(parseInt(searchParams.get('page')  ?? '1',  10), 1);
     const offset = (page - 1) * limit;
 
+    if (!userId) {
+      return NextResponse.json({
+        success: true,
+        cities: [],
+        pagination: {
+          page,
+          limit,
+          total_items: 0,
+          total_pages: 0,
+          has_next: false,
+          has_prev: false,
+        },
+      });
+    }
+
     // ── Sorting ─────────────────────────────────────────────────────
     const ascending = (searchParams.get('sort_order') ?? 'asc') === 'asc';
 
     // ── Filters ─────────────────────────────────────────────────────
     const search = searchParams.get('search')?.trim() ?? '';
-    const myCities = searchParams.get('myCities') === 'true';
 
     // ── Build query ─────────────────────────────────────────────────
     let query = supabaseAdmin
       .from('cities')
       .select('id, name, latitude, longitude, created_at', { count: 'exact' })
+      .eq('user_id', userId)
       .order('name', { ascending })
       .range(offset, offset + limit - 1);
 
     if (search) {
       query = query.ilike('name', `%${search}%`);
-    }
-
-    if (myCities && userId) {
-      query = query.eq('user_id', userId);
     }
 
     const { data, error, count } = await query;

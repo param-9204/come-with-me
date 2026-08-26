@@ -25,6 +25,21 @@ export async function GET(request: Request) {
     const limit  = Math.min(parseInt(searchParams.get('limit') ?? '50', 10), 100);
     const page   = Math.max(parseInt(searchParams.get('page')  ?? '1',  10), 1);
 
+    if (!userId) {
+      return NextResponse.json({
+        success: true,
+        categories: [],
+        pagination: {
+          page,
+          limit,
+          total_items: 0,
+          total_pages: 0,
+          has_next: false,
+          has_prev: false,
+        },
+      });
+    }
+
     // ── Sorting ─────────────────────────────────────────────────────
     const ascending = (searchParams.get('sort_order') ?? 'asc') === 'asc';
 
@@ -32,14 +47,11 @@ export async function GET(request: Request) {
     let query = supabaseAdmin
       .from('places')
       .select('category')
-      .not('category', 'is', null);
+      .not('category', 'is', null)
+      .eq('user_id', userId);
 
     if (city) {
       query = query.ilike('city', `%${city}%`);
-    }
-
-    if (myCategories && userId) {
-      query = query.eq('user_id', userId);
     }
 
     const { data, error } = await query;
@@ -50,7 +62,7 @@ export async function GET(request: Request) {
     }
 
     // Deduplicate, clean, and sort
-    let categories = Array.from(new Set(data.map((item: any) => item.category)))
+    let categories = Array.from(new Set((data ?? []).map((item: any) => item.category)))
       .filter((c): c is string => typeof c === 'string' && c.trim().length > 0);
 
     if (search) {

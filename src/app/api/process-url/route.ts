@@ -205,7 +205,13 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
 
 export async function POST(request: Request) {
   try {
+    const headerUserId = request.headers.get('x-user-id');
     const { url, userId } = await request.json();
+    const finalUserId = userId || headerUserId;
+
+    if (!finalUserId) {
+      return NextResponse.json({ error: 'Unauthorized. Authenticated session required.' }, { status: 401 });
+    }
 
     if (!url) {
       return NextResponse.json({ error: 'URL is required' }, { status: 400 });
@@ -285,7 +291,7 @@ export async function POST(request: Request) {
           status: 'pending',
           platform,
           content_id: tempContentId,
-          user_id: userId || null
+          user_id: finalUserId || null
         })
         .select('id')
         .single();
@@ -297,7 +303,7 @@ export async function POST(request: Request) {
     }
 
     // Execute the pipeline synchronously and await completion
-    const finalPostId = await runSynchronousPipeline(origin, cleanUrl, socialPostId, userId);
+    const finalPostId = await runSynchronousPipeline(origin, cleanUrl, socialPostId, finalUserId);
 
     // Fetch and return the completed social post record
     const { data: completedPost, error: fetchErr } = await supabaseAdmin
