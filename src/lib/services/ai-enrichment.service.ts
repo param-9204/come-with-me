@@ -214,7 +214,7 @@ Audio Transcript: "${transcript || 'None'}"
 Extract all places/location details.`;
 
     const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: 'gpt-4o',
       messages: [
         { role: 'system', content: PLACE_SYSTEM_PROMPT },
         { role: 'user', content: userMessage },
@@ -307,7 +307,7 @@ Extract all places/location details.`;
       },
       // OCR results (our key addition)
       ocr_gpt_vision: gptOcrTexts.slice(0, 30),
-      ocr_apify: apifyOcrTexts.slice(0, 30),
+      ocr_apify: apifyOcrTexts.slice(0, 1000),
       // Audio transcript
       whisper_transcript: transcript || null,
     };
@@ -325,7 +325,7 @@ Audio transcript available: ${transcriptAvailable}
 Return the full analysis JSON.`;
 
     const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: 'gpt-4o',
       messages: [
         { role: 'system', content: ANALYSIS_SYSTEM_PROMPT },
         { role: 'user', content: userMessage },
