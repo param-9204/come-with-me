@@ -1,8 +1,13 @@
 import { NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
+import { getAuthUser } from '@/lib/auth';
 
 /**
  * GET /api/categories
+ *
+ * PUBLIC endpoint — no auth required.
+ * If the request includes a valid Clerk Bearer token or x-user-id header,
+ * results are filtered to that user's categories. Otherwise all categories are returned.
  *
  * Query params:
  *   search      - filter category names (case-insensitive partial match)
@@ -13,32 +18,19 @@ import { supabaseAdmin } from '@/lib/supabase';
  */
 export async function GET(request: Request) {
   try {
-    const userId = request.headers.get('x-user-id');
+    // Optionally resolve user ID — null is fine (anonymous request returns all categories)
+    const authUser = await getAuthUser(request);
+    const userId = authUser?.id || request.headers.get('x-user-id') || null;
+
     const { searchParams } = new URL(request.url);
 
     // ── Filters ─────────────────────────────────────────────────────
     const search = searchParams.get('search')?.trim() ?? '';
     const city   = searchParams.get('city')?.trim()   ?? '';
-    const myCategories = searchParams.get('myCategories') === 'true';
 
     // ── Pagination ──────────────────────────────────────────────────
     const limit  = Math.min(parseInt(searchParams.get('limit') ?? '50', 10), 100);
     const page   = Math.max(parseInt(searchParams.get('page')  ?? '1',  10), 1);
-
-    if (!userId) {
-      return NextResponse.json({
-        success: true,
-        categories: [],
-        pagination: {
-          page,
-          limit,
-          total_items: 0,
-          total_pages: 0,
-          has_next: false,
-          has_prev: false,
-        },
-      });
-    }
 
     // ── Sorting ─────────────────────────────────────────────────────
     const ascending = (searchParams.get('sort_order') ?? 'asc') === 'asc';
@@ -47,8 +39,12 @@ export async function GET(request: Request) {
     let query = supabaseAdmin
       .from('places')
       .select('category')
-      .not('category', 'is', null)
-      .eq('user_id', userId);
+      .not('category', 'is', null);
+
+    // Filter by user if authenticated; otherwise return categories from all places
+    if (userId) {
+      query = query.eq('user_id', userId);
+    }
 
     if (city) {
       query = query.ilike('city', `%${city}%`);
