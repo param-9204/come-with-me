@@ -18,8 +18,8 @@ import { getAuthUser } from '@/lib/auth';
 export async function GET(request: Request) {
   try {
     // Optionally resolve user ID — null is fine (anonymous request returns all cities)
-    const authUser = await getAuthUser(request);
-    const userId = authUser?.id || request.headers.get('x-user-id') || null;
+    // const authUser = await getAuthUser(request);
+    // const userId = authUser?.id || request.headers.get('x-user-id') || null;
 
     const { searchParams } = new URL(request.url);
 
@@ -42,9 +42,9 @@ export async function GET(request: Request) {
       .range(offset, offset + limit - 1);
 
     // Filter by user if authenticated; otherwise return all cities
-    if (userId) {
-      query = query.eq('user_id', userId);
-    }
+    // if (userId) {
+    //   query = query.eq('user_id', userId);
+    // }
 
 
     if (search) {

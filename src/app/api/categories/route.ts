@@ -19,18 +19,18 @@ import { getAuthUser } from '@/lib/auth';
 export async function GET(request: Request) {
   try {
     // Optionally resolve user ID — null is fine (anonymous request returns all categories)
-    const authUser = await getAuthUser(request);
-    const userId = authUser?.id || request.headers.get('x-user-id') || null;
+    // const authUser = await getAuthUser(request);
+    // const userId = authUser?.id || request.headers.get('x-user-id') || null;
 
     const { searchParams } = new URL(request.url);
 
     // ── Filters ─────────────────────────────────────────────────────
     const search = searchParams.get('search')?.trim() ?? '';
-    const city   = searchParams.get('city')?.trim()   ?? '';
+    const city = searchParams.get('city')?.trim() ?? '';
 
     // ── Pagination ──────────────────────────────────────────────────
-    const limit  = Math.min(parseInt(searchParams.get('limit') ?? '50', 10), 100);
-    const page   = Math.max(parseInt(searchParams.get('page')  ?? '1',  10), 1);
+    const limit = Math.min(parseInt(searchParams.get('limit') ?? '50', 10), 100);
+    const page = Math.max(parseInt(searchParams.get('page') ?? '1', 10), 1);
 
     // ── Sorting ─────────────────────────────────────────────────────
     const ascending = (searchParams.get('sort_order') ?? 'asc') === 'asc';
@@ -42,9 +42,9 @@ export async function GET(request: Request) {
       .not('category', 'is', null);
 
     // Filter by user if authenticated; otherwise return categories from all places
-    if (userId) {
-      query = query.eq('user_id', userId);
-    }
+    // if (userId) {
+    //   query = query.eq('user_id', userId);
+    // }
 
     if (city) {
       query = query.ilike('city', `%${city}%`);
