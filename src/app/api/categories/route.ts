@@ -13,11 +13,13 @@ import { supabaseAdmin } from '@/lib/supabase';
  */
 export async function GET(request: Request) {
   try {
+    const userId = request.headers.get('x-user-id');
     const { searchParams } = new URL(request.url);
 
     // ── Filters ─────────────────────────────────────────────────────
     const search = searchParams.get('search')?.trim() ?? '';
     const city   = searchParams.get('city')?.trim()   ?? '';
+    const myCategories = searchParams.get('myCategories') === 'true';
 
     // ── Pagination ──────────────────────────────────────────────────
     const limit  = Math.min(parseInt(searchParams.get('limit') ?? '50', 10), 100);
@@ -34,6 +36,10 @@ export async function GET(request: Request) {
 
     if (city) {
       query = query.ilike('city', `%${city}%`);
+    }
+
+    if (myCategories && userId) {
+      query = query.eq('user_id', userId);
     }
 
     const { data, error } = await query;

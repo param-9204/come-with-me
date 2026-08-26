@@ -12,6 +12,7 @@ import { supabaseAdmin } from '@/lib/supabase';
  */
 export async function GET(request: Request) {
   try {
+    const userId = request.headers.get('x-user-id');
     const { searchParams } = new URL(request.url);
 
     // ── Pagination ──────────────────────────────────────────────────
@@ -24,6 +25,7 @@ export async function GET(request: Request) {
 
     // ── Filters ─────────────────────────────────────────────────────
     const search = searchParams.get('search')?.trim() ?? '';
+    const myCities = searchParams.get('myCities') === 'true';
 
     // ── Build query ─────────────────────────────────────────────────
     let query = supabaseAdmin
@@ -34,6 +36,10 @@ export async function GET(request: Request) {
 
     if (search) {
       query = query.ilike('name', `%${search}%`);
+    }
+
+    if (myCities && userId) {
+      query = query.eq('user_id', userId);
     }
 
     const { data, error, count } = await query;
