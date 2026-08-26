@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
-
+import { getAuthUser } from '@/lib/auth';
 
 /**
  * GET /api/lists
@@ -9,8 +9,8 @@ import { supabaseAdmin } from '@/lib/supabase';
  */
 export async function GET(request: Request) {
   try {
-    const userId = request.headers.get('x-user-id');
-    if (!userId) {
+    const user = await getAuthUser(request);
+    if (!user) {
       return NextResponse.json(
         { error: 'Unauthorized. Authenticated session required.' },
         { status: 401 }
@@ -21,7 +21,7 @@ export async function GET(request: Request) {
     const { data: lists, error: listsError } = await supabaseAdmin
       .from('lists')
       .select('*')
-      .eq('user_id', userId)
+      .eq('user_id', user.id)
       .order('created_at', { ascending: false });
 
     if (listsError) {
@@ -54,8 +54,8 @@ export async function GET(request: Request) {
  */
 export async function POST(request: Request) {
   try {
-    const userId = request.headers.get('x-user-id');
-    if (!userId) {
+    const user = await getAuthUser(request);
+    if (!user) {
       return NextResponse.json(
         { error: 'Unauthorized. Authenticated session required.' },
         { status: 401 }
@@ -76,7 +76,7 @@ export async function POST(request: Request) {
       .replace(/(^-|-$)+/g, '') + '-' + Math.random().toString(36).substring(2, 6);
 
     const insertData = {
-      user_id: userId,
+      user_id: user.id,
       title: title.trim(),
       description: description || null,
       city: city.trim(),
