@@ -205,6 +205,15 @@ CREATE TABLE IF NOT EXISTS public.cities (
   created_at timestamptz DEFAULT now()
 );
 
+-- 13b. SOCIAL POST PLACES JUNCTION TABLE (Many-to-Many linking)
+CREATE TABLE IF NOT EXISTS public.social_post_places (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  social_post_id uuid REFERENCES public.social_posts(id) ON DELETE CASCADE NOT NULL,
+  place_id uuid REFERENCES public.places(id) ON DELETE CASCADE NOT NULL,
+  created_at timestamptz DEFAULT now(),
+  UNIQUE(social_post_id, place_id)
+);
+
 -- 14. ROW LEVEL SECURITY (RLS)
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.places ENABLE ROW LEVEL SECURITY;
@@ -218,6 +227,7 @@ ALTER TABLE public.guide_places ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.follows ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.waitlist ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.cities ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.social_post_places ENABLE ROW LEVEL SECURITY;
 
 -- 15. SECURITY POLICIES (Safe drop & create)
 

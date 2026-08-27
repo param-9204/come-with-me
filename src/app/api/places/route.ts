@@ -51,7 +51,19 @@ export async function GET(request: Request) {
 
     if (category)     query = query.ilike('category', category);
     if (city)         query = query.ilike('city', `%${city}%`);
-    if (socialPostId) query = query.eq('social_post_id', socialPostId);
+    if (socialPostId) {
+      const { data: junctionRows } = await supabaseAdmin
+        .from('social_post_places')
+        .select('place_id')
+        .eq('social_post_id', socialPostId);
+      const placeIds = junctionRows?.map((r) => r.place_id).filter(Boolean) || [];
+
+      if (placeIds.length > 0) {
+        query = query.or(`id.in.(${placeIds.join(',')}),social_post_id.eq.${socialPostId}`);
+      } else {
+        query = query.eq('social_post_id', socialPostId);
+      }
+    }
 
     if (myPlaces) {
       const user = await getAuthUser(request);

@@ -3,6 +3,7 @@ import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { v4 as uuidv4 } from 'uuid';
 import { after } from 'next/server';
 import { ScraperService } from '@/lib/services/scraper.service';
+import { DbService } from '@/lib/services/db.service';
 
 
 export const maxDuration = 300; // Requires Vercel Pro / Fluid Compute
@@ -395,31 +396,7 @@ export async function POST(request: Request) {
         const existingPost = foundCompletedPost || (existingPosts && existingPosts.length > 0 ? existingPosts[0] : null);
 
         if (existingPost && existingPost.status === 'completed') {
-          let places: any[] = [];
-          if (existingPost.place_id) {
-            const { data: primaryData } = await supabaseAdmin
-              .from('places')
-              .select('*')
-              .eq('id', existingPost.place_id)
-              .maybeSingle();
-            if (primaryData) {
-              places.push(primaryData);
-            }
-          }
-
-          if (existingPost.post_url) {
-            const { data: secondaryData } = await supabaseAdmin
-              .from('places')
-              .select('*')
-              .eq('source_url', existingPost.post_url);
-            if (secondaryData) {
-              for (const p of secondaryData) {
-                if (!places.some(x => x.id === p.id)) {
-                  places.push(p);
-                }
-              }
-            }
-          }
+          const places = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
 
           const cleanPost = { ...(existingPost || {}) };
           delete cleanPost.raw_apify_data;
@@ -574,31 +551,7 @@ export async function POST(request: Request) {
             } 
             else if (currentStatus === 'completed') {
               // Fetch final mapped places associated with this post
-              let places: any[] = [];
-              if (dbPost.place_id) {
-                const { data: primaryData } = await supabaseAdmin
-                  .from('places')
-                  .select('*')
-                  .eq('id', dbPost.place_id)
-                  .maybeSingle();
-                if (primaryData) {
-                  places.push(primaryData);
-                }
-              }
-
-              if (dbPost.post_url) {
-                const { data: secondaryData } = await supabaseAdmin
-                  .from('places')
-                  .select('*')
-                  .eq('source_url', dbPost.post_url);
-                if (secondaryData) {
-                  for (const p of secondaryData) {
-                    if (!places.some(x => x.id === p.id)) {
-                      places.push(p);
-                    }
-                  }
-                }
-              }
+              const places = await DbService.getPlacesForSocialPost(socialPostId, dbPost.post_url);
 
               // Fetch the latest updated social post record
               const { data: finalPost } = await supabaseAdmin

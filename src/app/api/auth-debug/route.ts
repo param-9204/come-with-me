@@ -1,16 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getAuthUser } from '@/lib/auth';
 
-/**
- * GET/POST /api/auth-debug
- *
- * Temporary debug endpoint to verify that a Clerk Bearer token is accepted.
- * Call from the mobile app with:
- *   Authorization: Bearer <clerkToken>
- *
- * Returns the resolved user ID if auth succeeds, or 401 with details if it fails.
- * DELETE THIS FILE before going to production.
- */
 export async function GET(request: Request) {
   return handleDebug(request);
 }
