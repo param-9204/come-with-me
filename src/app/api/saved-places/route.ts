@@ -120,7 +120,7 @@ export async function GET(request: Request) {
     const enrichedPlaces = (places ?? []).map((p) => ({
       ...p,
       saved_at: savedAtMap[p.id] ?? null,
-      status: statusMap[p.id] ?? 'SAVED',
+      status: statusMap[p.id] ?? null,
       created_by: p.user_id ? (profilesMap[p.user_id] || 'Anonymous') : 'Anonymous',
     }));
 
@@ -154,7 +154,7 @@ export async function POST(request: Request) {
     }
 
     const body = await request.json();
-    const { placeId, status = 'SAVED' } = body;
+    const { placeId, status = null } = body;
 
     if (!placeId) {
       return NextResponse.json({ error: 'Missing required field: placeId' }, { status: 400 });
