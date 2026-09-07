@@ -50,7 +50,7 @@ export async function GET(request: Request) {
     // ── Fetch saved place IDs for user ──────────────────────────────
     const { data: savedEntries, error: savedError, count } = await supabaseAdmin
       .from('saved_places')
-      .select('created_at, place_id, status', { count: 'exact' })
+      .select('created_at, place_id', { count: 'exact' })
       .eq('user_id', user.id)
       .order('created_at', { ascending })
       .range(offset, offset + limit - 1);
@@ -71,9 +71,6 @@ export async function GET(request: Request) {
     const placeIds = savedEntries.map((e: any) => e.place_id).filter(Boolean);
     const savedAtMap: Record<string, string> = Object.fromEntries(
       savedEntries.map((e: any) => [e.place_id, e.created_at])
-    );
-    const statusMap: Record<string, string> = Object.fromEntries(
-      savedEntries.map((e: any) => [e.place_id, e.status])
     );
 
     // ── Fetch full place details ─────────────────────────────────────
@@ -120,7 +117,6 @@ export async function GET(request: Request) {
     const enrichedPlaces = (places ?? []).map((p) => ({
       ...p,
       saved_at: savedAtMap[p.id] ?? null,
-      status: statusMap[p.id] ?? null,
       created_by: p.user_id ? (profilesMap[p.user_id] || 'Anonymous') : 'Anonymous',
     }));
 
@@ -154,7 +150,7 @@ export async function POST(request: Request) {
     }
 
     const body = await request.json();
-    const { placeId, status = null } = body;
+    const { placeId } = body;
 
     if (!placeId) {
       return NextResponse.json({ error: 'Missing required field: placeId' }, { status: 400 });
@@ -162,12 +158,15 @@ export async function POST(request: Request) {
 
     const { data, error } = await supabaseAdmin
       .from('saved_places')
-      .upsert({ user_id: user.id, place_id: placeId, status }, { onConflict: 'user_id, place_id' })
+      .insert({ user_id: user.id, place_id: placeId })
       .select('id')
       .single();
 
     if (error) {
-      console.error('[Saved Places POST] Upsert error:', error);
+      if (error.code === '23505') {
+        return NextResponse.json({ success: true, message: 'Place already saved' });
+      }
+      console.error('[Saved Places POST] Insert error:', error);
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
 

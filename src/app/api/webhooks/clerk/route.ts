@@ -91,6 +91,7 @@ export async function POST(req: Request) {
           id: userUuid,
           display_name: fullName,
           phone: phone,
+          email: email,
         });
 
       if (profileError) {
@@ -105,6 +106,7 @@ export async function POST(req: Request) {
       const { id, first_name, last_name, phone_numbers } = evt.data;
 
       const clerkId = id;
+      const email = evt.data.email_addresses?.[0]?.email_address || null;
       const firstName = first_name || '';
       const lastName = last_name || '';
       const fullName = [firstName, lastName].filter(Boolean).join(' ') || 'Explorer';
@@ -120,6 +122,7 @@ export async function POST(req: Request) {
         .update({
           display_name: fullName,
           phone: phone,
+          email: email,
         })
         .eq('id', userUuid);
 
