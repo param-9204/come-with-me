@@ -20,21 +20,21 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url);
 
     // ── Pagination ──────────────────────────────────────────────────
-    const limit   = Math.min(parseInt(searchParams.get('limit')  ?? '10', 10), 100);
-    const page    = Math.max(parseInt(searchParams.get('page')   ?? '1',  10), 1);
-    const offset  = (page - 1) * limit;
+    const limit = Math.min(parseInt(searchParams.get('limit') ?? '10', 10), 100);
+    const page = Math.max(parseInt(searchParams.get('page') ?? '1', 10), 1);
+    const offset = (page - 1) * limit;
 
     // ── Sorting ─────────────────────────────────────────────────────
     const ALLOWED_SORT = ['name', 'category', 'city', 'created_at', 'rating'];
-    const sortBy    = ALLOWED_SORT.includes(searchParams.get('sort_by') ?? '') ? searchParams.get('sort_by')! : 'created_at';
+    const sortBy = ALLOWED_SORT.includes(searchParams.get('sort_by') ?? '') ? searchParams.get('sort_by')! : 'created_at';
     const ascending = (searchParams.get('sort_order') ?? 'desc') === 'asc';
 
     // ── Filters ─────────────────────────────────────────────────────
-    const search       = searchParams.get('search')?.trim()   ?? '';
-    const category     = searchParams.get('category')?.trim() ?? '';
-    const city         = searchParams.get('city')?.trim()     ?? '';
+    const search = searchParams.get('search')?.trim() ?? '';
+    const category = searchParams.get('category')?.trim() ?? '';
+    const city = searchParams.get('city')?.trim() ?? '';
     const socialPostId = searchParams.get('social_post_id')?.trim() ?? '';
-    const myPlaces     = searchParams.get('my_places') === 'true';
+    const myPlaces = searchParams.get('my_places') === 'true';
 
     // ── Build query ─────────────────────────────────────────────────
     let query = supabaseAdmin
@@ -49,8 +49,8 @@ export async function GET(request: Request) {
       );
     }
 
-    if (category)     query = query.ilike('category', category);
-    if (city)         query = query.ilike('city', `%${city}%`);
+    if (category) query = query.ilike('category', category);
+    if (city) query = query.ilike('city', `%${city}%`);
     if (socialPostId) {
       const { data: junctionRows } = await supabaseAdmin
         .from('social_post_places')
