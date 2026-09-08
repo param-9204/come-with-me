@@ -49,7 +49,7 @@ export async function GET(request: Request) {
       );
     }
 
-    if (category) query = query.ilike('category', category);
+    if (category && category.toUpperCase() !== 'ALL') query = query.ilike('category', category);
     if (city) query = query.ilike('city', `%${city}%`);
     if (socialPostId) {
       const { data: junctionRows } = await supabaseAdmin
@@ -83,25 +83,32 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
-    // ── Enrich with creator display names ───────────────────────────
+    // ── Enrich with creator display names & avatars ─────────────────
     const userIds = [...new Set((places ?? []).map((p) => p.user_id).filter(Boolean))];
-    let profilesMap: Record<string, string> = {};
+    let profilesMap: Record<string, { display_name: string; avatar_url: string | null }> = {};
     if (userIds.length > 0) {
       const { data: profiles } = await supabaseAdmin
         .from('profiles')
-        .select('id, display_name')
+        .select('id, display_name, avatar_url')
         .in('id', userIds);
       if (profiles) {
         profilesMap = Object.fromEntries(
-          profiles.map((p) => [p.id, p.display_name || 'Anonymous'])
+          profiles.map((p) => [
+            p.id,
+            { display_name: p.display_name || 'Anonymous', avatar_url: p.avatar_url || null },
+          ])
         );
       }
     }
 
-    const enrichedPlaces = (places ?? []).map((p) => ({
-      ...p,
-      created_by: p.user_id ? (profilesMap[p.user_id] || 'Anonymous') : 'Anonymous',
-    }));
+    const enrichedPlaces = (places ?? []).map((p) => {
+      const profile = p.user_id ? profilesMap[p.user_id] : null;
+      return {
+        ...p,
+        created_by: profile?.display_name || 'Anonymous',
+        creator_avatar: profile?.avatar_url || null,
+      };
+    });
 
     const totalItems = count ?? 0;
     const totalPages = Math.ceil(totalItems / limit);

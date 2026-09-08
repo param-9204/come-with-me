@@ -62,9 +62,9 @@ async function runBackgroundPipeline(
           }),
           tempAudioPath
             ? WhisperService.processAudio(tempAudioPath).catch((err: any) => {
-                console.warn('[Background Pipeline] Whisper failed (non-fatal):', err.message);
-                return null;
-              })
+              console.warn('[Background Pipeline] Whisper failed (non-fatal):', err.message);
+              return null;
+            })
             : Promise.resolve(null),
         ]);
 
@@ -87,7 +87,7 @@ async function runBackgroundPipeline(
               process.env.AWS_S3_BUCKET_NAME
             ) {
               const fileBuffer = fs.default.readFileSync(tempAudioPath);
-              const s3Url = await S3Service.uploadAudio(fileBuffer, fileName, 'audio/mpeg');
+              const s3Url = await S3Service.uploadFile(fileBuffer, fileName, 'audio/mpeg', "audios");
               const { data: dbData } = await supabaseAdmin
                 .from('audio_uploads')
                 .insert({
@@ -126,7 +126,7 @@ async function runBackgroundPipeline(
         MediaService.cleanupFiles([tempVideoPath]);
       }
 
-    // ── BRANCH B: Carousel / Sidecar — support mixed carousel images + videos ──
+      // ── BRANCH B: Carousel / Sidecar — support mixed carousel images + videos ──
     } else if (isCarousel) {
       const childPosts = (rawApifyDataObj?.childPosts || []) as any[];
 
@@ -247,7 +247,7 @@ async function runBackgroundPipeline(
         }
       }
 
-    // ── BRANCH C: Single Image Post ────────────────────────────────────────────
+      // ── BRANCH C: Single Image Post ────────────────────────────────────────────
     } else {
       const imageUrl = contentData.displayUrl || contentData.videoUrl;
       if (imageUrl) {
@@ -531,8 +531,8 @@ export async function POST(request: Request) {
               );
               try {
                 after(() => bgPromise);
-              } catch (_) {}
-            } 
+              } catch (_) { }
+            }
             else if (currentStatus === 'processing:media') {
               send('processing', {
                 socialPostId,
@@ -540,7 +540,7 @@ export async function POST(request: Request) {
                 failed_stage: null,
                 error_message: null,
               });
-            } 
+            }
             else if (currentStatus === 'processing:analysis') {
               send('processing', {
                 socialPostId,
@@ -548,7 +548,7 @@ export async function POST(request: Request) {
                 failed_stage: null,
                 error_message: null,
               });
-            } 
+            }
             else if (currentStatus === 'completed') {
               // Fetch final mapped places associated with this post
               const places = await DbService.getPlacesForSocialPost(socialPostId, dbPost.post_url);
@@ -577,7 +577,7 @@ export async function POST(request: Request) {
               });
               controller.close();
               break;
-            } 
+            }
             else if (currentStatus === 'failed') {
               let errorMsg = dbPost.error_message || 'Processing failed';
               try {

@@ -12,33 +12,29 @@ import type { SocialContent, AiAnalysisResult, PlaceExtraction } from '../types/
 const PLACE_SYSTEM_PROMPT = `You are a place extraction assistant for the social map app "Come With Me".
 Your job is to extract all physical places (restaurants, cafes, bars, shops, hotels, attractions, destinations) from social media posts.
 
-=== DYNAMIC CATEGORIZATION GUIDE ===
-Determine a highly precise, hyper-specific category for each place by analyzing all video details (OCR text, audio transcripts, caption keywords, hashtags, and social handles):
-1. TRIANGULATE EVIDENCE & KEYWORDS:
-   - Scan OCR text and audio transcripts for specific culinary, beverage, or retail clues:
-     - Keywords "espresso", "latte", "pour over", "roaster" -> "Specialty Coffee Roastery & Cafe"
-     - Keywords "croissant", "pastry", "sourdough", "baguette", "bakery" -> "Artisanal Bakery & Cafe"
-     - Keywords "natural wine", "orange wine", "biodynamic" -> "Natural Wine Bar"
-     - Keywords "speakeasy", "hidden entrance", "secret door" -> "Speakeasy Cocktail Lounge"
-     - Keywords "omakase", "nigiri", "sushi chef" -> "Omakase Sushi Bar"
-     - Keywords "neapolitan", "woodfired", "pizza", "pizzeria" -> "Neapolitan Pizzeria"
-     - Keywords "matcha", "whisk", "ceremonial" -> "Artisanal Matcha Bar"
-2. SPECIFICITY OVER GENERALITY:
-   - Avoid generic terms like "Restaurant", "Bar", "Shop", or "Cafe". Instead, capture the exact cuisine style, vibe, and format:
-     - Dining Styles: Use "Japanese Omakase Spot", "Italian Osteria", "Ramen & Gyoza Shop", "Argentine Steakhouse", "French Bistro", "Spanish Tapas Bar", "Greek Taverna", "Taco Stand", "Korean BBQ Restaurant", "Brunch Cafe", "Artisanal Dessert Parlor".
-     - Beverage & Nightlife: Use "Rooftop Cocktail Bar", "Speakeasy Cocktail Lounge", "Natural Wine Bar", "Craft Brewery Taproom", "Specialty Matcha Bar", "Third-Wave Coffee Shop", "Specialty Boba Shop".
-     - Specialized Retail: Use "Vintage Apparel Store", "Concept Lifestyle Store", "Aesthetic Stationery Shop", "Artisanal Pastry Shop", "Independent Bookstore", "Fine Cheese & Wine Shop".
-     - Sightseeing & Attractions: Use "Contemporary Art Gallery", "Scenic Lookout Point", "Botanical Garden", "Amusement Park Ride", "Historical Landmark Palace", "Public Beach & Boardwalk", "Hiking Trailhead".
-3. COMBINED / MULTI-PURPOSE VENUES: If a place offers dual services (e.g., bookstore cafe or natural wine bar restaurant), use a descriptive combined name like "Bookstore & Cafe" or "Natural Wine Bar & Bistro".
-4. FORMATTING: Always capitalize each word of the category (e.g., "Speakeasy Cocktail Lounge", "Artisanal Bakery & Cafe").
-5. FALLBACK RULE: Only use basic broad categories ("Restaurant", "Cafe", "Bar", "Shop", "Hotel", "Attraction") if there is absolutely no specific context.
+=== FIXED CATEGORIZATION GUIDE ===
+Determine the category for each place by choosing EXACTLY ONE from this fixed list:
+RESTAURANTS, COFFEE, TRAVEL, ADVENTURE, NATURE, CITY, SHOPPING, NIGHTLIFE, CULTURE, HIDDEN GEMS, BARS.
+
+Do NOT invent new categories. Do NOT use hyper-specific categories like "Specialty Coffee Roastery". Only use the exact strings above.
+- RESTAURANTS: Sit-down restaurants, eateries, bistros, pizzerias, food hubs, fine dining, street food.
+- COFFEE: Coffee shops, cafes, roasteries, espresso bars, tea rooms, boba shops.
+- BARS: Cocktail lounges, speakeasies, taprooms, pubs, any place where the primary focus is drinking.
+- NIGHTLIFE: Nightclubs, dance clubs, late-night entertainment.
+- SHOPPING: Retail stores, boutiques, supermarkets, markets.
+- CULTURE: Museums, galleries, temples, historical landmarks, monuments.
+- NATURE: Parks, beaches, hiking trails, mountains, scenic lookouts.
+- ADVENTURE: Amusement parks, sports stadiums, trekking destinations, active experiences.
+- TRAVEL: Hotels, travel destinations, regions, states, islands.
+- CITY: General urban areas or neighborhoods.
+- HIDDEN GEMS: Unique spots that don't fit perfectly into the above but are notable discoveries.
 
 === CRITICAL RULES & INSTRUCTIONS ===
 1. OUTPUT: Return ONLY valid JSON matching the schema. No markdown fences. If no places are found, return "places": [].
 2. MULTI-ENTITY: Extract ALL distinct physical locations.
 3. EVIDENCE PRIORITY: Visual Signage (OCR storefront/decor) > Spoken Words (Audio) > Location Metadata > Caption Place Names > Tagged Venue Handles > Hashtags > Geographic Inference.
 4. ATTRIBUTES:
-   - category: Use the dynamic category derived using the DYNAMIC CATEGORIZATION GUIDE above.
+   - category: Must be EXACTLY ONE of: RESTAURANTS, COFFEE, TRAVEL, ADVENTURE, NATURE, CITY, SHOPPING, NIGHTLIFE, CULTURE, HIDDEN GEMS, BARS.
    - confidence: 0.0 to 1.0 (1.0 = explicit, 0.5 = handle inference).
    - city: Best guess (e.g. from context or handle suffix). Leave blank/null if unclear. Do NOT guess or default.
    - neighborhood & address: Extract ONLY if explicitly supported by inputs. Do not guess/hallucinate.
@@ -61,31 +57,27 @@ Your job is to analyze social media scraper data, OCR frame results, and audio t
    - If a place name is found (e.g. "Victoria Street" or "Old Town"), cross-reference the audio transcript translation or OCR texts to find the target city (e.g. "Edinburgh") and country (e.g. "Scotland"/"United Kingdom").
    - Link the place to the correct city/region mentioned in the audio/OCR rather than leaving the city blank or defaulting it to New York.
 3. EVIDENCE PRIORITY: Trust evidence in this order: Visual Signage (OCR) > Spoken Words (Audio) > Location Metadata > Explicit Caption Names > Tagged Venue Handles > Hashtags.
-4. WHAT IS A PLACE: Physical destinations (states, islands, lakes, streets), attractions (landmarks, historical sites, palaces), or businesses (restaurants, bars, shops). Use the dynamic category derived using the DYNAMIC CATEGORIZATION GUIDE below. Do NOT mix up specific attractions with their city (e.g. name="Taj Mahal", city="Agra", category="Historical Landmark", NOT name="Agra").
+4. WHAT IS A PLACE: Physical destinations (states, islands, lakes, streets), attractions (landmarks, historical sites, palaces), or businesses (restaurants, bars, shops). Use the FIXED CATEGORIZATION GUIDE below to determine the category. Do NOT mix up specific attractions with their city (e.g. name="Taj Mahal", city="Agra", category="CULTURE", NOT name="Agra").
 5. ENRICHED DESCRIPTIONS:
    - Generate rich, user-centric descriptions for each place. 
    - Combine factual details with the context of why the creator is showcasing/recommending the place in the video/audio (e.g., "A historic and colorful street in Edinburgh's Old Town, recommended by the travel creator as a highlight of their scenic train trip from London").
 
-=== DYNAMIC CATEGORIZATION GUIDE ===
-Determine a highly precise, hyper-specific category for each place by analyzing all video details (OCR text, audio transcripts, caption keywords, hashtags, and social handles):
-1. TRIANGULATE EVIDENCE & KEYWORDS:
-   - Scan OCR text and audio transcripts for specific culinary, beverage, or retail clues:
-     - Keywords "espresso", "latte", "pour over", "roaster" -> "Specialty Coffee Roastery & Cafe"
-     - Keywords "croissant", "pastry", "sourdough", "baguette", "bakery" -> "Artisanal Bakery & Cafe"
-     - Keywords "natural wine", "orange wine", "biodynamic" -> "Natural Wine Bar"
-     - Keywords "speakeasy", "hidden entrance", "secret door" -> "Speakeasy Cocktail Lounge"
-     - Keywords "omakase", "nigiri", "sushi chef" -> "Omakase Sushi Bar"
-     - Keywords "neapolitan", "woodfired", "pizza", "pizzeria" -> "Neapolitan Pizzeria"
-     - Keywords "matcha", "whisk", "ceremonial" -> "Artisanal Matcha Bar"
-2. SPECIFICITY OVER GENERALITY:
-   - Avoid generic terms like "Restaurant", "Bar", "Shop", or "Cafe". Instead, capture the exact cuisine style, vibe, and format:
-     - Dining Styles: Use "Japanese Omakase Spot", "Italian Osteria", "Ramen & Gyoza Shop", "Argentine Steakhouse", "French Bistro", "Spanish Tapas Bar", "Greek Taverna", "Taco Stand", "Korean BBQ Restaurant", "Brunch Cafe", "Artisanal Dessert Parlor".
-     - Beverage & Nightlife: Use "Rooftop Cocktail Bar", "Speakeasy Cocktail Lounge", "Natural Wine Bar", "Craft Brewery Taproom", "Specialty Matcha Bar", "Third-Wave Coffee Shop", "Specialty Boba Shop".
-     - Specialized Retail: Use "Vintage Apparel Store", "Concept Lifestyle Store", "Aesthetic Stationery Shop", "Artisanal Pastry Shop", "Independent Bookstore", "Fine Cheese & Wine Shop".
-     - Sightseeing & Attractions: Use "Contemporary Art Gallery", "Scenic Lookout Point", "Botanical Garden", "Amusement Park Ride", "Historical Landmark Palace", "Public Beach & Boardwalk", "Hiking Trailhead", "Historic Shopping Street".
-3. COMBINED / MULTI-PURPOSE VENUES: If a place offers dual services (e.g., bookstore cafe or natural wine bar restaurant), use a descriptive combined name like "Bookstore & Cafe" or "Natural Wine Bar & Bistro".
-4. FORMATTING: Always capitalize each word of the category (e.g., "Speakeasy Cocktail Lounge", "Artisanal Bakery & Cafe").
-5. FALLBACK RULE: Only use basic broad categories ("Restaurant", "Cafe", "Bar", "Shop", "Hotel", "Attraction") if there is absolutely no specific context.
+=== FIXED CATEGORIZATION GUIDE ===
+Determine the category for each place by choosing EXACTLY ONE from this fixed list:
+RESTAURANTS, COFFEE, TRAVEL, ADVENTURE, NATURE, CITY, SHOPPING, NIGHTLIFE, CULTURE, HIDDEN GEMS, BARS.
+
+Do NOT invent new categories. Do NOT use hyper-specific categories like "Specialty Coffee Roastery". Only use the exact strings above.
+- RESTAURANTS: Sit-down restaurants, eateries, bistros, pizzerias, food hubs, fine dining, street food.
+- COFFEE: Coffee shops, cafes, roasteries, espresso bars, tea rooms, boba shops.
+- BARS: Cocktail lounges, speakeasies, taprooms, pubs, any place where the primary focus is drinking.
+- NIGHTLIFE: Nightclubs, dance clubs, late-night entertainment.
+- SHOPPING: Retail stores, boutiques, supermarkets, markets.
+- CULTURE: Museums, galleries, temples, historical landmarks, monuments.
+- NATURE: Parks, beaches, hiking trails, mountains, scenic lookouts.
+- ADVENTURE: Amusement parks, sports stadiums, trekking destinations, active experiences.
+- TRAVEL: Hotels, travel destinations, regions, states, islands.
+- CITY: General urban areas or neighborhoods.
+- HIDDEN GEMS: Unique spots that don't fit perfectly into the above but are notable discoveries.
 5. RESTAURANTS & FOOD LOGIC: Food is NOT a place. Extract food items separately and link them to their associated place via the "foods" array.
    - Extract name, type, description, price, currency, source, confidence, and is_signature.
    - "is_signature" is true ONLY if explicitly described as signature, famous, must-try, viral, bestselling, etc.

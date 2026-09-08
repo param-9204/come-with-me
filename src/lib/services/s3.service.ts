@@ -22,10 +22,11 @@ export class S3Service {
   /**
    * Uploads a file buffer to AWS S3 and returns the public URL.
    */
-  static async uploadAudio(
+  static async uploadFile(
     fileBuffer: Buffer,
     fileName: string,
-    mimeType: string
+    mimeType: string,
+    folderName: string = "general"
   ): Promise<string> {
     const bucketName = process.env.AWS_S3_BUCKET_NAME;
     const region = process.env.AWS_REGION || 'us-east-1';
@@ -35,7 +36,7 @@ export class S3Service {
     }
 
     const s3Client = this.getClient();
-    const key = `audios/${Date.now()}-${fileName}`;
+    const key = `${folderName}/${Date.now()}-${fileName}`;
 
     const command = new PutObjectCommand({
       Bucket: bucketName,

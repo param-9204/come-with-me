@@ -84,7 +84,7 @@ export async function GET(request: Request) {
         `name.ilike.%${search}%,description.ilike.%${search}%,neighborhood.ilike.%${search}%`
       );
     }
-    if (category) placesQuery = placesQuery.ilike('category', category);
+    if (category && category.toUpperCase() !== 'ALL') placesQuery = placesQuery.ilike('category', category);
     if (city) placesQuery = placesQuery.ilike('city', `%${city}%`);
 
     // Sort by place columns if not sorting by saved_at

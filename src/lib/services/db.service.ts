@@ -147,7 +147,7 @@ export class DbService {
         address: address || '',
         city: placeData.city || '',
         neighborhood,
-        category: placeData.category || 'Restaurants',
+        category: placeData.category || 'RESTAURANTS',
         description: placeData.description || '',
         source: sourcePlatform,
         creator_handle: placeData.creator_handle || '',

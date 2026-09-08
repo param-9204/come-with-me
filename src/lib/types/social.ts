@@ -387,7 +387,7 @@ export interface PlaceExtraction {
   city: string;
   neighborhood: string;
   address: string;
-  category: string;
+  category: 'RESTAURANTS' | 'COFFEE' | 'TRAVEL' | 'ADVENTURE' | 'NATURE' | 'CITY' | 'SHOPPING' | 'NIGHTLIFE' | 'CULTURE' | 'HIDDEN GEMS' | 'BARS';
   description: string;
   creator_handle: string;
   confidence: number;

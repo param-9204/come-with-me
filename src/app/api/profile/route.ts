@@ -66,6 +66,8 @@ export async function GET(request: Request) {
           id: newProfile.id,
           displayName: newProfile.display_name,
           phone: newProfile.phone,
+          email: newProfile.email,
+          avatarUrl: newProfile.avatar_url || null,
           createdAt: newProfile.created_at,
         },
       });
@@ -78,6 +80,8 @@ export async function GET(request: Request) {
         id: profile.id,
         displayName: profile.display_name,
         phone: profile.phone,
+        email: profile.email,
+        avatarUrl: profile.avatar_url || null,
         createdAt: profile.created_at,
       },
     });
@@ -96,6 +100,8 @@ export async function GET(request: Request) {
  * Request Body:
  *   displayName? : string
  *   phone?       : string
+ *   avatarUrl?   : string (S3 image URL)
+ *   avatar_url?  : string
  */
 export async function PUT(request: Request) {
   try {
@@ -119,7 +125,7 @@ export async function PUT(request: Request) {
       );
     }
 
-    const { displayName, phone } = body;
+    const { displayName, phone, avatarUrl, avatar_url } = body;
 
     // 3. Prepare the database update object
     const updateData: Record<string, any> = {};
@@ -131,6 +137,11 @@ export async function PUT(request: Request) {
 
     if (phone !== undefined) {
       updateData.phone = typeof phone === 'string' ? phone.trim() : phone;
+    }
+
+    const newAvatarUrl = avatarUrl ?? avatar_url;
+    if (newAvatarUrl !== undefined) {
+      updateData.avatar_url = typeof newAvatarUrl === 'string' ? newAvatarUrl.trim() : newAvatarUrl;
     }
 
     // Check if there are fields to update
@@ -179,6 +190,8 @@ export async function PUT(request: Request) {
         id: updatedProfile.id,
         displayName: updatedProfile.display_name,
         phone: updatedProfile.phone,
+        email: updatedProfile.email,
+        avatarUrl: updatedProfile.avatar_url || null,
         createdAt: updatedProfile.created_at,
       },
     });
