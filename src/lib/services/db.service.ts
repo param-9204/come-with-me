@@ -26,11 +26,21 @@ export class DbService {
     sourcePlatform: string,
     audioTranscript?: string,
     userId?: string,
-    socialPostId?: string
+    socialPostId?: string,
+    authorUsername?: string
   ): Promise<string | null> {
     if (!placeData.name) {
       console.warn('[DB] Place name is null — skipping insert.');
       return null;
+    }
+
+    // Resolve creator_handle fallback from placeData or authorUsername
+    let creatorHandle = (placeData.creator_handle || '').trim();
+    if (!creatorHandle && authorUsername) {
+      creatorHandle = authorUsername.trim();
+    }
+    if (creatorHandle && !creatorHandle.startsWith('@')) {
+      creatorHandle = `@${creatorHandle}`;
     }
 
     // Idempotent: skip geocoding and insertion if place already exists
@@ -151,7 +161,7 @@ export class DbService {
         category: placeData.category || 'RESTAURANTS',
         description: placeData.description || '',
         source: sourcePlatform,
-        creator_handle: placeData.creator_handle || '',
+        creator_handle: creatorHandle,
         source_url: sourceUrl || '',
         audio_transcript: audioTranscript || '',
         latitude: lat,
@@ -533,7 +543,8 @@ export class DbService {
             post.platform || 'instagram',
             transcript,
             post.user_id || undefined,
-            socialPostId
+            socialPostId,
+            post.author_username
           ).catch((err) => {
             console.warn(`[DB] Error saving re-extracted place "${place.name}":`, err.message);
             return null;
