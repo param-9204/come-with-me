@@ -2,6 +2,7 @@ import { supabaseAdmin } from '../supabase';
 import { resolveProfileId } from '../auth';
 import type { SocialContent, AiAnalysisResult, ApifyOcrFrameResult, GptVisionFrameResult, PlaceExtraction } from '../types/social';
 import { LocationService } from './location.service';
+import { AiEnrichmentService } from './ai-enrichment.service';
 
 export interface PlaceInput {
   name: string | null;
@@ -443,4 +444,127 @@ export class DbService {
     console.log(`[DB] Social post saved: ${finalPostId}`);
     return finalPostId;
   }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Re-extract places for an existing completed post using cached data
+  // (Prevents re-scraping the media from scratch when places are missing)
+  // ──────────────────────────────────────────────────────────────────
+  static async reextractAndLinkPlaces(socialPostId: string): Promise<any[]> {
+    try {
+      const { data: post, error } = await supabaseAdmin
+        .from('social_posts')
+        .select('*')
+        .eq('id', socialPostId)
+        .maybeSingle();
+
+      if (error || !post || post.status !== 'completed') {
+        console.warn(`[DB] Cannot re-extract places: Post ${socialPostId} not found or not completed.`);
+        return [];
+      }
+
+      // 1. Gather OCR texts from stored DB columns
+      const ocrTexts: string[] = [];
+      if (post.ocr_combined_text) {
+        ocrTexts.push(post.ocr_combined_text);
+      }
+      if (Array.isArray(post.ocr_frames_apify)) {
+        for (const frame of post.ocr_frames_apify) {
+          if (frame?.text) ocrTexts.push(frame.text);
+        }
+      }
+
+      // 2. Build SocialContent structure from DB row
+      const rawApify = post.raw_apify_data || {};
+      const content: SocialContent = {
+        platform: (post.platform as any) || 'instagram',
+        contentId: post.content_id || '',
+        contentType: (post.content_type as any) || 'video',
+        authorUsername: post.author_username || '',
+        authorFullName: post.owner_full_name || '',
+        caption: post.caption || '',
+        videoUrl: post.video_url || '',
+        displayUrl: post.display_url || '',
+        shortCode: post.short_code || '',
+        hashtags: post.hashtags || [],
+        mentions: post.mentions || [],
+        taggedUsers: post.tagged_users || [],
+        musicInfo: post.music_info || null,
+        videoDuration: post.video_duration || null,
+        dimensions:
+          post.dimensions_width && post.dimensions_height
+            ? { width: post.dimensions_width, height: post.dimensions_height }
+            : null,
+        paidPartnership: !!post.is_paid_partnership,
+        productType: post.product_type || null,
+        publishedAt: post.created_at || null,
+        metrics: {
+          likes: post.likes || 0,
+          views: post.views || 0,
+          plays: post.video_plays || 0,
+          comments: post.comments || 0,
+          shares: 0,
+          saves: 0,
+        },
+        rawApifyData: rawApify,
+      };
+
+      const transcript = post.whisper_transcript || '';
+
+      // 3. Execute OpenAI place extraction using stored text context
+      console.log(`[DB] Re-extracting places using stored data for post ID: ${socialPostId}...`);
+      const extractedPlaces = await AiEnrichmentService.extractPlace(content, transcript, ocrTexts);
+
+      let placeIds: string[] = [];
+      if (extractedPlaces && extractedPlaces.length > 0) {
+        // In-memory deduplication by name and city
+        const seen = new Set<string>();
+        const uniquePlaces = extractedPlaces.filter((p) => {
+          if (!p.name) return false;
+          const key = `${p.name.toLowerCase().trim()}_${(p.city || '').toLowerCase().trim()}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+
+        const savePromises = uniquePlaces.map((place) =>
+          DbService.savePlace(
+            place,
+            post.post_url || '',
+            post.platform || 'instagram',
+            transcript,
+            post.user_id || undefined,
+            socialPostId
+          ).catch((err) => {
+            console.warn(`[DB] Error saving re-extracted place "${place.name}":`, err.message);
+            return null;
+          })
+        );
+
+        const savedIds = await Promise.all(savePromises);
+        placeIds = savedIds.filter(Boolean) as string[];
+      }
+
+      // 4. Update post metadata flag to prevent infinite re-extraction attempts
+      const currentAnalysis = (typeof post.ai_analysis === 'object' && post.ai_analysis !== null) ? post.ai_analysis : {};
+      await supabaseAdmin
+        .from('social_posts')
+        .update({
+          ai_analysis: {
+            ...currentAnalysis,
+            places_checked: true,
+            places_reextracted_at: new Date().toISOString(),
+          },
+        })
+        .eq('id', socialPostId);
+
+      console.log(`[DB] Re-extraction finished for post ${socialPostId}. Discovered ${placeIds.length} place(s).`);
+
+      // 5. Return updated places list
+      return await DbService.getPlacesForSocialPost(socialPostId, post.post_url);
+    } catch (err: any) {
+      console.error('[DB] Re-extract places failed:', err.message);
+      return [];
+    }
+  }
 }
+
