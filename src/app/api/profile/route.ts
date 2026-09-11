@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
-import { getAuthUser } from '@/lib/auth';
+import { getAuthUser, resolveProfileId } from '@/lib/auth';
 
 /**
  * GET /api/profile
@@ -18,11 +18,17 @@ export async function GET(request: Request) {
       );
     }
 
+    const profileId = await resolveProfileId({
+      clerkId: user.clerkId,
+      userIdInput: user.id,
+      email: user.email,
+    });
+
     // 2. Fetch the profile from the database
     const { data: profile, error: fetchError } = await supabaseAdmin
       .from('profiles')
       .select('*')
-      .eq('id', user.id)
+      .eq('id', profileId || user.id)
       .maybeSingle();
 
     if (fetchError) {
@@ -38,11 +44,13 @@ export async function GET(request: Request) {
       const { data: newProfile, error: insertError } = await supabaseAdmin
         .from('profiles')
         .insert({
-          id: user.id,
+          id: profileId || user.id,
+          clerk_user_id: user.clerkId || undefined,
           display_name: 'Explorer',
         })
         .select('*')
         .single();
+
 
       if (insertError) {
         console.error('[Profile GET API] Auto-initialization error:', insertError);
@@ -58,6 +66,8 @@ export async function GET(request: Request) {
           id: newProfile.id,
           displayName: newProfile.display_name,
           phone: newProfile.phone,
+          email: newProfile.email,
+          avatarUrl: newProfile.avatar_url || null,
           createdAt: newProfile.created_at,
         },
       });
@@ -70,6 +80,8 @@ export async function GET(request: Request) {
         id: profile.id,
         displayName: profile.display_name,
         phone: profile.phone,
+        email: profile.email,
+        avatarUrl: profile.avatar_url || null,
         createdAt: profile.created_at,
       },
     });
@@ -88,6 +100,8 @@ export async function GET(request: Request) {
  * Request Body:
  *   displayName? : string
  *   phone?       : string
+ *   avatarUrl?   : string (S3 image URL)
+ *   avatar_url?  : string
  */
 export async function PUT(request: Request) {
   try {
@@ -111,7 +125,7 @@ export async function PUT(request: Request) {
       );
     }
 
-    const { displayName, phone } = body;
+    const { displayName, phone, avatarUrl, avatar_url } = body;
 
     // 3. Prepare the database update object
     const updateData: Record<string, any> = {};
@@ -125,6 +139,11 @@ export async function PUT(request: Request) {
       updateData.phone = typeof phone === 'string' ? phone.trim() : phone;
     }
 
+    const newAvatarUrl = avatarUrl ?? avatar_url;
+    if (newAvatarUrl !== undefined) {
+      updateData.avatar_url = typeof newAvatarUrl === 'string' ? newAvatarUrl.trim() : newAvatarUrl;
+    }
+
     // Check if there are fields to update
     if (Object.keys(updateData).length === 0) {
       return NextResponse.json(
@@ -133,13 +152,20 @@ export async function PUT(request: Request) {
       );
     }
 
+    const profileId = await resolveProfileId({
+      clerkId: user.clerkId,
+      userIdInput: user.id,
+      email: user.email,
+    });
+
     // 5. Update user profile in database
     const { data: updatedProfile, error: updateError } = await supabaseAdmin
       .from('profiles')
       .update(updateData)
-      .eq('id', user.id)
+      .eq('id', profileId || user.id)
       .select('*')
       .maybeSingle();
+
 
     if (updateError) {
       console.error('[Profile PUT API] Update error:', updateError);
@@ -164,6 +190,8 @@ export async function PUT(request: Request) {
         id: updatedProfile.id,
         displayName: updatedProfile.display_name,
         phone: updatedProfile.phone,
+        email: updatedProfile.email,
+        avatarUrl: updatedProfile.avatar_url || null,
         createdAt: updatedProfile.created_at,
       },
     });

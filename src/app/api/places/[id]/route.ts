@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
+import { DbService } from '@/lib/services/db.service';
 
 export async function GET(
   request: Request,
@@ -26,16 +27,8 @@ export async function GET(
     }
 
     if (!place) {
-      // Fallback: Query places by social_post_id = id
-      const { data: placesByPost, error: postPlacesError } = await supabaseAdmin
-        .from('places')
-        .select('*')
-        .eq('social_post_id', id);
-
-      if (postPlacesError) {
-        console.error('[Place Details API] Fetch places by post ID error:', postPlacesError);
-        return NextResponse.json({ error: postPlacesError.message }, { status: 500 });
-      }
+      // Fallback: Query places associated with social post ID
+      const placesByPost = await DbService.getPlacesForSocialPost(id);
 
       if (!placesByPost || placesByPost.length === 0) {
         return NextResponse.json({ error: 'Place or Social Post not found' }, { status: 404 });

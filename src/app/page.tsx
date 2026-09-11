@@ -1008,7 +1008,10 @@ export default function Page() {
                           <div>
                             <p className="text-[11px] text-zinc-500 mb-2">Calls to Action</p>
                             <div className="flex flex-wrap gap-1.5">
-                              {aiAnalysis.promotion.call_to_actions.map((c, i) => <Pill key={i}>{c}</Pill>)}
+                              {aiAnalysis.promotion.call_to_actions.map((c, i) => {
+                                const label = typeof c === 'object' && c !== null ? ((c as any).text || (c as any).action || JSON.stringify(c)) : String(c);
+                                return <Pill key={i}>{label}</Pill>;
+                              })}
                             </div>
                           </div>
                         )}
@@ -1016,7 +1019,10 @@ export default function Page() {
                           <div>
                             <p className="text-[11px] text-zinc-500 mb-2">Offers / Deals</p>
                             <div className="flex flex-wrap gap-1.5">
-                              {aiAnalysis.promotion.offers.map((o, i) => <Pill key={i}>{o}</Pill>)}
+                              {aiAnalysis.promotion.offers.map((o, i) => {
+                                const label = typeof o === 'object' && o !== null ? ((o as any).text || (o as any).title || (o as any).description || (o as any).action || JSON.stringify(o)) : String(o);
+                                return <Pill key={i}>{label}</Pill>;
+                              })}
                             </div>
                           </div>
                         )}

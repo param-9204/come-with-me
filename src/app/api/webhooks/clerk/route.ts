@@ -50,7 +50,7 @@ export async function POST(req: Request) {
 
   try {
     if (eventType === 'user.created') {
-      const { id, email_addresses, first_name, last_name, phone_numbers } = evt.data;
+      const { id, email_addresses, first_name, last_name, phone_numbers, image_url, profile_image_url } = evt.data as any;
 
       const clerkId = id;
       const email = email_addresses?.[0]?.email_address || null;
@@ -58,6 +58,7 @@ export async function POST(req: Request) {
       const lastName = last_name || '';
       const fullName = [firstName, lastName].filter(Boolean).join(' ') || 'Explorer';
       const phone = phone_numbers?.[0]?.phone_number || null;
+      const avatarUrl = image_url || profile_image_url || null;
 
       // Compute deterministic UUID v5
       const userUuid = uuidv5(clerkId, CLERK_UUID_NAMESPACE);
@@ -69,7 +70,7 @@ export async function POST(req: Request) {
           id: userUuid,
           email: email || undefined,
           email_confirm: true,
-          user_metadata: { clerk_id: clerkId, full_name: fullName },
+          user_metadata: { clerk_id: clerkId, full_name: fullName, avatar_url: avatarUrl },
         });
 
         if (authError) {
@@ -91,6 +92,8 @@ export async function POST(req: Request) {
           id: userUuid,
           display_name: fullName,
           phone: phone,
+          email: email,
+          avatar_url: avatarUrl,
         });
 
       if (profileError) {
@@ -102,13 +105,15 @@ export async function POST(req: Request) {
     }
 
     if (eventType === 'user.updated') {
-      const { id, first_name, last_name, phone_numbers } = evt.data;
+      const { id, first_name, last_name, phone_numbers, image_url, profile_image_url } = evt.data as any;
 
       const clerkId = id;
+      const email = evt.data.email_addresses?.[0]?.email_address || null;
       const firstName = first_name || '';
       const lastName = last_name || '';
       const fullName = [firstName, lastName].filter(Boolean).join(' ') || 'Explorer';
       const phone = phone_numbers?.[0]?.phone_number || null;
+      const avatarUrl = image_url || profile_image_url || null;
 
       // Compute deterministic UUID v5
       const userUuid = uuidv5(clerkId, CLERK_UUID_NAMESPACE);
@@ -120,6 +125,8 @@ export async function POST(req: Request) {
         .update({
           display_name: fullName,
           phone: phone,
+          email: email,
+          avatar_url: avatarUrl,
         })
         .eq('id', userUuid);
 

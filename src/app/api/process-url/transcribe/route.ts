@@ -51,7 +51,7 @@ export async function POST(request: Request) {
     if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && process.env.AWS_S3_BUCKET_NAME) {
       try {
         const fileBuffer = fs.readFileSync(/*turbopackIgnore: true*/ tempAudioPath);
-        const s3Url = await S3Service.uploadAudio(fileBuffer, fileName, 'audio/mpeg');
+        const s3Url = await S3Service.uploadFile(fileBuffer, fileName, 'audio/mpeg', "audios");
 
         const { data: dbData, error: dbError } = await supabaseAdmin
           .from('audio_uploads')
@@ -117,7 +117,7 @@ export async function POST(request: Request) {
 
   } catch (error: any) {
     console.error('[API Transcribe] Error:', error);
-    
+
     // Attempt cleanup on error
     try {
       MediaService.cleanupFiles([tempVideoPath, tempAudioPath].filter(Boolean));

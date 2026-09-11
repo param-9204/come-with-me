@@ -63,7 +63,7 @@ export async function POST(request: Request) {
     // 1. Upload to AWS S3 if configured
     if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && process.env.AWS_S3_BUCKET_NAME) {
       try {
-        const s3Url = await S3Service.uploadAudio(buffer, file.name, file.type);
+        const s3Url = await S3Service.uploadFile(buffer, file.name, file.type, "audios");
 
         // Insert entry in DB
         const { data: dbData, error: dbError } = await supabaseAdmin

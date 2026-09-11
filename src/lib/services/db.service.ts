@@ -1,4 +1,5 @@
 import { supabaseAdmin } from '../supabase';
+import { resolveProfileId } from '../auth';
 import type { SocialContent, AiAnalysisResult, ApifyOcrFrameResult, GptVisionFrameResult, PlaceExtraction } from '../types/social';
 import { LocationService } from './location.service';
 
@@ -42,10 +43,7 @@ export class DbService {
     if (existing) {
       console.log(`[DB] Place already exists: ${existing.id}`);
       if (socialPostId) {
-        await supabaseAdmin
-          .from('places')
-          .update({ social_post_id: socialPostId })
-          .eq('id', existing.id);
+        await DbService.linkPlacesToSocialPost(socialPostId, [existing.id]);
       }
       return existing.id;
     }
@@ -97,10 +95,7 @@ export class DbService {
       if (existingByCoords) {
         console.log(`[DB] Place already exists at coordinates (${lat}, ${lng}): "${existingByCoords.name}" (ID: ${existingByCoords.id}). Skipping insertion of "${placeData.name}".`);
         if (socialPostId) {
-          await supabaseAdmin
-            .from('places')
-            .update({ social_post_id: socialPostId })
-            .eq('id', existingByCoords.id);
+          await DbService.linkPlacesToSocialPost(socialPostId, [existingByCoords.id]);
         }
         return existingByCoords.id;
       }
@@ -152,7 +147,7 @@ export class DbService {
         address: address || '',
         city: placeData.city || '',
         neighborhood,
-        category: placeData.category || 'Restaurants',
+        category: placeData.category || 'RESTAURANTS',
         description: placeData.description || '',
         source: sourcePlatform,
         creator_handle: placeData.creator_handle || '',
@@ -172,7 +167,86 @@ export class DbService {
     }
 
     console.log(`[DB] New place saved: ${placeData.name} (${newPlace.id})`);
+    if (socialPostId) {
+      await DbService.linkPlacesToSocialPost(socialPostId, [newPlace.id]);
+    }
     return newPlace.id;
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Link places to a social post via the junction table (social_post_places)
+  // ──────────────────────────────────────────────────────────────────
+  static async linkPlacesToSocialPost(socialPostId: string, placeIds: string[]): Promise<void> {
+    if (!socialPostId || !placeIds.length) return;
+    const rows = placeIds.map((placeId) => ({
+      social_post_id: socialPostId,
+      place_id: placeId,
+    }));
+    const { error } = await supabaseAdmin
+      .from('social_post_places')
+      .upsert(rows, { onConflict: 'social_post_id, place_id' });
+
+    if (error) {
+      console.warn('[DB] Failed to upsert social_post_places:', error.message);
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Get all places associated with a social post (junction + legacy)
+  // ──────────────────────────────────────────────────────────────────
+  static async getPlacesForSocialPost(socialPostId?: string | null, postUrl?: string | null): Promise<any[]> {
+    if (!socialPostId) return [];
+
+    let places: any[] = [];
+
+    // 1. Fetch via social_post_places junction table
+    const { data: junctionRows } = await supabaseAdmin
+      .from('social_post_places')
+      .select('place_id')
+      .eq('social_post_id', socialPostId);
+
+    const junctionPlaceIds = junctionRows?.map((r) => r.place_id).filter(Boolean) || [];
+
+    if (junctionPlaceIds.length > 0) {
+      const { data: junctionPlaces } = await supabaseAdmin
+        .from('places')
+        .select('*')
+        .in('id', junctionPlaceIds);
+      if (junctionPlaces) {
+        places.push(...junctionPlaces);
+      }
+    }
+
+    // 2. Fetch via legacy social_post_id column
+    const { data: directPlaces } = await supabaseAdmin
+      .from('places')
+      .select('*')
+      .eq('social_post_id', socialPostId);
+
+    if (directPlaces) {
+      for (const p of directPlaces) {
+        if (!places.some((existing) => existing.id === p.id)) {
+          places.push(p);
+        }
+      }
+    }
+
+    // 3. Fetch via legacy source_url match
+    if (postUrl) {
+      const { data: urlPlaces } = await supabaseAdmin
+        .from('places')
+        .select('*')
+        .eq('source_url', postUrl);
+      if (urlPlaces) {
+        for (const p of urlPlaces) {
+          if (!places.some((existing) => existing.id === p.id)) {
+            places.push(p);
+          }
+        }
+      }
+    }
+
+    return places;
   }
 
   // ──────────────────────────────────────────────────────────────────
@@ -223,12 +297,17 @@ export class DbService {
       engagementRate = parseFloat(((likes + comments) / views * 100).toFixed(4));
     }
 
+    const resolvedUserId = userId
+      ? await resolveProfileId({ userIdInput: userId })
+      : null;
+
     const payload = {
       // ── Place link ──────────────────────────────
       place_id: placeIds.length > 0 ? placeIds[0] : null,
 
       // ── User association ────────────────────────
-      user_id: userId || null,
+      user_id: resolvedUserId,
+
 
       // ── Platform / type ─────────────────────────
       platform: content.platform,
@@ -345,10 +424,7 @@ export class DbService {
 
           // Link all extracted places to this canonical social post ID
           if (placeIds.length > 0) {
-            await supabaseAdmin
-              .from('places')
-              .update({ social_post_id: existingPost.id })
-              .in('id', placeIds);
+            await DbService.linkPlacesToSocialPost(existingPost.id, placeIds);
           }
 
           return existingPost.id;
@@ -361,10 +437,7 @@ export class DbService {
 
     const finalPostId = data?.id || null;
     if (finalPostId && placeIds.length > 0) {
-      await supabaseAdmin
-        .from('places')
-        .update({ social_post_id: finalPostId })
-        .in('id', placeIds);
+      await DbService.linkPlacesToSocialPost(finalPostId, placeIds);
     }
 
     console.log(`[DB] Social post saved: ${finalPostId}`);

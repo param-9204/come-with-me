@@ -1,5 +1,7 @@
 import { NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
+import { getAuthUser, resolveProfileId } from '@/lib/auth';
+import { DbService } from '@/lib/services/db.service';
 import { v4 as uuidv4 } from 'uuid';
 
 export const maxDuration = 60; // Allow Vercel function to run up to 60 seconds (requires Pro tier or compatible runtime)
@@ -205,7 +207,22 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
 
 export async function POST(request: Request) {
   try {
-    const { url, userId } = await request.json();
+    // 1. Optionally resolve user ID — process-url is PUBLIC (no auth required).
+    //    If the client sends a Clerk Bearer token, middleware header, or userId in
+    //    the body, capture it so we can attribute the post to that user.
+    const authUser = await getAuthUser(request);
+    const headerUserId = request.headers.get('x-user-id');
+    const body = await request.json();
+    const { url, userId: bodyUserId } = body;
+
+    // Resolve profile identity against public.profiles to guarantee valid profile UUID
+    const finalUserId = await resolveProfileId({
+      clerkId: authUser?.clerkId,
+      userIdInput: headerUserId || bodyUserId || authUser?.id,
+      email: authUser?.email,
+    });
+    console.log('[process-url] profile user_id resolved:', finalUserId ?? '(anonymous)');
+
 
     if (!url) {
       return NextResponse.json({ error: 'URL is required' }, { status: 400 });
@@ -237,31 +254,7 @@ export async function POST(request: Request) {
     const existingPost = foundCompletedPost || (existingPosts && existingPosts.length > 0 ? existingPosts[0] : null);
 
     if (existingPost && existingPost.status === 'completed') {
-      let places: any[] = [];
-      if (existingPost.place_id) {
-        const { data: primaryData } = await supabaseAdmin
-          .from('places')
-          .select('*')
-          .eq('id', existingPost.place_id)
-          .maybeSingle();
-        if (primaryData) {
-          places.push(primaryData);
-        }
-      }
-
-      if (existingPost.post_url) {
-        const { data: secondaryData } = await supabaseAdmin
-          .from('places')
-          .select('*')
-          .eq('source_url', existingPost.post_url);
-        if (secondaryData) {
-          for (const p of secondaryData) {
-            if (!places.some(x => x.id === p.id)) {
-              places.push(p);
-            }
-          }
-        }
-      }
+      const places = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
 
       return NextResponse.json({
         success: true,
@@ -285,7 +278,7 @@ export async function POST(request: Request) {
           status: 'pending',
           platform,
           content_id: tempContentId,
-          user_id: userId || null
+          user_id: finalUserId || null
         })
         .select('id')
         .single();
@@ -297,7 +290,8 @@ export async function POST(request: Request) {
     }
 
     // Execute the pipeline synchronously and await completion
-    const finalPostId = await runSynchronousPipeline(origin, cleanUrl, socialPostId, userId);
+    const finalPostId = await runSynchronousPipeline(origin, cleanUrl, socialPostId, finalUserId || undefined);
+
 
     // Fetch and return the completed social post record
     const { data: completedPost, error: fetchErr } = await supabaseAdmin
@@ -310,31 +304,7 @@ export async function POST(request: Request) {
       throw new Error(`Failed to fetch completed post: ${fetchErr?.message}`);
     }
 
-    let places: any[] = [];
-    if (completedPost.place_id) {
-      const { data: primaryData } = await supabaseAdmin
-        .from('places')
-        .select('*')
-        .eq('id', completedPost.place_id)
-        .maybeSingle();
-      if (primaryData) {
-        places.push(primaryData);
-      }
-    }
-
-    if (completedPost.post_url) {
-      const { data: secondaryData } = await supabaseAdmin
-        .from('places')
-        .select('*')
-        .eq('source_url', completedPost.post_url);
-      if (secondaryData) {
-        for (const p of secondaryData) {
-          if (!places.some(x => x.id === p.id)) {
-            places.push(p);
-          }
-        }
-      }
-    }
+    const places = await DbService.getPlacesForSocialPost(completedPost.id, completedPost.post_url);
 
     return NextResponse.json({
       success: true,
@@ -388,32 +358,7 @@ export async function GET(request: Request) {
 
     const post = posts.find(p => p.status === 'completed') || posts[0];
 
-    // Fetch all places linked to this post (primary place_id + secondary post_url matches)
-    let places: any[] = [];
-    if (post.place_id) {
-      const { data: primaryData } = await supabaseAdmin
-        .from('places')
-        .select('*')
-        .eq('id', post.place_id)
-        .maybeSingle();
-      if (primaryData) {
-        places.push(primaryData);
-      }
-    }
-
-    if (post.post_url) {
-      const { data: secondaryData } = await supabaseAdmin
-        .from('places')
-        .select('*')
-        .eq('source_url', post.post_url);
-      if (secondaryData) {
-        for (const p of secondaryData) {
-          if (!places.some(x => x.id === p.id)) {
-            places.push(p);
-          }
-        }
-      }
-    }
+    const places = await DbService.getPlacesForSocialPost(post.id, post.post_url);
 
     return NextResponse.json({
       success: true,

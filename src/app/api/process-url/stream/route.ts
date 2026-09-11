@@ -1,7 +1,10 @@
 import { supabaseAdmin } from '@/lib/supabase';
+import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { v4 as uuidv4 } from 'uuid';
 import { after } from 'next/server';
 import { ScraperService } from '@/lib/services/scraper.service';
+import { DbService } from '@/lib/services/db.service';
+
 
 export const maxDuration = 300; // Requires Vercel Pro / Fluid Compute
 
@@ -59,9 +62,9 @@ async function runBackgroundPipeline(
           }),
           tempAudioPath
             ? WhisperService.processAudio(tempAudioPath).catch((err: any) => {
-                console.warn('[Background Pipeline] Whisper failed (non-fatal):', err.message);
-                return null;
-              })
+              console.warn('[Background Pipeline] Whisper failed (non-fatal):', err.message);
+              return null;
+            })
             : Promise.resolve(null),
         ]);
 
@@ -84,7 +87,7 @@ async function runBackgroundPipeline(
               process.env.AWS_S3_BUCKET_NAME
             ) {
               const fileBuffer = fs.default.readFileSync(tempAudioPath);
-              const s3Url = await S3Service.uploadAudio(fileBuffer, fileName, 'audio/mpeg');
+              const s3Url = await S3Service.uploadFile(fileBuffer, fileName, 'audio/mpeg', "audios");
               const { data: dbData } = await supabaseAdmin
                 .from('audio_uploads')
                 .insert({
@@ -123,7 +126,7 @@ async function runBackgroundPipeline(
         MediaService.cleanupFiles([tempVideoPath]);
       }
 
-    // ── BRANCH B: Carousel / Sidecar — support mixed carousel images + videos ──
+      // ── BRANCH B: Carousel / Sidecar — support mixed carousel images + videos ──
     } else if (isCarousel) {
       const childPosts = (rawApifyDataObj?.childPosts || []) as any[];
 
@@ -244,7 +247,7 @@ async function runBackgroundPipeline(
         }
       }
 
-    // ── BRANCH C: Single Image Post ────────────────────────────────────────────
+      // ── BRANCH C: Single Image Post ────────────────────────────────────────────
     } else {
       const imageUrl = contentData.displayUrl || contentData.videoUrl;
       if (imageUrl) {
@@ -331,7 +334,15 @@ export async function POST(request: Request) {
 
   const { url, userId } = body;
 
+  const authUser = await getAuthUser(request);
+  const resolvedUserId = await resolveProfileId({
+    clerkId: authUser?.clerkId,
+    userIdInput: userId || authUser?.id,
+    email: authUser?.email,
+  });
+
   if (!url) {
+
     return new Response('data: {"error":"URL is required"}\n\n', { status: 400 });
   }
 
@@ -385,31 +396,7 @@ export async function POST(request: Request) {
         const existingPost = foundCompletedPost || (existingPosts && existingPosts.length > 0 ? existingPosts[0] : null);
 
         if (existingPost && existingPost.status === 'completed') {
-          let places: any[] = [];
-          if (existingPost.place_id) {
-            const { data: primaryData } = await supabaseAdmin
-              .from('places')
-              .select('*')
-              .eq('id', existingPost.place_id)
-              .maybeSingle();
-            if (primaryData) {
-              places.push(primaryData);
-            }
-          }
-
-          if (existingPost.post_url) {
-            const { data: secondaryData } = await supabaseAdmin
-              .from('places')
-              .select('*')
-              .eq('source_url', existingPost.post_url);
-            if (secondaryData) {
-              for (const p of secondaryData) {
-                if (!places.some(x => x.id === p.id)) {
-                  places.push(p);
-                }
-              }
-            }
-          }
+          const places = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
 
           const cleanPost = { ...(existingPost || {}) };
           delete cleanPost.raw_apify_data;
@@ -442,7 +429,8 @@ export async function POST(request: Request) {
               status: 'pending',
               platform,
               content_id: `pending_${uuidv4()}`,
-              user_id: userId || null,
+              user_id: resolvedUserId,
+
             })
             .select('id')
             .single();
@@ -543,8 +531,8 @@ export async function POST(request: Request) {
               );
               try {
                 after(() => bgPromise);
-              } catch (_) {}
-            } 
+              } catch (_) { }
+            }
             else if (currentStatus === 'processing:media') {
               send('processing', {
                 socialPostId,
@@ -552,7 +540,7 @@ export async function POST(request: Request) {
                 failed_stage: null,
                 error_message: null,
               });
-            } 
+            }
             else if (currentStatus === 'processing:analysis') {
               send('processing', {
                 socialPostId,
@@ -560,34 +548,10 @@ export async function POST(request: Request) {
                 failed_stage: null,
                 error_message: null,
               });
-            } 
+            }
             else if (currentStatus === 'completed') {
               // Fetch final mapped places associated with this post
-              let places: any[] = [];
-              if (dbPost.place_id) {
-                const { data: primaryData } = await supabaseAdmin
-                  .from('places')
-                  .select('*')
-                  .eq('id', dbPost.place_id)
-                  .maybeSingle();
-                if (primaryData) {
-                  places.push(primaryData);
-                }
-              }
-
-              if (dbPost.post_url) {
-                const { data: secondaryData } = await supabaseAdmin
-                  .from('places')
-                  .select('*')
-                  .eq('source_url', dbPost.post_url);
-                if (secondaryData) {
-                  for (const p of secondaryData) {
-                    if (!places.some(x => x.id === p.id)) {
-                      places.push(p);
-                    }
-                  }
-                }
-              }
+              const places = await DbService.getPlacesForSocialPost(socialPostId, dbPost.post_url);
 
               // Fetch the latest updated social post record
               const { data: finalPost } = await supabaseAdmin
@@ -613,7 +577,7 @@ export async function POST(request: Request) {
               });
               controller.close();
               break;
-            } 
+            }
             else if (currentStatus === 'failed') {
               let errorMsg = dbPost.error_message || 'Processing failed';
               try {

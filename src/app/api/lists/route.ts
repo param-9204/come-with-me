@@ -63,7 +63,7 @@ export async function POST(request: Request) {
     }
 
     const body = await request.json();
-    const { title, description, city = 'New York', coverEmoji = '📍', isPublic = true, slug: inputSlug } = body;
+    const { title, description, city = 'New York', coverEmoji = '📍', isPublic = true, slug: inputSlug, parent_list_id } = body;
 
     if (!title) {
       return NextResponse.json({ error: 'Missing required field: title' }, { status: 400 });
@@ -83,6 +83,7 @@ export async function POST(request: Request) {
       cover_emoji: coverEmoji.trim(),
       is_public: isPublic,
       slug: slug,
+      parent_list_id: parent_list_id || null,
     };
 
     const { data: newList, error: insertError } = await supabaseAdmin

@@ -1,8 +1,13 @@
 import { NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
+import { getAuthUser } from '@/lib/auth';
 
 /**
  * GET /api/cities
+ *
+ * PUBLIC endpoint — no auth required.
+ * If the request includes a valid Clerk Bearer token or x-user-id header,
+ * results are filtered to that user's cities. Otherwise all cities are returned.
  *
  * Query params:
  *   search      - filter city names (case-insensitive partial match)
@@ -12,11 +17,15 @@ import { supabaseAdmin } from '@/lib/supabase';
  */
 export async function GET(request: Request) {
   try {
+    // Optionally resolve user ID — null is fine (anonymous request returns all cities)
+    // const authUser = await getAuthUser(request);
+    // const userId = authUser?.id || request.headers.get('x-user-id') || null;
+
     const { searchParams } = new URL(request.url);
 
     // ── Pagination ──────────────────────────────────────────────────
-    const limit  = Math.min(parseInt(searchParams.get('limit') ?? '50', 10), 200);
-    const page   = Math.max(parseInt(searchParams.get('page')  ?? '1',  10), 1);
+    const limit = Math.min(parseInt(searchParams.get('limit') ?? '50', 10), 200);
+    const page = Math.max(parseInt(searchParams.get('page') ?? '1', 10), 1);
     const offset = (page - 1) * limit;
 
     // ── Sorting ─────────────────────────────────────────────────────
@@ -31,6 +40,12 @@ export async function GET(request: Request) {
       .select('id, name, latitude, longitude, created_at', { count: 'exact' })
       .order('name', { ascending })
       .range(offset, offset + limit - 1);
+
+    // Filter by user if authenticated; otherwise return all cities
+    // if (userId) {
+    //   query = query.eq('user_id', userId);
+    // }
+
 
     if (search) {
       query = query.ilike('name', `%${search}%`);

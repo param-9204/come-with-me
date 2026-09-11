@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS public.places (
   latitude double precision,
   longitude double precision,
   source_url text,
-  user_id uuid REFERENCES auth.users(id) ON DELETE SET NULL,
+  user_id uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
   audio_transcript text,
   social_post_id uuid, -- Foreign key constraint ensured safely below
   created_at timestamptz DEFAULT now()
@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS public.places (
 CREATE TABLE IF NOT EXISTS public.social_posts (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   place_id uuid REFERENCES public.places(id) ON DELETE SET NULL,
-  user_id uuid REFERENCES auth.users(id) ON DELETE SET NULL,
+  user_id uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
   platform text NOT NULL, -- 'tiktok', 'instagram'
   content_type text, -- 'video', 'reel', 'post'
   content_id text NOT NULL, -- The original post ID
@@ -103,7 +103,7 @@ END $$;
 -- 5. SAVED PLACES TABLE (strictly like Image 2)
 CREATE TABLE IF NOT EXISTS public.saved_places (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id uuid REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
+  user_id uuid REFERENCES public.profiles(id) ON DELETE CASCADE NOT NULL,
   place_id uuid REFERENCES public.places(id) ON DELETE CASCADE NOT NULL,
   created_at timestamptz DEFAULT now(),
   UNIQUE(user_id, place_id)
@@ -112,7 +112,7 @@ CREATE TABLE IF NOT EXISTS public.saved_places (
 -- 6. LISTS TABLE (strictly like Image 2)
 CREATE TABLE IF NOT EXISTS public.lists (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id uuid REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
+  user_id uuid REFERENCES public.profiles(id) ON DELETE CASCADE NOT NULL,
   title text NOT NULL,
   description text,
   city text DEFAULT 'New York',
@@ -136,7 +136,7 @@ CREATE TABLE IF NOT EXISTS public.list_places (
 CREATE TABLE IF NOT EXISTS public.list_collaborators (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   list_id uuid REFERENCES public.lists(id) ON DELETE CASCADE NOT NULL,
-  user_id uuid REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
+  user_id uuid REFERENCES public.profiles(id) ON DELETE CASCADE NOT NULL,
   role text DEFAULT 'editor', -- editor | viewer
   created_at timestamptz DEFAULT now(),
   UNIQUE(list_id, user_id)
@@ -179,8 +179,8 @@ CREATE TABLE IF NOT EXISTS public.guide_places (
 -- 11. FOLLOWS TABLE
 CREATE TABLE IF NOT EXISTS public.follows (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  follower_id uuid REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
-  following_id uuid REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
+  follower_id uuid REFERENCES public.profiles(id) ON DELETE CASCADE NOT NULL,
+  following_id uuid REFERENCES public.profiles(id) ON DELETE CASCADE NOT NULL,
   created_at timestamptz DEFAULT now(),
   UNIQUE(follower_id, following_id)
 );
@@ -201,7 +201,17 @@ CREATE TABLE IF NOT EXISTS public.cities (
   name text NOT NULL UNIQUE,
   latitude double precision,
   longitude double precision,
+  user_id uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
   created_at timestamptz DEFAULT now()
+);
+
+-- 13b. SOCIAL POST PLACES JUNCTION TABLE (Many-to-Many linking)
+CREATE TABLE IF NOT EXISTS public.social_post_places (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  social_post_id uuid REFERENCES public.social_posts(id) ON DELETE CASCADE NOT NULL,
+  place_id uuid REFERENCES public.places(id) ON DELETE CASCADE NOT NULL,
+  created_at timestamptz DEFAULT now(),
+  UNIQUE(social_post_id, place_id)
 );
 
 -- 14. ROW LEVEL SECURITY (RLS)
@@ -217,6 +227,7 @@ ALTER TABLE public.guide_places ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.follows ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.waitlist ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.cities ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.social_post_places ENABLE ROW LEVEL SECURITY;
 
 -- 15. SECURITY POLICIES (Safe drop & create)
 
