@@ -254,7 +254,6 @@ export async function resolveProfileId(params: {
       console.error('[Auth] Exception auto-creating profile:', err.message);
     }
   }
-
   return null;
 }
 
