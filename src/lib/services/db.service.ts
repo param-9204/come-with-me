@@ -34,11 +34,9 @@ export class DbService {
       return null;
     }
 
-    // Resolve creator_handle fallback from placeData or authorUsername
-    let creatorHandle = (placeData.creator_handle || '').trim();
-    if (!creatorHandle && authorUsername) {
-      creatorHandle = authorUsername.trim();
-    }
+    // Resolve creator_handle — prioritize authorUsername from the social post
+    let rawHandle = (authorUsername || placeData.creator_handle || '').trim();
+    let creatorHandle = rawHandle;
     if (creatorHandle && !creatorHandle.startsWith('@')) {
       creatorHandle = `@${creatorHandle}`;
     }
@@ -53,6 +51,16 @@ export class DbService {
 
     if (existing) {
       console.log(`[DB] Place already exists: ${existing.id}`);
+      if (creatorHandle) {
+        await supabaseAdmin
+          .from('places')
+          .update({
+            creator_handle: creatorHandle,
+            social_post_id: socialPostId || undefined,
+            user_id: userId || undefined,
+          })
+          .eq('id', existing.id);
+      }
       if (socialPostId) {
         await DbService.linkPlacesToSocialPost(socialPostId, [existing.id]);
       }
@@ -105,6 +113,16 @@ export class DbService {
 
       if (existingByCoords) {
         console.log(`[DB] Place already exists at coordinates (${lat}, ${lng}): "${existingByCoords.name}" (ID: ${existingByCoords.id}). Skipping insertion of "${placeData.name}".`);
+        if (creatorHandle) {
+          await supabaseAdmin
+            .from('places')
+            .update({
+              creator_handle: creatorHandle,
+              social_post_id: socialPostId || undefined,
+              user_id: userId || undefined,
+            })
+            .eq('id', existingByCoords.id);
+        }
         if (socialPostId) {
           await DbService.linkPlacesToSocialPost(socialPostId, [existingByCoords.id]);
         }

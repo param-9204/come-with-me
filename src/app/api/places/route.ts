@@ -51,7 +51,19 @@ export async function GET(request: Request) {
 
     if (category && category.toUpperCase() !== 'ALL') query = query.ilike('category', category);
     if (city) query = query.ilike('city', `%${city}%`);
+    let postAuthorHandle: string | null = null;
     if (socialPostId) {
+      const { data: postData } = await supabaseAdmin
+        .from('social_posts')
+        .select('author_username')
+        .eq('id', socialPostId)
+        .maybeSingle();
+
+      if (postData?.author_username) {
+        const handle = postData.author_username.trim();
+        postAuthorHandle = handle.startsWith('@') ? handle : `@${handle}`;
+      }
+
       const { data: junctionRows } = await supabaseAdmin
         .from('social_post_places')
         .select('place_id')
@@ -101,12 +113,41 @@ export async function GET(request: Request) {
       }
     }
 
+    const handles = Array.from(
+      new Set(
+        (places ?? [])
+          .map((p) => postAuthorHandle || p.creator_handle)
+          .filter(Boolean)
+      )
+    );
+    const avatarMap = new Map<string, string>();
+
+    if (handles.length > 0) {
+      const cleanHandles = handles.map((h: string) => (h.startsWith('@') ? h.slice(1) : h));
+      const { data: matchedProfiles } = await supabaseAdmin
+        .from('profiles')
+        .select('display_name, avatar_url')
+        .or(`display_name.in.(${cleanHandles.join(',')}),clerk_user_id.in.(${handles.join(',')})`);
+
+      (matchedProfiles || []).forEach((prof: any) => {
+        if (prof.avatar_url) {
+          if (prof.display_name) avatarMap.set(`@${prof.display_name.toLowerCase()}`, prof.avatar_url);
+          if (prof.display_name) avatarMap.set(prof.display_name.toLowerCase(), prof.avatar_url);
+        }
+      });
+    }
+
     const enrichedPlaces = (places ?? []).map((p) => {
       const profile = p.user_id ? profilesMap[p.user_id] : null;
+      const effectiveHandle = postAuthorHandle || p.creator_handle;
+      const handleKey = (effectiveHandle || '').toLowerCase();
+      const avatar = avatarMap.get(handleKey) || profile?.avatar_url || null;
+
       return {
         ...p,
+        creator_handle: effectiveHandle,
         created_by: profile?.display_name || 'Anonymous',
-        creator_avatar: profile?.avatar_url || null,
+        creator_avatar: avatar,
       };
     });
 
