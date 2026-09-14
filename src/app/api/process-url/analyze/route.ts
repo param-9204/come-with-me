@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
-import { getAuthUser } from '@/lib/auth';
+import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { AiEnrichmentService } from '@/lib/services/ai-enrichment.service';
 import { DbService } from '@/lib/services/db.service';
 import { ApifyOcrService } from '@/lib/services/apify-ocr.service';
@@ -10,7 +10,6 @@ export async function POST(request: Request) {
   try {
     const user = await getAuthUser(request);
     const resolvedUserId = user?.id || null;
-
     const body = await request.json();
     const {
       content,
@@ -23,7 +22,8 @@ export async function POST(request: Request) {
       socialPostId: inputSocialPostId,
     } = body;
 
-    const finalUserId = userId || resolvedUserId;
+
+    const finalUserId = (userId || resolvedUserId) || undefined;
 
     if (!content || !url) {
       return NextResponse.json({ error: 'Missing required fields: content and url' }, { status: 400 });
@@ -65,7 +65,7 @@ export async function POST(request: Request) {
 
       const savePlacePromises = uniquePlaces.map(async (place) => {
         try {
-          return await DbService.savePlace(place, url, content.platform, transcript || '', finalUserId, inputSocialPostId);
+          return await DbService.savePlace(place, url, content.platform, transcript || '', finalUserId, inputSocialPostId, content.authorUsername);
         } catch (placeErr: any) {
           console.error('[API Analyze] Error saving individual place:', place.name, placeErr.message);
           return null;
@@ -138,6 +138,20 @@ export async function POST(request: Request) {
       },
     };
 
+    // Fetch fully enriched saved places with author_username and creator details
+    const savedPlaces = socialPostId ? await DbService.getPlacesForSocialPost(socialPostId, url) : [];
+    const finalAuthorUsername = content?.authorUsername ? content.authorUsername.replace(/^@/, '') : null;
+    const finalCreatorHandle = content?.authorUsername ? (content.authorUsername.startsWith('@') ? content.authorUsername : `@${content.authorUsername}`) : null;
+
+    const finalPlaces = savedPlaces.length > 0
+      ? savedPlaces
+      : (placeAnalysis || []).map((p: any) => ({
+          ...p,
+          author_username: finalAuthorUsername,
+          creator_handle: finalCreatorHandle,
+          creators: finalCreatorHandle ? [{ creator_handle: finalCreatorHandle, post_url: url, platform: content?.platform }] : [],
+        }));
+
     return NextResponse.json({
       success: true,
       scrapedData: content,
@@ -145,8 +159,8 @@ export async function POST(request: Request) {
       transcript,
       ocrComparison,
       aiAnalysis,
-      places: placeAnalysis,
-      place: placeAnalysis && placeAnalysis.length > 0 ? placeAnalysis[0] : null,
+      places: finalPlaces,
+      place: finalPlaces.length > 0 ? finalPlaces[0] : null,
       placeIds,
       socialPostId,
       audioUpload: linkedAudio,

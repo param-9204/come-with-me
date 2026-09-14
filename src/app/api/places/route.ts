@@ -51,7 +51,19 @@ export async function GET(request: Request) {
 
     if (category && category.toUpperCase() !== 'ALL') query = query.ilike('category', category);
     if (city) query = query.ilike('city', `%${city}%`);
+    let postAuthorHandle: string | null = null;
     if (socialPostId) {
+      const { data: postData } = await supabaseAdmin
+        .from('social_posts')
+        .select('author_username')
+        .eq('id', socialPostId)
+        .maybeSingle();
+
+      if (postData?.author_username) {
+        const handle = postData.author_username.trim();
+        postAuthorHandle = handle.startsWith('@') ? handle : `@${handle}`;
+      }
+
       const { data: junctionRows } = await supabaseAdmin
         .from('social_post_places')
         .select('place_id')
@@ -59,9 +71,10 @@ export async function GET(request: Request) {
       const placeIds = junctionRows?.map((r) => r.place_id).filter(Boolean) || [];
 
       if (placeIds.length > 0) {
-        query = query.or(`id.in.(${placeIds.join(',')}),social_post_id.eq.${socialPostId}`);
+        query = query.in('id', placeIds);
       } else {
-        query = query.eq('social_post_id', socialPostId);
+        // Return no results if socialPostId has no linked places
+        query = query.eq('id', '00000000-0000-0000-0000-000000000000');
       }
     }
 
@@ -73,7 +86,29 @@ export async function GET(request: Request) {
           { status: 401 }
         );
       }
-      query = query.eq('user_id', user.id);
+
+      const { data: userPosts } = await supabaseAdmin
+        .from('social_posts')
+        .select('id')
+        .eq('user_id', user.id);
+
+      const userPostIds = userPosts?.map((p) => p.id) || [];
+
+      if (userPostIds.length > 0) {
+        const { data: userJunction } = await supabaseAdmin
+          .from('social_post_places')
+          .select('place_id')
+          .in('social_post_id', userPostIds);
+
+        const myPlaceIds = [...new Set(userJunction?.map((j) => j.place_id).filter(Boolean))];
+        if (myPlaceIds.length > 0) {
+          query = query.in('id', myPlaceIds);
+        } else {
+          query = query.eq('id', '00000000-0000-0000-0000-000000000000');
+        }
+      } else {
+        query = query.eq('id', '00000000-0000-0000-0000-000000000000');
+      }
     }
 
     const { data: places, error, count } = await query;
@@ -83,30 +118,82 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
-    // ── Enrich with creator display names & avatars ─────────────────
-    const userIds = [...new Set((places ?? []).map((p) => p.user_id).filter(Boolean))];
-    let profilesMap: Record<string, { display_name: string; avatar_url: string | null }> = {};
-    if (userIds.length > 0) {
-      const { data: profiles } = await supabaseAdmin
-        .from('profiles')
-        .select('id, display_name, avatar_url')
-        .in('id', userIds);
-      if (profiles) {
-        profilesMap = Object.fromEntries(
-          profiles.map((p) => [
-            p.id,
-            { display_name: p.display_name || 'Anonymous', avatar_url: p.avatar_url || null },
-          ])
-        );
+    // ── Fetch creator handles dynamically from social_post_places -> social_posts ──
+    const fetchedPlaceIds = (places ?? []).map((p) => p.id).filter(Boolean);
+    let placeCreatorsMap: Record<string, { creator_handle: string; post_url: string; platform: string }[]> = {};
+
+    if (fetchedPlaceIds.length > 0) {
+      const { data: junctionData } = await supabaseAdmin
+        .from('social_post_places')
+        .select('place_id, social_posts(author_username, post_url, platform)')
+        .in('place_id', fetchedPlaceIds);
+
+      if (junctionData) {
+        junctionData.forEach((row: any) => {
+          const pId = row.place_id;
+          const post = row.social_posts;
+          if (pId && post?.author_username) {
+            let handle = post.author_username.trim();
+            if (!handle.startsWith('@')) handle = `@${handle}`;
+
+            if (!placeCreatorsMap[pId]) {
+              placeCreatorsMap[pId] = [];
+            }
+            if (!placeCreatorsMap[pId].some((c) => c.creator_handle === handle)) {
+              placeCreatorsMap[pId].push({
+                creator_handle: handle,
+                post_url: post.post_url || '',
+                platform: post.platform || '',
+              });
+            }
+          }
+        });
       }
     }
 
+    const handles = Array.from(
+      new Set(
+        (places ?? [])
+          .flatMap((p) => {
+            const creators = placeCreatorsMap[p.id] || [];
+            return postAuthorHandle
+              ? [postAuthorHandle]
+              : creators.map((c) => c.creator_handle);
+          })
+          .filter(Boolean)
+      )
+    );
+    const avatarMap = new Map<string, string>();
+
+    if (handles.length > 0) {
+      const cleanHandles = handles.map((h: string) => (h.startsWith('@') ? h.slice(1) : h));
+      const { data: matchedProfiles } = await supabaseAdmin
+        .from('profiles')
+        .select('display_name, avatar_url')
+        .or(`display_name.in.(${cleanHandles.join(',')}),clerk_user_id.in.(${handles.join(',')})`);
+
+      (matchedProfiles || []).forEach((prof: any) => {
+        if (prof.avatar_url) {
+          if (prof.display_name) avatarMap.set(`@${prof.display_name.toLowerCase()}`, prof.avatar_url);
+          if (prof.display_name) avatarMap.set(prof.display_name.toLowerCase(), prof.avatar_url);
+        }
+      });
+    }
+
     const enrichedPlaces = (places ?? []).map((p) => {
-      const profile = p.user_id ? profilesMap[p.user_id] : null;
+      const creatorsList = placeCreatorsMap[p.id] || [];
+      const effectiveHandle = postAuthorHandle || (creatorsList.length > 0 ? creatorsList[0].creator_handle : null);
+      const handleKey = (effectiveHandle || '').toLowerCase();
+      const avatar = avatarMap.get(handleKey) || null;
+      const rawAuthorUsername = effectiveHandle ? effectiveHandle.replace(/^@/, '') : null;
+
       return {
         ...p,
-        created_by: profile?.display_name || 'Anonymous',
-        creator_avatar: profile?.avatar_url || null,
+        author_username: rawAuthorUsername,
+        creator_handle: effectiveHandle,
+        creators: creatorsList,
+        created_by: effectiveHandle || 'Community',
+        creator_avatar: avatar,
       };
     });
 

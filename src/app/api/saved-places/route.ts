@@ -39,9 +39,6 @@ export async function GET(request: Request) {
     const sortBy = ALLOWED_SORT.includes(sortByParam) ? sortByParam : 'saved_at';
     const ascending = (searchParams.get('sort_order') ?? 'desc') === 'asc';
 
-    // Map sort_by=saved_at → order on saved_places.created_at
-    const orderCol = sortBy === 'saved_at' ? 'created_at' : `place.${sortBy}`;
-
     // ── Filters ─────────────────────────────────────────────────────
     const search = searchParams.get('search')?.trim() ?? '';
     const category = searchParams.get('category')?.trim() ?? '';
@@ -50,7 +47,7 @@ export async function GET(request: Request) {
     // ── Fetch saved place IDs for user ──────────────────────────────
     const { data: savedEntries, error: savedError, count } = await supabaseAdmin
       .from('saved_places')
-      .select('created_at, place_id', { count: 'exact' })
+      .select('created_at, place_id, social_post_id', { count: 'exact' })
       .eq('user_id', user.id)
       .order('created_at', { ascending })
       .range(offset, offset + limit - 1);
@@ -71,6 +68,9 @@ export async function GET(request: Request) {
     const placeIds = savedEntries.map((e: any) => e.place_id).filter(Boolean);
     const savedAtMap: Record<string, string> = Object.fromEntries(
       savedEntries.map((e: any) => [e.place_id, e.created_at])
+    );
+    const socialPostIdMap: Record<string, string | null> = Object.fromEntries(
+      savedEntries.map((e: any) => [e.place_id, e.social_post_id || null])
     );
 
     // ── Fetch full place details ─────────────────────────────────────
@@ -99,26 +99,53 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: placesError.message }, { status: 500 });
     }
 
-    // ── Enrich with creator display names ───────────────────────────
-    const userIds = [...new Set((places ?? []).map((p) => p.user_id).filter(Boolean))];
-    let profilesMap: Record<string, string> = {};
-    if (userIds.length > 0) {
-      const { data: profiles } = await supabaseAdmin
-        .from('profiles')
-        .select('id, display_name')
-        .in('id', userIds);
-      if (profiles) {
-        profilesMap = Object.fromEntries(
-          profiles.map((p) => [p.id, p.display_name || 'Anonymous'])
-        );
+    // ── Enrich with creator details dynamically ──────────────────────
+    let placeCreatorsMap: Record<string, { creator_handle: string; post_url: string; platform: string }[]> = {};
+
+    if (placeIds.length > 0) {
+      const { data: junctionData } = await supabaseAdmin
+        .from('social_post_places')
+        .select('place_id, social_posts(author_username, post_url, platform)')
+        .in('place_id', placeIds);
+
+      if (junctionData) {
+        junctionData.forEach((row: any) => {
+          const pId = row.place_id;
+          const post = row.social_posts;
+          if (pId && post?.author_username) {
+            let handle = post.author_username.trim();
+            if (!handle.startsWith('@')) handle = `@${handle}`;
+
+            if (!placeCreatorsMap[pId]) {
+              placeCreatorsMap[pId] = [];
+            }
+            if (!placeCreatorsMap[pId].some((c) => c.creator_handle === handle)) {
+              placeCreatorsMap[pId].push({
+                creator_handle: handle,
+                post_url: post.post_url || '',
+                platform: post.platform || '',
+              });
+            }
+          }
+        });
       }
     }
 
-    const enrichedPlaces = (places ?? []).map((p) => ({
-      ...p,
-      saved_at: savedAtMap[p.id] ?? null,
-      created_by: p.user_id ? (profilesMap[p.user_id] || 'Anonymous') : 'Anonymous',
-    }));
+    const enrichedPlaces = (places ?? []).map((p) => {
+      const creatorsList = placeCreatorsMap[p.id] || [];
+      const effectiveHandle = creatorsList.length > 0 ? creatorsList[0].creator_handle : null;
+      const rawAuthorUsername = effectiveHandle ? effectiveHandle.replace(/^@/, '') : null;
+
+      return {
+        ...p,
+        social_post_id: socialPostIdMap[p.id] ?? null,
+        saved_at: savedAtMap[p.id] ?? null,
+        author_username: rawAuthorUsername,
+        creator_handle: effectiveHandle,
+        creators: creatorsList,
+        created_by: effectiveHandle || 'Community',
+      };
+    });
 
     const totalItems = count ?? 0;
     const totalPages = Math.ceil(totalItems / limit);
@@ -150,7 +177,8 @@ export async function POST(request: Request) {
     }
 
     const body = await request.json();
-    const { placeId } = body;
+    const { placeId, socialPostId, social_post_id } = body;
+    const finalSocialPostId = socialPostId || social_post_id || null;
 
     if (!placeId) {
       return NextResponse.json({ error: 'Missing required field: placeId' }, { status: 400 });
@@ -158,7 +186,11 @@ export async function POST(request: Request) {
 
     const { data, error } = await supabaseAdmin
       .from('saved_places')
-      .insert({ user_id: user.id, place_id: placeId })
+      .insert({
+        user_id: user.id,
+        place_id: placeId,
+        social_post_id: finalSocialPostId,
+      })
       .select('id')
       .single();
 
