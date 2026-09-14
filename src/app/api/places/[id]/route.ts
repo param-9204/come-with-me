@@ -34,24 +34,9 @@ export async function GET(
         return NextResponse.json({ error: 'Place or Social Post not found' }, { status: 404 });
       }
 
-      // Enrich places with creator details
-      const userIds = [...new Set(placesByPost.map((p) => p.user_id).filter(Boolean))];
-      let profilesMap: Record<string, string> = {};
-      if (userIds.length > 0) {
-        const { data: profiles } = await supabaseAdmin
-          .from('profiles')
-          .select('id, display_name')
-          .in('id', userIds);
-        if (profiles) {
-          profilesMap = Object.fromEntries(
-            profiles.map((p) => [p.id, p.display_name || 'Anonymous'])
-          );
-        }
-      }
-
       const enrichedPlaces = placesByPost.map((p) => ({
         ...p,
-        created_by: p.user_id ? (profilesMap[p.user_id] || 'Anonymous') : 'Anonymous',
+        created_by: 'Community',
       }));
 
       return NextResponse.json({
@@ -61,24 +46,42 @@ export async function GET(
       });
     }
 
-    // Retrieve creator details from profiles table
-    let createdBy = 'Anonymous';
-    if (place.user_id) {
-      const { data: profile } = await supabaseAdmin
-        .from('profiles')
-        .select('display_name')
-        .eq('id', place.user_id)
-        .maybeSingle();
-      if (profile?.display_name) {
-        createdBy = profile.display_name;
-      }
+    let createdBy = 'Community';
+
+    // Fetch linked social posts & creator handles for this place
+    const { data: junctionData } = await supabaseAdmin
+      .from('social_post_places')
+      .select('social_posts(author_username, post_url, platform, created_at)')
+      .eq('place_id', place.id);
+
+    const creators: { creator_handle: string; post_url: string; platform: string }[] = [];
+    if (junctionData) {
+      junctionData.forEach((row: any) => {
+        const post = row.social_posts;
+        if (post?.author_username) {
+          let handle = post.author_username.trim();
+          if (!handle.startsWith('@')) handle = `@${handle}`;
+
+          if (!creators.some((c) => c.creator_handle === handle)) {
+            creators.push({
+              creator_handle: handle,
+              post_url: post.post_url || '',
+              platform: post.platform || '',
+            });
+          }
+        }
+      });
     }
+
+    const primaryCreatorHandle = creators.length > 0 ? creators[0].creator_handle : null;
 
     return NextResponse.json({
       success: true,
       message: 'Place details retrieved successfully',
       place: {
         ...place,
+        creator_handle: primaryCreatorHandle,
+        creators,
         created_by: createdBy,
       },
       created_by: createdBy,

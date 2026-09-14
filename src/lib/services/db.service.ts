@@ -51,16 +51,6 @@ export class DbService {
 
     if (existing) {
       console.log(`[DB] Place already exists: ${existing.id}`);
-      if (creatorHandle) {
-        await supabaseAdmin
-          .from('places')
-          .update({
-            creator_handle: creatorHandle,
-            social_post_id: socialPostId || undefined,
-            user_id: userId || undefined,
-          })
-          .eq('id', existing.id);
-      }
       if (socialPostId) {
         await DbService.linkPlacesToSocialPost(socialPostId, [existing.id]);
       }
@@ -113,16 +103,6 @@ export class DbService {
 
       if (existingByCoords) {
         console.log(`[DB] Place already exists at coordinates (${lat}, ${lng}): "${existingByCoords.name}" (ID: ${existingByCoords.id}). Skipping insertion of "${placeData.name}".`);
-        if (creatorHandle) {
-          await supabaseAdmin
-            .from('places')
-            .update({
-              creator_handle: creatorHandle,
-              social_post_id: socialPostId || undefined,
-              user_id: userId || undefined,
-            })
-            .eq('id', existingByCoords.id);
-        }
         if (socialPostId) {
           await DbService.linkPlacesToSocialPost(socialPostId, [existingByCoords.id]);
         }
@@ -179,13 +159,10 @@ export class DbService {
         category: placeData.category || 'RESTAURANTS',
         description: placeData.description || '',
         source: sourcePlatform,
-        creator_handle: creatorHandle,
         source_url: sourceUrl || '',
         audio_transcript: audioTranscript || '',
         latitude: lat,
         longitude: lng,
-        user_id: userId || null,
-        social_post_id: socialPostId || null,
       })
       .select('id')
       .single();
@@ -246,21 +223,7 @@ export class DbService {
       }
     }
 
-    // 2. Fetch via legacy social_post_id column
-    const { data: directPlaces } = await supabaseAdmin
-      .from('places')
-      .select('*')
-      .eq('social_post_id', socialPostId);
-
-    if (directPlaces) {
-      for (const p of directPlaces) {
-        if (!places.some((existing) => existing.id === p.id)) {
-          places.push(p);
-        }
-      }
-    }
-
-    // 3. Fetch via legacy source_url match
+    // 2. Fetch via legacy source_url match
     if (postUrl) {
       const { data: urlPlaces } = await supabaseAdmin
         .from('places')
@@ -331,9 +294,6 @@ export class DbService {
       : null;
 
     const payload = {
-      // ── Place link ──────────────────────────────
-      place_id: placeIds.length > 0 ? placeIds[0] : null,
-
       // ── User association ────────────────────────
       user_id: resolvedUserId,
 
