@@ -201,25 +201,27 @@ export class DbService {
   // Get all places associated with a social post (junction + legacy)
   // ──────────────────────────────────────────────────────────────────
   static async getPlacesForSocialPost(socialPostId?: string | null, postUrl?: string | null): Promise<any[]> {
-    if (!socialPostId) return [];
+    if (!socialPostId && !postUrl) return [];
 
     let places: any[] = [];
 
     // 1. Fetch via social_post_places junction table
-    const { data: junctionRows } = await supabaseAdmin
-      .from('social_post_places')
-      .select('place_id')
-      .eq('social_post_id', socialPostId);
+    if (socialPostId) {
+      const { data: junctionRows } = await supabaseAdmin
+        .from('social_post_places')
+        .select('place_id')
+        .eq('social_post_id', socialPostId);
 
-    const junctionPlaceIds = junctionRows?.map((r) => r.place_id).filter(Boolean) || [];
+      const junctionPlaceIds = junctionRows?.map((r) => r.place_id).filter(Boolean) || [];
 
-    if (junctionPlaceIds.length > 0) {
-      const { data: junctionPlaces } = await supabaseAdmin
-        .from('places')
-        .select('*')
-        .in('id', junctionPlaceIds);
-      if (junctionPlaces) {
-        places.push(...junctionPlaces);
+      if (junctionPlaceIds.length > 0) {
+        const { data: junctionPlaces } = await supabaseAdmin
+          .from('places')
+          .select('*')
+          .in('id', junctionPlaceIds);
+        if (junctionPlaces) {
+          places.push(...junctionPlaces);
+        }
       }
     }
 
@@ -238,7 +240,67 @@ export class DbService {
       }
     }
 
-    return places;
+    // 3. Fetch author_username from social_posts for this socialPostId
+    let postAuthorUsername: string | null = null;
+    if (socialPostId) {
+      const { data: post } = await supabaseAdmin
+        .from('social_posts')
+        .select('author_username')
+        .eq('id', socialPostId)
+        .maybeSingle();
+      if (post?.author_username) {
+        postAuthorUsername = post.author_username;
+      }
+    }
+
+    // 4. Enrich every place with author_username, creator_handle, creators
+    const placeIds = places.map((p) => p.id).filter(Boolean);
+    let placeCreatorsMap: Record<string, { creator_handle: string; post_url: string; platform: string }[]> = {};
+
+    if (placeIds.length > 0) {
+      const { data: allJunctions } = await supabaseAdmin
+        .from('social_post_places')
+        .select('place_id, social_posts(author_username, post_url, platform)')
+        .in('place_id', placeIds);
+
+      if (allJunctions) {
+        allJunctions.forEach((row: any) => {
+          const pId = row.place_id;
+          const post = row.social_posts;
+          if (pId && post?.author_username) {
+            let handle = post.author_username.trim();
+            if (!handle.startsWith('@')) handle = `@${handle}`;
+
+            if (!placeCreatorsMap[pId]) {
+              placeCreatorsMap[pId] = [];
+            }
+            if (!placeCreatorsMap[pId].some((c) => c.creator_handle === handle)) {
+              placeCreatorsMap[pId].push({
+                creator_handle: handle,
+                post_url: post.post_url || '',
+                platform: post.platform || '',
+              });
+            }
+          }
+        });
+      }
+    }
+
+    return places.map((p) => {
+      const creatorsList = placeCreatorsMap[p.id] || [];
+      const fallbackHandle = postAuthorUsername
+        ? (postAuthorUsername.startsWith('@') ? postAuthorUsername : `@${postAuthorUsername}`)
+        : null;
+      const effectiveHandle = creatorsList.length > 0 ? creatorsList[0].creator_handle : fallbackHandle;
+      const rawAuthorUsername = effectiveHandle ? effectiveHandle.replace(/^@/, '') : null;
+
+      return {
+        ...p,
+        author_username: rawAuthorUsername,
+        creator_handle: effectiveHandle,
+        creators: creatorsList,
+      };
+    });
   }
 
   // ──────────────────────────────────────────────────────────────────

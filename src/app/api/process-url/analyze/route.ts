@@ -138,6 +138,20 @@ export async function POST(request: Request) {
       },
     };
 
+    // Fetch fully enriched saved places with author_username and creator details
+    const savedPlaces = socialPostId ? await DbService.getPlacesForSocialPost(socialPostId, url) : [];
+    const finalAuthorUsername = content?.authorUsername ? content.authorUsername.replace(/^@/, '') : null;
+    const finalCreatorHandle = content?.authorUsername ? (content.authorUsername.startsWith('@') ? content.authorUsername : `@${content.authorUsername}`) : null;
+
+    const finalPlaces = savedPlaces.length > 0
+      ? savedPlaces
+      : (placeAnalysis || []).map((p: any) => ({
+          ...p,
+          author_username: finalAuthorUsername,
+          creator_handle: finalCreatorHandle,
+          creators: finalCreatorHandle ? [{ creator_handle: finalCreatorHandle, post_url: url, platform: content?.platform }] : [],
+        }));
+
     return NextResponse.json({
       success: true,
       scrapedData: content,
@@ -145,8 +159,8 @@ export async function POST(request: Request) {
       transcript,
       ocrComparison,
       aiAnalysis,
-      places: placeAnalysis,
-      place: placeAnalysis && placeAnalysis.length > 0 ? placeAnalysis[0] : null,
+      places: finalPlaces,
+      place: finalPlaces.length > 0 ? finalPlaces[0] : null,
       placeIds,
       socialPostId,
       audioUpload: linkedAudio,
