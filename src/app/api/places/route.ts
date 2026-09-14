@@ -185,9 +185,11 @@ export async function GET(request: Request) {
       const effectiveHandle = postAuthorHandle || (creatorsList.length > 0 ? creatorsList[0].creator_handle : null);
       const handleKey = (effectiveHandle || '').toLowerCase();
       const avatar = avatarMap.get(handleKey) || null;
+      const rawAuthorUsername = effectiveHandle ? effectiveHandle.replace(/^@/, '') : null;
 
       return {
         ...p,
+        author_username: rawAuthorUsername,
         creator_handle: effectiveHandle,
         creators: creatorsList,
         created_by: effectiveHandle || 'Community',

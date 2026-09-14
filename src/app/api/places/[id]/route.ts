@@ -74,12 +74,14 @@ export async function GET(
     }
 
     const primaryCreatorHandle = creators.length > 0 ? creators[0].creator_handle : null;
+    const rawAuthorUsername = primaryCreatorHandle ? primaryCreatorHandle.replace(/^@/, '') : null;
 
     return NextResponse.json({
       success: true,
       message: 'Place details retrieved successfully',
       place: {
         ...place,
+        author_username: rawAuthorUsername,
         creator_handle: primaryCreatorHandle,
         creators,
         created_by: createdBy,
