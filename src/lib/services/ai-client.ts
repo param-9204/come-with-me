@@ -13,8 +13,8 @@ export function getAIClient(task: AITaskType): AIClientConfig {
   const groqKey = process.env.GROQ_API_KEY;
 
   if (openAiKey) {
-    let model = 'gpt-4o-mini';
-    if (task === 'vision') model = 'gpt-4o-mini';
+    let model = 'gpt-4o';
+    if (task === 'vision') model = 'gpt-4o';
     if (task === 'audio' || task === 'audio-translation') model = 'whisper-1';
 
     return {
