@@ -11,23 +11,31 @@ const PLACE_CATEGORIES = [
 
 const PLACE_SYSTEM_PROMPT = `You are a deterministic place extractor.
 RULES:
-1. Extract ALL physical places/businesses into the "places" array. If none, return [].
-2. Focus MAINLY on accurately identifying the PLACE NAME and its CATEGORY.
-3. Category MUST be exactly one of: ${PLACE_CATEGORIES.join(', ')}.
-4. A city is only a place if it's the main destination. Otherwise put it in the "city" field.
-5. Trust OCR > Audio > Caption > Hashtags.
-6. Handle Inference: @carbone_la -> name: Carbone, city: Los Angeles (la, nyc, miami, chi, sf, dc, nola, atx, london, uk, delhi, bom, mumbai, blr).
-7. Do not extract food as a place.
-8. NO geographic hallucinations. E.g. If you see "Brooklyn", map it to New York City, not Australia, unless explicitly stated.
+1. Extract ONLY the place(s) the post is ACTUALLY ABOUT (featured, reviewed, recommended, visited). Return them in the "places" array. If none, return [].
+2. DO NOT extract places that are merely mentioned, compared to, tagged, or referenced as context. Examples of what to SKIP:
+   - "From the team behind @kyma.nyc" → Kyma is background context, NOT the featured place. Skip it.
+   - "Better than Carbone" → Carbone is a comparison, NOT the featured place. Skip it.
+   - Tagged handles of other restaurants/venues that are not the subject of the post.
+   - Collaborator or photographer handles that happen to be venue names.
+3. Focus on accurately identifying the PLACE NAME, ADDRESS, and CATEGORY.
+4. Category MUST be exactly one of: ${PLACE_CATEGORIES.join(', ')}.
+5. A city is only a place if it's the main destination. Otherwise put it in the "city" field.
+6. Trust OCR > Audio > Caption > Hashtags.
+7. Handle Inference for the FEATURED place only: @selenesoho -> name: Selene, city: New York City, neighborhood: SoHo.
+8. Do not extract food as a place.
+9. NO geographic hallucinations. E.g. If you see "Brooklyn", map it to New York City, not Australia, unless explicitly stated.
+10. ADDRESS IS CRITICAL: Always try to extract or infer the full street address for the featured place. If no address or city can be determined at all, DO NOT include the place.
+11. Every place MUST have at least a city. Do not return places where both address and city are empty.
+12. Most posts feature only ONE place. Only return multiple if the post genuinely reviews/visits multiple locations (e.g. "Top 5 cafes in NYC").
 
 OUTPUT JSON SCHEMA:
 {
   "places": [{
-    "name": "string (The extracted place name)",
+    "name": "string (The featured place name)",
     "category": "string (MUST be from the list above)",
     "neighborhood": "string (or empty)",
-    "city": "string (or empty)",
-    "address": "string (or empty)",
+    "city": "string (REQUIRED - must not be empty)",
+    "address": "string (full street address if known, or empty)",
     "description": "string (1 short sentence max)",
     "confidence": "number (0.5 to 1.0)"
   }]
@@ -36,16 +44,22 @@ OUTPUT JSON SCHEMA:
 const ANALYSIS_SYSTEM_PROMPT = `
 You are a location/food intelligence engine.
 RULES:
-1. Extract ALL physical places/businesses into the "places" array. If none, return [].
-2. Trust OCR > Audio > Caption > Hashtags.
-3. Food is NOT a place. Extract foods separately into the place's "foods" array.
-4. If a venue is a handle (e.g. @carbone_la), extract name "Carbone", city "Los Angeles".
-5. Use ONLY these exact categories: RESTAURANTS, COFFEE, TRAVEL, ADVENTURE, NATURE, CITY, SHOPPING, NIGHTLIFE, CULTURE, HIDDEN GEMS, BARS.
-6. NO hallucinations. Use null for missing data.
+1. Extract ONLY the place(s) the post is ACTUALLY ABOUT (featured, reviewed, recommended, visited) into the "places" array. If none, return [].
+2. DO NOT extract places that are merely mentioned, tagged, compared to, or referenced as background context. Examples:
+   - "From the team behind @kyma.nyc" → Skip Kyma, it is NOT the featured place.
+   - Tagged handles of other venues → Skip unless the post is specifically about that venue.
+   - "Reminds me of X" or "Better than Y" → Skip X and Y.
+3. Trust OCR > Audio > Caption > Hashtags.
+4. Food is NOT a place. Extract foods separately into the featured place's "foods" array.
+5. If the FEATURED venue is a handle (e.g. @selenesoho), extract name "Selene", city "New York City", neighborhood "SoHo".
+6. Use ONLY these exact categories: RESTAURANTS, COFFEE, TRAVEL, ADVENTURE, NATURE, CITY, SHOPPING, NIGHTLIFE, CULTURE, HIDDEN GEMS, BARS.
+7. NO hallucinations. Use null for missing data.
+8. ADDRESS IS CRITICAL: Always extract or infer the full street address for the featured place. Every place MUST have at least a city — skip places where both city and address are unknown.
+9. Most posts feature ONE place. Only return multiple if the post genuinely reviews/visits multiple locations (e.g. a listicle or multi-stop trip).
 OUTPUT JSON SCHEMA:
 {
   "places": [{
-    "name": "string", "neighborhood": "string|null", "city": "string|null", "address": "string|null",
+    "name": "string", "neighborhood": "string|null", "city": "string (REQUIRED)", "address": "string|null",
     "category": "string(from list above)", "description": "short string",
     "source": "string", "confidence": 0.5-1.0,
     "foods": [{ "name": "string", "type": "string", "description": "string", "price": "number|null", "currency": "string|null", "is_signature": "boolean", "source": "string", "confidence": "number" }]
@@ -54,6 +68,7 @@ OUTPUT JSON SCHEMA:
   "audience": { "primary_audience": "string", "interests": [] },
   "creator": { "username": "string" }
 }`;
+
 
 
 export class AiEnrichmentService {

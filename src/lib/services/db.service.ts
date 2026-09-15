@@ -66,7 +66,7 @@ export class DbService {
       const coords = await LocationService.geocodePlace(placeData.name, placeData.city || '', placeData.address);
       lat = coords.lat;
       lng = coords.lng;
-      if (coords.formattedAddress && !address) {
+      if (coords.formattedAddress) {
         address = coords.formattedAddress;
       }
       // Use neighborhood from forward geocode context if not already known
@@ -86,6 +86,12 @@ export class DbService {
       }
     } catch (geoErr: any) {
       console.warn(`[DB] Forward geocoding failed (non-fatal) for place "${placeData.name}":`, geoErr.message);
+    }
+
+    // GATE: Do not save places with no resolved address
+    if (!address || !address.trim()) {
+      console.warn(`[DB] Skipping place "${placeData.name}" — no address resolved (AI or geocoding).`);
+      return null;
     }
 
     // Deduplicate by coordinate proximity (if geocoding succeeded)

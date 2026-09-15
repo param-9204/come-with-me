@@ -143,14 +143,13 @@ export async function POST(request: Request) {
     const finalAuthorUsername = content?.authorUsername ? content.authorUsername.replace(/^@/, '') : null;
     const finalCreatorHandle = content?.authorUsername ? (content.authorUsername.startsWith('@') ? content.authorUsername : `@${content.authorUsername}`) : null;
 
-    const finalPlaces = savedPlaces.length > 0
-      ? savedPlaces
-      : (placeAnalysis || []).map((p: any) => ({
-          ...p,
-          author_username: finalAuthorUsername,
-          creator_handle: finalCreatorHandle,
-          creators: finalCreatorHandle ? [{ creator_handle: finalCreatorHandle, post_url: url, platform: content?.platform }] : [],
-        }));
+    const placesSource = savedPlaces.length > 0 ? savedPlaces : (placeAnalysis || []);
+    const finalPlaces = placesSource.map((p: any) => ({
+      ...p,
+      author_username: finalAuthorUsername,
+      creator_handle: finalCreatorHandle,
+      creators: finalCreatorHandle ? [{ creator_handle: finalCreatorHandle, post_url: url, platform: content?.platform }] : [],
+    }));
 
     return NextResponse.json({
       success: true,
