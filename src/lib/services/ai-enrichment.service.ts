@@ -323,7 +323,7 @@ Return the full analysis JSON.`;
         { role: 'user', content: userMessage },
       ],
       response_format: { type: 'json_object' },
-      max_tokens: 600,
+      max_tokens: 6000,
     });
     const raw = response.choices[0].message.content || '{}';
 
