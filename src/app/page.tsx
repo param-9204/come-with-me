@@ -545,7 +545,7 @@ export default function Page() {
             return results;
           };
 
-          const ocrResultsRaw = await runWithConcurrency(timestamps, 3, async (item) => {
+          const ocrResultsRaw = await runWithConcurrency(timestamps, 10, async (item) => {
             try {
               const res = await fetch("/api/process-url/ocr-frame", {
                 method: "POST",
@@ -596,7 +596,7 @@ export default function Page() {
               return results;
             };
 
-            const ocrResultsRaw = await runWithConcurrency(imageUrls, 3, async (imageUrl: string, index: number) => {
+            const ocrResultsRaw = await runWithConcurrency(imageUrls, 10, async (imageUrl: string, index: number) => {
               try {
                 const res = await fetch("/api/process-url/ocr-frame", {
                   method: "POST",

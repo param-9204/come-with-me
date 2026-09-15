@@ -123,7 +123,7 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
           }
         }
 
-        const rawOcr = await runWithConcurrency(timestamps, 3, async (item) => {
+        const rawOcr = await runWithConcurrency(timestamps, 10, async (item) => {
           try {
             const res = await fetch(`${origin}/api/process-url/ocr-frame`, {
               method: 'POST',
@@ -154,7 +154,7 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
             ) as string[];
 
         if (imageUrls.length > 0) {
-          const rawOcr = await runWithConcurrency(imageUrls, 3, async (imageUrl, index) => {
+          const rawOcr = await runWithConcurrency(imageUrls, 10, async (imageUrl, index) => {
             try {
               const res = await fetch(`${origin}/api/process-url/ocr-frame`, {
                 method: 'POST',
