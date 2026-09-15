@@ -14,6 +14,14 @@ const CITY_ALIASES: Record<string, CityInfo> = {
   nyc: { name: 'New York City', country: 'US' },
   'new york': { name: 'New York City', country: 'US' },
   'new york city': { name: 'New York City', country: 'US' },
+  brooklyn: { name: 'New York City', country: 'US' },
+  'brooklyn ny': { name: 'New York City', country: 'US' },
+  'brooklyn new york': { name: 'New York City', country: 'US' },
+  manhattan: { name: 'New York City', country: 'US' },
+  'manhattan ny': { name: 'New York City', country: 'US' },
+  queens: { name: 'New York City', country: 'US' },
+  bronx: { name: 'New York City', country: 'US' },
+  'staten island': { name: 'New York City', country: 'US' },
   la: { name: 'Los Angeles', country: 'US' },
   'los angeles': { name: 'Los Angeles', country: 'US' },
   miami: { name: 'Miami', country: 'US' },
@@ -70,8 +78,20 @@ export class LocationService {
 
   private static cityNamesMatch(expectedCity: string, candidateCities: string[]): boolean {
     if (!expectedCity.trim()) return true;
-    const expected = this.normalize(this.cityInfo(expectedCity).name);
-    return candidateCities.some(city => this.normalize(this.cityInfo(city).name) === expected);
+    const expectedCanonical = this.normalize(this.cityInfo(expectedCity).name);
+    const expectedRaw = this.normalize(expectedCity);
+
+    return candidateCities.some(city => {
+      const normCity = this.normalize(city);
+      const normCanonical = this.normalize(this.cityInfo(city).name);
+      return (
+        normCity === expectedCanonical ||
+        normCanonical === expectedCanonical ||
+        normCity === expectedRaw ||
+        expectedRaw.includes(normCity) ||
+        normCity.includes(expectedRaw)
+      );
+    });
   }
 
   private static addressContainsCity(address: string, expectedCity: string): boolean {
@@ -80,8 +100,12 @@ export class LocationService {
     const variants = Object.entries(CITY_ALIASES)
       .filter(([, info]) => info.name === canonical)
       .map(([alias]) => alias);
+    const rawParts = expectedCity.split(/[\s,]+/).map(p => this.normalize(p)).filter(p => p.length > 2);
+
     const normalizedAddress = this.normalize(address);
-    return [canonical, ...variants].some(city => normalizedAddress.includes(this.normalize(city)));
+    const allKeywords = [canonical, expectedCity, ...variants, ...rawParts].map(k => this.normalize(k)).filter(Boolean);
+
+    return allKeywords.some(keyword => normalizedAddress.includes(keyword));
   }
 
   static async geocodePlace(name: string, city: string, address?: string): Promise<GeocodeResult> {

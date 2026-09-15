@@ -514,7 +514,6 @@ export default function Page() {
         const ocrStart = Date.now();
         if (isVideo) {
           addOrUpdateStep(3, 'Frame OCR (Extract & Tesseract)', 'pending', 0, 'Starting frame extraction and OCR...');
-          // Capture 1 frame per second of the video, capped at a maximum of 30 frames
           const duration = contentData.videoDuration || 15;
           const numFrames = Math.min(30, Math.round(duration));
           const timestamps: { index: number; timestamp: number }[] = [];
@@ -526,10 +525,27 @@ export default function Page() {
             }
           }
 
-          addOrUpdateStep(3, `Frame OCR (Processing ${timestamps.length} frames)`, 'pending', 0, 'Extracting and processing frames in parallel...');
+          addOrUpdateStep(3, `Frame OCR (Processing ${timestamps.length} frames)`, 'pending', 0, 'Extracting and processing frames...');
 
-          // Fire single ocr frame calls in parallel
-          const ocrPromises = timestamps.map(async (item) => {
+          const runWithConcurrency = async <T, R>(
+            items: T[],
+            limit: number,
+            fn: (item: T, idx: number) => Promise<R>
+          ): Promise<R[]> => {
+            const results: R[] = new Array(items.length);
+            let idx = 0;
+            async function worker() {
+              while (idx < items.length) {
+                const current = idx++;
+                results[current] = await fn(items[current], current);
+              }
+            }
+            const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+            await Promise.all(workers);
+            return results;
+          };
+
+          const ocrResultsRaw = await runWithConcurrency(timestamps, 3, async (item) => {
             try {
               const res = await fetch("/api/process-url/ocr-frame", {
                 method: "POST",
@@ -551,7 +567,6 @@ export default function Page() {
             return null;
           });
 
-          const ocrResultsRaw = await Promise.all(ocrPromises);
           ocrResultsList = ocrResultsRaw.filter(Boolean);
           addOrUpdateStep(3, 'Frame OCR', 'success', Date.now() - ocrStart, `Processed ${ocrResultsList.length}/${timestamps.length} frames`);
         } else {
@@ -562,8 +577,26 @@ export default function Page() {
 
           if (imageUrls.length > 0) {
             addOrUpdateStep(3, `Image OCR (Processing ${imageUrls.length} images)`, 'pending', 0, 'Running OCR on images...');
-            
-            const ocrPromises = imageUrls.map(async (imageUrl: string, index: number) => {
+
+            const runWithConcurrency = async <T, R>(
+              items: T[],
+              limit: number,
+              fn: (item: T, idx: number) => Promise<R>
+            ): Promise<R[]> => {
+              const results: R[] = new Array(items.length);
+              let idx = 0;
+              async function worker() {
+                while (idx < items.length) {
+                  const current = idx++;
+                  results[current] = await fn(items[current], current);
+                }
+              }
+              const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+              await Promise.all(workers);
+              return results;
+            };
+
+            const ocrResultsRaw = await runWithConcurrency(imageUrls, 3, async (imageUrl: string, index: number) => {
               try {
                 const res = await fetch("/api/process-url/ocr-frame", {
                   method: "POST",
@@ -584,7 +617,6 @@ export default function Page() {
               return null;
             });
 
-            const ocrResultsRaw = await Promise.all(ocrPromises);
             ocrResultsList = ocrResultsRaw.filter(Boolean);
             addOrUpdateStep(3, 'Image OCR', 'success', Date.now() - ocrStart, `Processed ${ocrResultsList.length}/${imageUrls.length} images`);
           } else {

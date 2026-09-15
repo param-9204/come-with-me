@@ -12,68 +12,79 @@ const PLACE_CATEGORIES = [
 const PLACE_SYSTEM_PROMPT = `You are a deterministic place extractor.
 RULES:
 1. Extract ONLY the place(s) the post is ACTUALLY ABOUT (featured, reviewed, recommended, visited). Return them in the "places" array. If none, return [].
-2. DO NOT extract places that are merely mentioned, compared to, tagged, or referenced as context. Examples of what to SKIP:
-   - "From the team behind @kyma.nyc" → Kyma is background context, NOT the featured place. Skip it.
-   - "Better than Carbone" → Carbone is a comparison, NOT the featured place. Skip it.
-   - Tagged handles of other restaurants/venues that are not the subject of the post.
-   - Collaborator or photographer handles that happen to be venue names.
-3. Focus on accurately identifying the PLACE NAME, ADDRESS, and CATEGORY.
+2. SKIP background context, team history, or comparisons. EXAMPLES TO SKIP:
+   - "From the team behind [Venue A]" -> Extract ONLY [Venue B]. SKIP [Venue A].
+   - "From creators of X" / "By owners of Y" -> SKIP X and Y.
+   - "Better than Z" / "Reminds me of Z" -> SKIP Z.
+   - Tagged handles of other non-subject venues.
+3. Clean handle names (e.g. "@[handle]" -> Name: "[Handle]").
 4. Category MUST be exactly one of: ${PLACE_CATEGORIES.join(', ')}.
-5. A city is only a place if it's the main destination. Otherwise put it in the "city" field.
-6. Trust OCR > Audio > Caption > Hashtags.
-7. Handle Inference for the FEATURED place only: @selenesoho -> name: Selene, city: New York City, neighborhood: SoHo.
-8. Do not extract food as a place.
-9. NO geographic hallucinations. E.g. If you see "Brooklyn", map it to New York City, not Australia, unless explicitly stated.
-10. ADDRESS IS CRITICAL: Always try to extract or infer the full street address for the featured place. If no address or city can be determined at all, DO NOT include the place.
-11. Every place MUST have at least a city. Do not return places where both address and city are empty.
-12. Most posts feature only ONE place. Only return multiple if the post genuinely reviews/visits multiple locations (e.g. "Top 5 cafes in NYC").
+5. ADDRESS IS CRITICAL: Look closely for location pins (📍, 📌, 🗺️), street numbers & names (e.g. "305 Schermerhorn St"), or addresses anywhere in caption, OCR, or transcript. Extract full street address into "address". NEVER leave address null if street address or pin exists!
+6. A borough or area (e.g. "Brooklyn", "SoHo") goes in "city" or "neighborhood". Do not invent non-existent cities.
+7. Food is NOT a place.
+8. Most posts feature only 1 place. Only return multiple if post genuinely reviews/visits multiple distinct venues.
 
 OUTPUT JSON SCHEMA:
 {
   "places": [{
-    "name": "string (The featured place name)",
-    "category": "string (MUST be from the list above)",
-    "neighborhood": "string (or empty)",
-    "city": "string (REQUIRED - must not be empty)",
-    "address": "string (full street address if known, or empty)",
+    "name": "string (Featured place name)",
+    "category": "string (MUST be from list above)",
+    "neighborhood": "string|null",
+    "city": "string (REQUIRED, e.g. Brooklyn, New York)",
+    "address": "string|null (Full street address, e.g. 305 Schermerhorn St)",
     "description": "string (1 short sentence max)",
     "confidence": "number (0.5 to 1.0)"
   }]
 }`;
 
-const ANALYSIS_SYSTEM_PROMPT = `
-You are a location/food intelligence engine.
+const ANALYSIS_SYSTEM_PROMPT = `You are a location and content intelligence engine.
 RULES:
-1. Extract ONLY the place(s) the post is ACTUALLY ABOUT (featured, reviewed, recommended, visited) into the "places" array. If none, return [].
-2. DO NOT extract places that are merely mentioned, tagged, compared to, or referenced as background context. Examples:
-   - "From the team behind @kyma.nyc" → Skip Kyma, it is NOT the featured place.
-   - Tagged handles of other venues → Skip unless the post is specifically about that venue.
-   - "Reminds me of X" or "Better than Y" → Skip X and Y.
-3. Trust OCR > Audio > Caption > Hashtags.
-4. Food is NOT a place. Extract foods separately into the featured place's "foods" array.
-5. If the FEATURED venue is a handle (e.g. @selenesoho), extract name "Selene", city "New York City", neighborhood "SoHo".
-6. Use ONLY these exact categories: RESTAURANTS, COFFEE, TRAVEL, ADVENTURE, NATURE, CITY, SHOPPING, NIGHTLIFE, CULTURE, HIDDEN GEMS, BARS.
-7. NO hallucinations. Use null for missing data.
-8. ADDRESS IS CRITICAL: Always extract or infer the full street address for the featured place. Every place MUST have at least a city — skip places where both city and address are unknown.
-9. Most posts feature ONE place. Only return multiple if the post genuinely reviews/visits multiple locations (e.g. a listicle or multi-stop trip).
+1. Extract ALL places/restaurants ACTUALLY featured, visited, or reviewed in the post into "places". If none, return [].
+2. SKIP background context, team history, or comparisons. EXAMPLES TO SKIP:
+   - "From team behind [Venue A]" -> Extract [Venue B]. SKIP [Venue A].
+   - "From creators of X" / "By owners of Y" / "Better than Z" -> SKIP X, Y, Z.
+3. Clean handle names (e.g. "@[handle]" -> Name: "[Handle]").
+4. Food is NOT a place. Put dishes in the place's "foods" array.
+5. Category MUST be one of: ${PLACE_CATEGORIES.join(', ')}.
+6. ADDRESS IS CRITICAL: Look closely for location pins (📍, 📌, 🗺️), street numbers/names (e.g. "305 Schermerhorn St"), or addresses anywhere in caption, OCR, or transcript. Extract full street address into "address". NEVER leave address null if street address or pin exists!
+
 OUTPUT JSON SCHEMA:
 {
   "places": [{
     "name": "string", "neighborhood": "string|null", "city": "string (REQUIRED)", "address": "string|null",
-    "category": "string(from list above)", "description": "short string",
-    "source": "string", "confidence": 0.5-1.0,
-    "foods": [{ "name": "string", "type": "string", "description": "string", "price": "number|null", "currency": "string|null", "is_signature": "boolean", "source": "string", "confidence": "number" }]
+    "category": "string", "description": "short string", "confidence": 0.5-1.0,
+    "foods": [{ "name": "string", "type": "string", "description": "string", "price": "number|null", "currency": "string|null", "is_signature": "boolean" }]
   }],
-  "content": { "primary_category": "string", "categories": [], "summary": "string", "topics": [] },
-  "audience": { "primary_audience": "string", "interests": [] },
+  "content": { "primary_category": "string", "summary": "1 sentence", "topics": [] },
+  "audience": { "primary_audience": "string" },
   "creator": { "username": "string" }
 }`;
 
-
-
 export class AiEnrichmentService {
+  static formatCondensedCaption(caption: string | null | undefined, maxLen = 1000): string {
+    if (!caption) return '';
+    const trimmed = caption.trim();
+    if (trimmed.length <= maxLen) return trimmed;
+
+    const lines = trimmed.split('\n');
+    const locationRegex = /(📍|📌|🗺️|located|location|address|st\b|street|ave\b|avenue|blvd|rd\b|road|dr\b|drive|way\b|unit|suite|#)/i;
+
+    const importantLines: string[] = [];
+    let charCount = 0;
+
+    for (const line of lines) {
+      const isLoc = locationRegex.test(line);
+      if (charCount < 400 || isLoc) {
+        importantLines.push(line);
+        charCount += line.length + 1;
+      }
+    }
+
+    return importantLines.join('\n').substring(0, maxLen);
+  }
+
   // ──────────────────────────────────────────────────────────────────────
-  // 1. Place extraction (for the Come With Me map feature)
+  // 1. Place extraction (for map feature)
   // ──────────────────────────────────────────────────────────────────────
   static async extractPlace(
     content: SocialContent,
@@ -82,27 +93,18 @@ export class AiEnrichmentService {
   ): Promise<PlaceExtraction[] | null> {
     const { client, model, isGroq } = getAIClient('chat');
 
-    const userMessage = JSON.stringify({
+    const condensedInput = {
       platform: content.platform,
-      content_type: content.contentType,
+      caption: AiEnrichmentService.formatCondensedCaption(content.caption, 1000),
       author_username: content.authorUsername,
-      author_full_name: content.authorFullName,
-      caption: content.caption,
-      hashtags: content.hashtags,
-      mentions: content.mentions,
-      tagged_users: content.taggedUsers.map(u => u.username),
-      ocr_texts: ocrTexts,
-      audio_transcript: transcript || null,
-    });
+      tagged_users: (content.taggedUsers || []).map(u => typeof u === 'string' ? u : u.username).slice(0, 5),
+      ocr_texts: ocrTexts.slice(0, 8),
+      audio_transcript: transcript ? transcript.substring(0, 200) : null,
+    };
 
-    const response = await client.chat.completions.create({
-      model,
-      temperature: 0.7,
-      messages: [
-        { role: 'system', content: PLACE_SYSTEM_PROMPT },
-        { role: 'user', content: userMessage },
-      ],
-      response_format: {
+    const responseFormat: any = isGroq
+      ? { type: 'json_object' }
+      : {
         type: 'json_schema',
         json_schema: {
           name: 'place_extraction_list',
@@ -122,7 +124,7 @@ export class AiEnrichmentService {
                     category: {
                       type: 'string',
                       enum: [...PLACE_CATEGORIES],
-                      description: 'One fixed Come With Me map category',
+                      description: 'One fixed map category',
                     },
                     description: { type: 'string' },
                     creator_handle: { type: 'string' },
@@ -137,7 +139,17 @@ export class AiEnrichmentService {
             additionalProperties: false,
           },
         },
-      },
+      };
+
+    const response = await client.chat.completions.create({
+      model,
+      temperature: 0.3,
+      max_tokens: 1500,
+      messages: [
+        { role: 'system', content: PLACE_SYSTEM_PROMPT },
+        { role: 'user', content: JSON.stringify(condensedInput) },
+      ],
+      response_format: responseFormat,
     });
 
     const raw = response.choices[0].message.content;
@@ -147,18 +159,16 @@ export class AiEnrichmentService {
   }
 
   // ──────────────────────────────────────────────────────────────────────
-  // 2. Full 32-section analysis
+  // 2. Full analysis
   // ──────────────────────────────────────────────────────────────────────
   static compressOcrTexts(texts: string[]): string[] {
     if (!texts || texts.length === 0) return [];
 
-    // 1. Remove stopwords to compress text
     let compressed = texts.map(text => {
       const words = text.split(/\s+/);
       return removeStopwords(words, eng).join(' ').trim();
     }).filter(t => t.length > 2);
 
-    // 2. Fuzzy deduplication (Dice's Coefficient)
     const unique: string[] = [];
     for (const text of compressed) {
       if (unique.length === 0) {
@@ -182,7 +192,7 @@ export class AiEnrichmentService {
     const nouns = doc.nouns().out('array');
     const entities = Array.from(new Set([...places, ...nouns]))
       .filter(w => w.length > 3)
-      .slice(0, 30) // Cap to top 30 entities
+      .slice(0, 15)
       .join(', ');
     return entities;
   }
@@ -194,56 +204,53 @@ export class AiEnrichmentService {
     gptOcrTexts: string[],
     apifyOcrTexts: string[]
   ): Promise<{ analysis: AiAnalysisResult; places: PlaceExtraction[] } | null> {
-    const { client, model, isGroq } = getAIClient('chat');
+    const { client, model } = getAIClient('chat');
+
+    const condensedOcr = [
+      ...AiEnrichmentService.compressOcrTexts(gptOcrTexts).slice(0, 5),
+      ...AiEnrichmentService.compressOcrTexts(apifyOcrTexts).slice(0, 5)
+    ].slice(0, 8);
+
+    const condensedInput = {
+      platform: content.platform,
+      content_type: content.contentType,
+      caption: AiEnrichmentService.formatCondensedCaption(content.caption, 1000),
+      hashtags: (content.hashtags || []).slice(0, 5),
+      mentions: (content.mentions || []).slice(0, 5),
+      author_username: content.authorUsername,
+      tagged_users: (content.taggedUsers || []).map(u => typeof u === 'string' ? u : u.username).slice(0, 5),
+      ocr_text: condensedOcr,
+      whisper_transcript: transcript ? transcript.substring(0, 200) : null,
+      transcript_entities: AiEnrichmentService.extractTranscriptEntities(transcript || ''),
+    };
 
     const ocrAvailable = gptOcrTexts.length > 0 || apifyOcrTexts.length > 0;
     const transcriptAvailable = !!transcript && transcript.trim().length > 0;
 
-    // Build a condensed version of the raw data for the prompt
-    // (avoid sending huge token payloads — send the key fields)
-    const condensedInput = {
-      platform: content.platform,
-      content_type: content.contentType,
-      caption: content.caption ? content.caption.substring(0, 400) : '',
-      hashtags: content.hashtags,
-      mentions: content.mentions,
-      author_username: content.authorUsername,
-      tagged_users: content.taggedUsers,
-      ocr_gpt_vision: AiEnrichmentService.compressOcrTexts(gptOcrTexts).slice(0, 15),
-      ocr_apify: AiEnrichmentService.compressOcrTexts(apifyOcrTexts).slice(0, 50),
-      whisper_transcript: transcript ? transcript.substring(0, 600) : null,
-      transcript_entities: AiEnrichmentService.extractTranscriptEntities(transcript || ''),
-    };
-
-    const userMessage = `
-Analyze the following social media content and return a complete intelligence analysis as JSON.
-
+    const userMessage = `Analyze the following social media content and return intelligence analysis as JSON:
 === INPUT DATA ===
 ${JSON.stringify(condensedInput, null, 2)}
 
-=== MEDIA ANALYSIS AVAILABILITY ===
-OCR text available: ${ocrAvailable} (${gptOcrTexts.length} GPT Vision texts, ${apifyOcrTexts.length} Apify OCR texts)
-Audio transcript available: ${transcriptAvailable}
-
-Return the full analysis JSON.`;
+=== MEDIA AVAILABILITY ===
+OCR: ${ocrAvailable} (${gptOcrTexts.length} Vision, ${apifyOcrTexts.length} Apify)
+Audio Transcript: ${transcriptAvailable}`;
 
     const response = await client.chat.completions.create({
       model,
+      temperature: 0.3,
       messages: [
         { role: 'system', content: ANALYSIS_SYSTEM_PROMPT },
         { role: 'user', content: userMessage },
       ],
       response_format: { type: 'json_object' },
-      max_tokens: 2500,
+      max_tokens: 1500,
     });
     const raw = response.choices[0].message.content || '{}';
 
-    // Parse and validate — fill required top-level keys if missing
     const parsedJson = JSON.parse(raw);
     const parsed = (parsedJson || {}) as Partial<AiAnalysisResult>;
     const places = (parsedJson.places || []) as PlaceExtraction[];
 
-    // Ensure all sections exist with safe defaults and merge scraper metadata
     const analysis: AiAnalysisResult = {
       platform: parsed.platform || content.platform,
       content: {

@@ -93,6 +93,24 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
     })();
 
     const ocrPromise = (async () => {
+      const runWithConcurrency = async <T, R>(
+        items: T[],
+        limit: number,
+        fn: (item: T, idx: number) => Promise<R>
+      ): Promise<R[]> => {
+        const results: R[] = new Array(items.length);
+        let idx = 0;
+        async function worker() {
+          while (idx < items.length) {
+            const current = idx++;
+            results[current] = await fn(items[current], current);
+          }
+        }
+        const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+        await Promise.all(workers);
+        return results;
+      };
+
       if (isVideo) {
         const duration = contentData.videoDuration || 15;
         const numFrames = Math.min(30, Math.round(duration));
@@ -105,7 +123,7 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
           }
         }
 
-        const ocrPromises = timestamps.map(async (item) => {
+        const rawOcr = await runWithConcurrency(timestamps, 3, async (item) => {
           try {
             const res = await fetch(`${origin}/api/process-url/ocr-frame`, {
               method: 'POST',
@@ -126,7 +144,6 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
           }
           return null;
         });
-        const rawOcr = await Promise.all(ocrPromises);
         ocrResultsList = rawOcr.filter(Boolean);
       } else {
         const imageUrls =
@@ -137,7 +154,7 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
             ) as string[];
 
         if (imageUrls.length > 0) {
-          const ocrPromises = imageUrls.map(async (imageUrl: string, index: number) => {
+          const rawOcr = await runWithConcurrency(imageUrls, 3, async (imageUrl, index) => {
             try {
               const res = await fetch(`${origin}/api/process-url/ocr-frame`, {
                 method: 'POST',
@@ -157,7 +174,6 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
             }
             return null;
           });
-          const rawOcr = await Promise.all(ocrPromises);
           ocrResultsList = rawOcr.filter(Boolean);
         }
       }
