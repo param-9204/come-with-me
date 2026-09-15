@@ -256,12 +256,6 @@ export async function POST(request: Request) {
     if (existingPost && existingPost.status === 'completed') {
       let places = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
 
-      const hasBeenChecked = existingPost.ai_analysis && typeof existingPost.ai_analysis === 'object' && (existingPost.ai_analysis as any).places_checked;
-      if ((!places || places.length === 0) && !hasBeenChecked) {
-        console.log(`[Process URL API] Completed post ${existingPost.id} has 0 places. Running fast place re-extraction...`);
-        places = await DbService.reextractAndLinkPlaces(existingPost.id);
-      }
-
       return NextResponse.json({
         success: true,
         socialPostId: existingPost.id,
@@ -365,12 +359,6 @@ export async function GET(request: Request) {
     const post = posts.find(p => p.status === 'completed') || posts[0];
 
     let places = await DbService.getPlacesForSocialPost(post.id, post.post_url);
-
-    const hasBeenChecked = post.ai_analysis && typeof post.ai_analysis === 'object' && (post.ai_analysis as any).places_checked;
-    if ((!places || places.length === 0) && !hasBeenChecked && post.status === 'completed') {
-      console.log(`[Process URL GET API] Post ${post.id} has 0 places. Running fast place re-extraction...`);
-      places = await DbService.reextractAndLinkPlaces(post.id);
-    }
 
     return NextResponse.json({
       success: true,

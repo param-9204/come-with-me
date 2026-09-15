@@ -398,12 +398,7 @@ export async function POST(request: Request) {
         if (existingPost && existingPost.status === 'completed') {
           let places = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
 
-          // Fallback: If 0 places found and places haven't been re-extracted yet, run fast re-extraction!
-          const hasBeenChecked = existingPost.ai_analysis && typeof existingPost.ai_analysis === 'object' && (existingPost.ai_analysis as any).places_checked;
-          if ((!places || places.length === 0) && !hasBeenChecked) {
-            console.log(`[Stream API] Completed post ${existingPost.id} has 0 places. Running fast place re-extraction...`);
-            places = await DbService.reextractAndLinkPlaces(existingPost.id);
-          }
+
 
           const cleanPost = { ...(existingPost || {}) };
           delete cleanPost.raw_apify_data;
