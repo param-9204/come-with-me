@@ -140,12 +140,30 @@ export async function POST(request: Request) {
 
     // Fetch fully enriched saved places with author_username and creator details
     const savedPlaces = socialPostId ? await DbService.getPlacesForSocialPost(socialPostId) : [];
-    const finalAuthorUsername = content?.authorUsername ? content.authorUsername.replace(/^@/, '') : null;
-    const finalCreatorHandle = content?.authorUsername ? (content.authorUsername.startsWith('@') ? content.authorUsername : `@${content.authorUsername}`) : null;
+
+    let rawAuthorUsername = content?.authorUsername || null;
+    if (!rawAuthorUsername) {
+      const targetPostId = socialPostId || inputSocialPostId;
+      if (targetPostId) {
+        const { data: postData } = await supabaseAdmin
+          .from('social_posts')
+          .select('author_username')
+          .eq('id', targetPostId)
+          .maybeSingle();
+
+        if (postData?.author_username) {
+          rawAuthorUsername = postData.author_username;
+        }
+      }
+    }
+
+    const finalAuthorUsername = rawAuthorUsername ? rawAuthorUsername.replace(/^@/, '') : null;
+    const finalCreatorHandle = rawAuthorUsername ? (rawAuthorUsername.startsWith('@') ? rawAuthorUsername : `@${rawAuthorUsername}`) : null;
 
     const placesSource = savedPlaces.length > 0 ? savedPlaces : (placeAnalysis || []);
     const finalPlaces = placesSource.map((p: any) => ({
       ...p,
+      place_id: p.id || p.place_id,
       author_username: finalAuthorUsername,
       creator_handle: finalCreatorHandle,
       creators: finalCreatorHandle ? [{ creator_handle: finalCreatorHandle, post_url: url, platform: content?.platform }] : [],

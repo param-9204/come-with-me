@@ -275,19 +275,35 @@ export class DbService {
       }
     }
 
+    const currentPostHandle = postAuthorUsername
+      ? (postAuthorUsername.startsWith('@') ? postAuthorUsername : `@${postAuthorUsername}`)
+      : null;
+
     return places.map((p) => {
       const creatorsList = placeCreatorsMap[p.id] || [];
-      const fallbackHandle = postAuthorUsername
-        ? (postAuthorUsername.startsWith('@') ? postAuthorUsername : `@${postAuthorUsername}`)
-        : null;
-      const effectiveHandle = creatorsList.length > 0 ? creatorsList[0].creator_handle : fallbackHandle;
-      const rawAuthorUsername = effectiveHandle ? effectiveHandle.replace(/^@/, '') : null;
+      const effectiveHandle = currentPostHandle || (creatorsList.length > 0 ? creatorsList[0].creator_handle : null);
+      const effectiveAuthor = effectiveHandle ? effectiveHandle.replace(/^@/, '') : null;
+
+      let finalCreators = [...creatorsList];
+      if (currentPostHandle) {
+        const existingIdx = finalCreators.findIndex((c) => c.creator_handle === currentPostHandle);
+        if (existingIdx >= 0) {
+          const [match] = finalCreators.splice(existingIdx, 1);
+          finalCreators.unshift(match);
+        } else {
+          finalCreators.unshift({
+            creator_handle: currentPostHandle,
+            post_url: postUrl || '',
+            platform: '',
+          });
+        }
+      }
 
       return {
         ...p,
-        author_username: rawAuthorUsername,
+        author_username: effectiveAuthor,
         creator_handle: effectiveHandle,
-        creators: creatorsList,
+        creators: finalCreators,
       };
     });
   }

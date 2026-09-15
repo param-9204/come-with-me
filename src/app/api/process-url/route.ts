@@ -6,7 +6,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 export const maxDuration = 60; // Allow Vercel function to run up to 60 seconds (requires Pro tier or compatible runtime)
 
-async function runSynchronousPipeline(origin: string, url: string, socialPostId: string, userId?: string): Promise<string> {
+async function runSynchronousPipeline(origin: string, url: string, socialPostId: string, userId?: string): Promise<{ finalPostId: string; analyzeData: any }> {
   console.log(`[Synchronous Pipeline] Starting process-url for: ${url} (origin: ${origin})`);
   try {
     // Update status to scraping
@@ -187,7 +187,10 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
     }
 
     console.log(`[Synchronous Pipeline] Finished processing successfully for: ${url}`);
-    return analyzeData.socialPostId || socialPostId;
+    return {
+      finalPostId: analyzeData.socialPostId || socialPostId,
+      analyzeData
+    };
   } catch (err: any) {
     console.error(`[Synchronous Pipeline] Error processing: ${url}`, err.message);
     try {
@@ -255,12 +258,17 @@ export async function POST(request: Request) {
 
     if (existingPost && existingPost.status === 'completed') {
       let places = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
+      const firstPlace = places.length > 0 ? places[0] : null;
 
       return NextResponse.json({
         success: true,
         socialPostId: existingPost.id,
         data: existingPost,
-        places
+        places,
+        place: firstPlace,
+        placeIds: places.map((p: any) => p.id || p.place_id).filter(Boolean),
+        aiAnalysis: existingPost.ai_analysis || null,
+        transcript: existingPost.whisper_transcript || null,
       });
     }
 
@@ -290,7 +298,7 @@ export async function POST(request: Request) {
     }
 
     // Execute the pipeline synchronously and await completion
-    const finalPostId = await runSynchronousPipeline(origin, cleanUrl, socialPostId, finalUserId || undefined);
+    const { finalPostId, analyzeData } = await runSynchronousPipeline(origin, cleanUrl, socialPostId, finalUserId || undefined);
 
 
     // Fetch and return the completed social post record
@@ -305,12 +313,20 @@ export async function POST(request: Request) {
     }
 
     const places = await DbService.getPlacesForSocialPost(completedPost.id, completedPost.post_url);
+    const firstPlace = places.length > 0 ? places[0] : null;
 
     return NextResponse.json({
       success: true,
       socialPostId: completedPost.id,
       data: completedPost,
-      places
+      places,
+      place: firstPlace,
+      place_id: firstPlace?.id || firstPlace?.place_id || null,
+      placeIds: places.map((p: any) => p.id || p.place_id).filter(Boolean),
+      aiAnalysis: analyzeData?.aiAnalysis || completedPost.ai_analysis || null,
+      transcript: analyzeData?.transcript || completedPost.whisper_transcript || null,
+      scrapedData: analyzeData?.scrapedData || null,
+      ocrComparison: analyzeData?.ocrComparison || null,
     });
   } catch (error: any) {
     console.error('[Process URL API] Error:', error);
@@ -359,12 +375,19 @@ export async function GET(request: Request) {
     const post = posts.find(p => p.status === 'completed') || posts[0];
 
     let places = await DbService.getPlacesForSocialPost(post.id, post.post_url);
+    const firstPlace = places.length > 0 ? places[0] : null;
 
     return NextResponse.json({
       success: true,
       status: post.status,
+      socialPostId: post.id,
       data: post,
-      places
+      places,
+      place: firstPlace,
+      place_id: firstPlace?.id || firstPlace?.place_id || null,
+      placeIds: places.map((p: any) => p.id || p.place_id).filter(Boolean),
+      aiAnalysis: post.ai_analysis || null,
+      transcript: post.whisper_transcript || null,
     });
   } catch (error: any) {
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
