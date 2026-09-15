@@ -139,7 +139,7 @@ export async function POST(request: Request) {
     };
 
     // Fetch fully enriched saved places with author_username and creator details
-    const savedPlaces = socialPostId ? await DbService.getPlacesForSocialPost(socialPostId, url) : [];
+    const savedPlaces = socialPostId ? await DbService.getPlacesForSocialPost(socialPostId) : [];
     const finalAuthorUsername = content?.authorUsername ? content.authorUsername.replace(/^@/, '') : null;
     const finalCreatorHandle = content?.authorUsername ? (content.authorUsername.startsWith('@') ? content.authorUsername : `@${content.authorUsername}`) : null;
 

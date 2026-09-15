@@ -201,42 +201,25 @@ export class DbService {
   // Get all places associated with a social post (junction + legacy)
   // ──────────────────────────────────────────────────────────────────
   static async getPlacesForSocialPost(socialPostId?: string | null, postUrl?: string | null): Promise<any[]> {
-    if (!socialPostId && !postUrl) return [];
+    if (!socialPostId) return [];
 
     let places: any[] = [];
 
-    // 1. Fetch via social_post_places junction table
-    if (socialPostId) {
-      const { data: junctionRows } = await supabaseAdmin
-        .from('social_post_places')
-        .select('place_id')
-        .eq('social_post_id', socialPostId);
+    // Fetch ONLY via social_post_places junction table (scoped to current post)
+    const { data: junctionRows } = await supabaseAdmin
+      .from('social_post_places')
+      .select('place_id')
+      .eq('social_post_id', socialPostId);
 
-      const junctionPlaceIds = junctionRows?.map((r) => r.place_id).filter(Boolean) || [];
+    const junctionPlaceIds = junctionRows?.map((r) => r.place_id).filter(Boolean) || [];
 
-      if (junctionPlaceIds.length > 0) {
-        const { data: junctionPlaces } = await supabaseAdmin
-          .from('places')
-          .select('*')
-          .in('id', junctionPlaceIds);
-        if (junctionPlaces) {
-          places.push(...junctionPlaces);
-        }
-      }
-    }
-
-    // 2. Fetch via legacy source_url match
-    if (postUrl) {
-      const { data: urlPlaces } = await supabaseAdmin
+    if (junctionPlaceIds.length > 0) {
+      const { data: junctionPlaces } = await supabaseAdmin
         .from('places')
         .select('*')
-        .eq('source_url', postUrl);
-      if (urlPlaces) {
-        for (const p of urlPlaces) {
-          if (!places.some((existing) => existing.id === p.id)) {
-            places.push(p);
-          }
-        }
+        .in('id', junctionPlaceIds);
+      if (junctionPlaces) {
+        places.push(...junctionPlaces);
       }
     }
 
