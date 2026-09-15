@@ -17,13 +17,13 @@ interface CacheEntry {
 export class MediaService {
   private static cache = new Map<string, CacheEntry>();
 
-  private static async fetchWithRetry(url: string, isVideo: boolean, maxRetries = 3): Promise<Response> {
+  private static async fetchWithRetry(url: string, isVideo: boolean, maxRetries = 2): Promise<Response> {
     let lastError: any = null;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 30000);
+        const timeoutId = setTimeout(() => controller.abort(), 12000); // 12s timeout
 
         const headers: Record<string, string> = {
           'User-Agent':
@@ -60,7 +60,7 @@ export class MediaService {
           `[MediaService] Download attempt ${attempt}/${maxRetries} failed for ${url.slice(0, 60)}: ${err.message || err}`
         );
         if (attempt < maxRetries) {
-          await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+          await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
         }
       }
     }
@@ -90,22 +90,8 @@ export class MediaService {
     const downloadPromise = (async () => {
       try {
         const response = await this.fetchWithRetry(url, true);
-        const fileStream = fs.createWriteStream(filePath);
-        const reader = response.body!.getReader();
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          fileStream.write(Buffer.from(value));
-        }
-
-        fileStream.end();
-
-        await new Promise<void>((resolve, reject) => {
-          fileStream.on('finish', () => resolve());
-          fileStream.on('error', (err) => reject(err));
-        });
-
+        const arrayBuffer = await response.arrayBuffer();
+        fs.writeFileSync(filePath, Buffer.from(arrayBuffer));
         return filePath;
       } catch (err) {
         this.cache.delete(url);
@@ -152,22 +138,8 @@ export class MediaService {
     const downloadPromise = (async () => {
       try {
         const response = await this.fetchWithRetry(url, false);
-        const fileStream = fs.createWriteStream(filePath);
-        const reader = response.body!.getReader();
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          fileStream.write(Buffer.from(value));
-        }
-
-        fileStream.end();
-
-        await new Promise<void>((resolve, reject) => {
-          fileStream.on('finish', () => resolve());
-          fileStream.on('error', (err) => reject(err));
-        });
-
+        const arrayBuffer = await response.arrayBuffer();
+        fs.writeFileSync(filePath, Buffer.from(arrayBuffer));
         return filePath;
       } catch (err) {
         this.cache.delete(url);
