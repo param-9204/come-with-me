@@ -66,7 +66,7 @@ export class DbService {
       const coords = await LocationService.geocodePlace(placeData.name, placeData.city || '', placeData.address);
       lat = coords.lat;
       lng = coords.lng;
-      if (coords.formattedAddress && !address) {
+      if (coords.formattedAddress) {
         address = coords.formattedAddress;
       }
       // Use neighborhood from forward geocode context if not already known
@@ -86,6 +86,12 @@ export class DbService {
       }
     } catch (geoErr: any) {
       console.warn(`[DB] Forward geocoding failed (non-fatal) for place "${placeData.name}":`, geoErr.message);
+    }
+
+    // GATE: Do not save places with no resolved address
+    if (!address || !address.trim()) {
+      console.warn(`[DB] Skipping place "${placeData.name}" — no address resolved (AI or geocoding).`);
+      return null;
     }
 
     // Deduplicate by coordinate proximity (if geocoding succeeded)
@@ -201,42 +207,25 @@ export class DbService {
   // Get all places associated with a social post (junction + legacy)
   // ──────────────────────────────────────────────────────────────────
   static async getPlacesForSocialPost(socialPostId?: string | null, postUrl?: string | null): Promise<any[]> {
-    if (!socialPostId && !postUrl) return [];
+    if (!socialPostId) return [];
 
     let places: any[] = [];
 
-    // 1. Fetch via social_post_places junction table
-    if (socialPostId) {
-      const { data: junctionRows } = await supabaseAdmin
-        .from('social_post_places')
-        .select('place_id')
-        .eq('social_post_id', socialPostId);
+    // Fetch ONLY via social_post_places junction table (scoped to current post)
+    const { data: junctionRows } = await supabaseAdmin
+      .from('social_post_places')
+      .select('place_id')
+      .eq('social_post_id', socialPostId);
 
-      const junctionPlaceIds = junctionRows?.map((r) => r.place_id).filter(Boolean) || [];
+    const junctionPlaceIds = junctionRows?.map((r) => r.place_id).filter(Boolean) || [];
 
-      if (junctionPlaceIds.length > 0) {
-        const { data: junctionPlaces } = await supabaseAdmin
-          .from('places')
-          .select('*')
-          .in('id', junctionPlaceIds);
-        if (junctionPlaces) {
-          places.push(...junctionPlaces);
-        }
-      }
-    }
-
-    // 2. Fetch via legacy source_url match
-    if (postUrl) {
-      const { data: urlPlaces } = await supabaseAdmin
+    if (junctionPlaceIds.length > 0) {
+      const { data: junctionPlaces } = await supabaseAdmin
         .from('places')
         .select('*')
-        .eq('source_url', postUrl);
-      if (urlPlaces) {
-        for (const p of urlPlaces) {
-          if (!places.some((existing) => existing.id === p.id)) {
-            places.push(p);
-          }
-        }
+        .in('id', junctionPlaceIds);
+      if (junctionPlaces) {
+        places.push(...junctionPlaces);
       }
     }
 
@@ -286,19 +275,35 @@ export class DbService {
       }
     }
 
+    const currentPostHandle = postAuthorUsername
+      ? (postAuthorUsername.startsWith('@') ? postAuthorUsername : `@${postAuthorUsername}`)
+      : null;
+
     return places.map((p) => {
       const creatorsList = placeCreatorsMap[p.id] || [];
-      const fallbackHandle = postAuthorUsername
-        ? (postAuthorUsername.startsWith('@') ? postAuthorUsername : `@${postAuthorUsername}`)
-        : null;
-      const effectiveHandle = creatorsList.length > 0 ? creatorsList[0].creator_handle : fallbackHandle;
-      const rawAuthorUsername = effectiveHandle ? effectiveHandle.replace(/^@/, '') : null;
+      const effectiveHandle = currentPostHandle || (creatorsList.length > 0 ? creatorsList[0].creator_handle : null);
+      const effectiveAuthor = effectiveHandle ? effectiveHandle.replace(/^@/, '') : null;
+
+      let finalCreators = [...creatorsList];
+      if (currentPostHandle) {
+        const existingIdx = finalCreators.findIndex((c) => c.creator_handle === currentPostHandle);
+        if (existingIdx >= 0) {
+          const [match] = finalCreators.splice(existingIdx, 1);
+          finalCreators.unshift(match);
+        } else {
+          finalCreators.unshift({
+            creator_handle: currentPostHandle,
+            post_url: postUrl || '',
+            platform: '',
+          });
+        }
+      }
 
       return {
         ...p,
-        author_username: rawAuthorUsername,
+        author_username: effectiveAuthor,
         creator_handle: effectiveHandle,
-        creators: creatorsList,
+        creators: finalCreators,
       };
     });
   }

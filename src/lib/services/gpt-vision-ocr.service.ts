@@ -11,7 +11,7 @@
  * This is the "AI Vision" path shown in the demo comparison.
  */
 
-import OpenAI from 'openai';
+import { getAIClient } from './ai-client';
 import fs from 'fs';
 import type { VideoFrame, GptVisionFrameResult } from '../types/social';
 
@@ -53,16 +53,8 @@ Rules:
 - confidence is your overall certainty (0.0 to 1.0)`;
 
 export class GptVisionOcrService {
-  private static getClient() {
-    return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  }
-
-  /**
-   * Analyze a single video frame with GPT-4o Vision.
-   * Sends the frame as a base64-encoded JPEG.
-   */
   static async analyzeFrame(frame: VideoFrame, contextHint?: string): Promise<GptVisionFrameResult> {
-    const openai = this.getClient();
+    const { client, model, isGroq } = getAIClient('vision');
 
     let base64Image: string;
     try {
@@ -74,8 +66,8 @@ export class GptVisionOcrService {
     }
 
     try {
-      const response = await openai.chat.completions.create({
-        model: 'gpt-4o',
+      const response = await client.chat.completions.create({
+        model,
         messages: [
           { role: 'system', content: FRAME_SYSTEM_PROMPT },
           {

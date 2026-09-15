@@ -1,48 +1,58 @@
-import OpenAI from 'openai';
+import { getAIClient } from './ai-client';
 import fs from 'fs';
 
 export class WhisperService {
-  private static getClient() {
-    return new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-    });
-  }
-
-  static async transcribeAudio(audioPath: string): Promise<string> {
-    const openai = this.getClient();
+  static async transcribeAudioVerbose(audioPath: string): Promise<{ text: string; language: string }> {
+    const { client, model, isGroq } = getAIClient('audio');
     const audioStream = fs.createReadStream(audioPath);
 
-    const response = await openai.audio.transcriptions.create({
+    const response = await client.audio.transcriptions.create({
       file: audioStream,
-      model: 'whisper-1',
-      response_format: 'text',
+      model,
+      response_format: 'verbose_json',
     });
-    return response as unknown as string;
+    return response as unknown as { text: string; language: string };
   }
 
   /**
    * Translates an audio file to English using OpenAI Whisper API
    */
   static async translateAudio(audioPath: string): Promise<string> {
-    const openai = this.getClient();
+    const { client, model, isGroq } = getAIClient('audio-translation');
     const audioStream = fs.createReadStream(audioPath);
 
-    const response = await openai.audio.translations.create({
+    const response = await client.audio.translations.create({
       file: audioStream,
-      model: 'whisper-1',
+      model,
       response_format: 'text',
     });
     return response as unknown as string;
   }
 
   /**
-   * Transcribes the audio into its original language and translates it to English in parallel.
+   * Transcribes the audio into its original language and translates it to English ONLY if needed.
    */
   static async processAudio(audioPath: string): Promise<{ originalTranscript: string; englishTranscript: string }> {
-    const [originalTranscript, englishTranscript] = await Promise.all([
-      this.transcribeAudio(audioPath),
-      this.translateAudio(audioPath),
-    ]);
-    return { originalTranscript, englishTranscript };
+    // 1. Transcribe the audio (this returns the original text AND detects the language)
+    const original = await this.transcribeAudioVerbose(audioPath);
+    const detectedLang = (original.language || '').toLowerCase();
+
+    // 2. If it's already English, just use the same text! (Saves an API call & tokens)
+    if (detectedLang === 'english' || detectedLang === 'en') {
+      console.log('[Whisper] Detected English. Skipping translation API call.');
+      return {
+        originalTranscript: original.text,
+        englishTranscript: original.text
+      };
+    }
+
+    // 3. If it's NOT English, we make a 2nd API call to get the translation.
+    console.log(`[Whisper] Detected ${detectedLang}. Calling translation API...`);
+    const englishTranscript = await this.translateAudio(audioPath);
+
+    return {
+      originalTranscript: original.text,
+      englishTranscript
+    };
   }
 }
