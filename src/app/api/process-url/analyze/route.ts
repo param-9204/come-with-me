@@ -5,6 +5,24 @@ import { AiEnrichmentService } from '@/lib/services/ai-enrichment.service';
 import { DbService } from '@/lib/services/db.service';
 import { ApifyOcrService } from '@/lib/services/apify-ocr.service';
 import { GptVisionOcrService } from '@/lib/services/gpt-vision-ocr.service';
+import type { PlaceExtraction } from '@/lib/types/social';
+
+function normalizedPlaceName(name: string | null | undefined): string {
+  return (name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function isSamePlace(a: PlaceExtraction, b: PlaceExtraction): boolean {
+  const aName = normalizedPlaceName(a.name);
+  const bName = normalizedPlaceName(b.name);
+  if (!aName || !bName) return false;
+
+  const namesMatch = aName === bName ||
+    (Math.min(aName.length, bName.length) >= 5 && (aName.includes(bName) || bName.includes(aName)));
+  const aCity = (a.city || '').trim().toLowerCase();
+  const bCity = (b.city || '').trim().toLowerCase();
+
+  return namesMatch && (!aCity || !bCity || aCity === bCity);
+}
 
 export async function POST(request: Request) {
   try {
@@ -35,7 +53,8 @@ export async function POST(request: Request) {
     const gptAggregated = GptVisionOcrService.aggregateResults([]);
     const apifyAllTexts = ApifyOcrService.deduplicateAcrossFrames(apifyOcrFrames);
 
-    // 2. Run OpenAI consolidated AI analysis (32-Section & Place Extraction in one call)
+    // 2. One strict response supplies both lightweight content intelligence and
+    // the authoritative place list. This avoids sending caption/OCR/transcript twice.
     const enrichmentResult = await AiEnrichmentService.analyzeContent(
       content,
       rawApifyData,
@@ -46,9 +65,11 @@ export async function POST(request: Request) {
 
     const aiAnalysis = enrichmentResult?.analysis || null;
     const placeAnalysis = enrichmentResult?.places || [];
+    console.log(`[API Analyze] Schema-valid place count: ${placeAnalysis.length}`);
 
     // 4. Save places to DB (Parallelized geocoding & saving)
     let placeIds: string[] = [];
+    let unresolvedPlaces: PlaceExtraction[] = [];
     if (placeAnalysis && placeAnalysis.length > 0) {
       // In-memory deduplication by name and city
       const seenPlaces = new Set<string>();
@@ -65,14 +86,22 @@ export async function POST(request: Request) {
 
       const savePlacePromises = uniquePlaces.map(async (place) => {
         try {
-          return await DbService.savePlace(place, url, content.platform, transcript || '', finalUserId, inputSocialPostId, content.authorUsername);
+          const id = await DbService.savePlace(place, url, content.platform, transcript || '', finalUserId, inputSocialPostId, content.authorUsername);
+          return { place, id };
         } catch (placeErr: any) {
           console.error('[API Analyze] Error saving individual place:', place.name, placeErr.message);
-          return null;
+          return { place, id: null };
         }
       });
-      const resolvedIds = await Promise.all(savePlacePromises);
-      placeIds = resolvedIds.filter(Boolean) as string[];
+      const saveResults = await Promise.all(savePlacePromises);
+      placeIds = saveResults.map((result) => result.id).filter(Boolean) as string[];
+      unresolvedPlaces = saveResults.filter((result) => !result.id).map((result) => result.place);
+      if (unresolvedPlaces.length > 0) {
+        console.warn(
+          `[API Analyze] Returning ${unresolvedPlaces.length} unresolved place(s): ` +
+          unresolvedPlaces.map((place) => place.name).join(', ')
+        );
+      }
     }
 
     // 5. Save full social post record to DB
@@ -160,7 +189,12 @@ export async function POST(request: Request) {
     const finalAuthorUsername = rawAuthorUsername ? rawAuthorUsername.replace(/^@/, '') : null;
     const finalCreatorHandle = rawAuthorUsername ? (rawAuthorUsername.startsWith('@') ? rawAuthorUsername : `@${rawAuthorUsername}`) : null;
 
-    const placesSource = savedPlaces.length > 0 ? savedPlaces : (placeAnalysis || []);
+    // Keep extracted places visible when persistence is blocked by missing or
+    // unverified address data; never silently turn four extracted places into three.
+    const responseOnlyPlaces = unresolvedPlaces.filter(
+      (unresolved) => !savedPlaces.some((saved) => isSamePlace(saved, unresolved))
+    );
+    const placesSource = [...savedPlaces, ...responseOnlyPlaces];
     const finalPlaces = placesSource.map((p: any) => ({
       ...p,
       place_id: p.id || p.place_id,

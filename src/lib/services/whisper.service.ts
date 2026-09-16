@@ -1,32 +1,32 @@
-import { getAIClient } from './ai-client';
+import { getAIClient, executeAICall } from './ai-client';
 import fs from 'fs';
 
 export class WhisperService {
   static async transcribeAudioVerbose(audioPath: string): Promise<{ text: string; language: string }> {
-    const { client, model, isGroq } = getAIClient('audio');
-    const audioStream = fs.createReadStream(audioPath);
-
-    const response = await client.audio.transcriptions.create({
-      file: audioStream,
-      model,
-      response_format: 'verbose_json',
+    return executeAICall('audio', async ({ client, model }) => {
+      const audioStream = fs.createReadStream(audioPath);
+      const response = await client.audio.transcriptions.create({
+        file: audioStream,
+        model,
+        response_format: 'verbose_json',
+      });
+      return response as unknown as { text: string; language: string };
     });
-    return response as unknown as { text: string; language: string };
   }
 
   /**
-   * Translates an audio file to English using OpenAI Whisper API
+   * Translates an audio file to English using Whisper API
    */
   static async translateAudio(audioPath: string): Promise<string> {
-    const { client, model, isGroq } = getAIClient('audio-translation');
-    const audioStream = fs.createReadStream(audioPath);
-
-    const response = await client.audio.translations.create({
-      file: audioStream,
-      model,
-      response_format: 'text',
+    return executeAICall('audio-translation', async ({ client, model }) => {
+      const audioStream = fs.createReadStream(audioPath);
+      const response = await client.audio.translations.create({
+        file: audioStream,
+        model,
+        response_format: 'text',
+      });
+      return response as unknown as string;
     });
-    return response as unknown as string;
   }
 
   /**

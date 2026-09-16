@@ -515,14 +515,10 @@ export default function Page() {
         if (isVideo) {
           addOrUpdateStep(3, 'Frame OCR (Extract & Tesseract)', 'pending', 0, 'Starting frame extraction and OCR...');
           const duration = contentData.videoDuration || 15;
-          const numFrames = Math.min(30, Math.round(duration));
+          const numFrames = Math.max(1, Math.round(duration));
           const timestamps: { index: number; timestamp: number }[] = [];
-          const interval = duration / numFrames;
           for (let i = 0; i < numFrames; i++) {
-            const ts = i * interval;
-            if (ts < duration) {
-              timestamps.push({ index: i, timestamp: ts });
-            }
+            timestamps.push({ index: i, timestamp: i });
           }
 
           addOrUpdateStep(3, `Frame OCR (Processing ${timestamps.length} frames)`, 'pending', 0, 'Extracting and processing frames...');
