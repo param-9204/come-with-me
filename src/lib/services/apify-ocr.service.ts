@@ -1,6 +1,6 @@
 import type { VideoFrame, ApifyOcrFrameResult } from '../types/social';
 
-const MAX_FRAMES_FOR_OCR = 60;
+const MAX_FRAMES_FOR_OCR = 120;
 
 const WORD_CONF_THRESHOLD = 60;
 

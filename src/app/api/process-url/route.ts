@@ -4,8 +4,6 @@ import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { DbService } from '@/lib/services/db.service';
 import { v4 as uuidv4 } from 'uuid';
 
-export const maxDuration = 60; // Allow Vercel function to run up to 60 seconds (requires Pro tier or compatible runtime)
-
 async function runSynchronousPipeline(origin: string, url: string, socialPostId: string, userId?: string): Promise<{ finalPostId: string; analyzeData: any }> {
   console.log(`[Synchronous Pipeline] Starting process-url for: ${url} (origin: ${origin})`);
   try {
@@ -113,14 +111,10 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
 
       if (isVideo) {
         const duration = contentData.videoDuration || 15;
-        const numFrames = Math.min(30, Math.round(duration));
+        const numFrames = Math.max(1, Math.round(duration));
         const timestamps: { index: number; timestamp: number }[] = [];
-        const interval = duration / numFrames;
         for (let i = 0; i < numFrames; i++) {
-          const ts = i * interval;
-          if (ts < duration) {
-            timestamps.push({ index: i, timestamp: ts });
-          }
+          timestamps.push({ index: i, timestamp: i });
         }
 
         const rawOcr = await runWithConcurrency(timestamps, 10, async (item) => {

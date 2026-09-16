@@ -26,7 +26,7 @@ export class VideoFrameService {
     });
   }
 
-  static async extractFrames(videoPath: string, maxFrames = 12): Promise<VideoFrame[]> {
+  static async extractFrames(videoPath: string, maxFrames = 120): Promise<VideoFrame[]> {
     const sessionId = uuidv4();
     const framesDir = path.join(os.tmpdir(), `frames_${sessionId}`);
     fs.mkdirSync(framesDir, { recursive: true });

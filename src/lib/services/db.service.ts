@@ -44,13 +44,45 @@ export class DbService {
     // Idempotent: skip geocoding and insertion if place already exists
     const { data: existing } = await supabaseAdmin
       .from('places')
-      .select('id')
+      .select('id, latitude, longitude, address, city, neighborhood')
       .ilike('name', placeData.name.trim())
       .ilike('city', (placeData.city || '').trim())
       .maybeSingle();
 
     if (existing) {
       console.log(`[DB] Place already exists: ${existing.id}`);
+      if (existing.latitude === null || existing.longitude === null) {
+        try {
+          const coords = await LocationService.geocodePlace(
+            placeData.name,
+            existing.city || placeData.city || '',
+            placeData.address || existing.address || '',
+            placeData.neighborhood || existing.neighborhood || ''
+          );
+
+          if (coords.lat !== null && coords.lng !== null) {
+            const verifiedUpdate: Record<string, string | number> = {
+              latitude: coords.lat,
+              longitude: coords.lng,
+            };
+            if (coords.formattedAddress) verifiedUpdate.address = coords.formattedAddress;
+            if (coords.city) verifiedUpdate.city = coords.city;
+            if (coords.neighborhood) verifiedUpdate.neighborhood = coords.neighborhood;
+
+            const { error: updateError } = await supabaseAdmin
+              .from('places')
+              .update(verifiedUpdate)
+              .eq('id', existing.id);
+            if (updateError) {
+              console.warn(`[DB] Failed to refresh coordinates for ${existing.id}:`, updateError.message);
+            } else {
+              console.log(`[DB] Refreshed provider-verified coordinates for ${existing.id}`);
+            }
+          }
+        } catch (geoErr: any) {
+          console.warn(`[DB] Failed to refresh coordinates for ${existing.id}:`, geoErr.message);
+        }
+      }
       if (socialPostId) {
         await DbService.linkPlacesToSocialPost(socialPostId, [existing.id]);
       }
@@ -61,13 +93,23 @@ export class DbService {
     let lng: number | null = null;
     let neighborhood = placeData.neighborhood;
     let address = placeData.address;
+    let city = LocationService.cleanCityName(placeData.city);
 
     try {
-      const coords = await LocationService.geocodePlace(placeData.name, placeData.city || '', placeData.address);
+      const coords = await LocationService.geocodePlace(
+        placeData.name,
+        city || '',
+        address,
+        neighborhood
+      );
       lat = coords.lat;
       lng = coords.lng;
       if (coords.formattedAddress) {
         address = coords.formattedAddress;
+      }
+      if (coords.city) {
+        city = coords.city;
+        console.log(`[DB] City from verified geocode: ${city}`);
       }
       // Use neighborhood from forward geocode context if not already known
       if (!neighborhood && coords.neighborhood) {
@@ -76,7 +118,7 @@ export class DbService {
       }
 
       // Only call reverse geocode if neighborhood is STILL missing
-      if (!neighborhood && lat && lng) {
+      if (!neighborhood && lat !== null && lng !== null) {
         console.log(`[DB] Neighborhood not in forward geocode — falling back to reverse geocode...`);
         try {
           neighborhood = await LocationService.getNeighborhood(lat, lng);
@@ -94,8 +136,27 @@ export class DbService {
       return null;
     }
 
+    // A source post may omit the city. Once Mapbox verifies it, check the
+    // canonical name/city pair before creating a duplicate record.
+    if (city.trim() && city.trim().toLowerCase() !== (placeData.city || '').trim().toLowerCase()) {
+      const { data: existingWithResolvedCity } = await supabaseAdmin
+        .from('places')
+        .select('id')
+        .ilike('name', placeData.name.trim())
+        .ilike('city', city.trim())
+        .maybeSingle();
+
+      if (existingWithResolvedCity) {
+        console.log(`[DB] Place already exists after geocoding: ${existingWithResolvedCity.id}`);
+        if (socialPostId) {
+          await DbService.linkPlacesToSocialPost(socialPostId, [existingWithResolvedCity.id]);
+        }
+        return existingWithResolvedCity.id;
+      }
+    }
+
     // Deduplicate by coordinate proximity (if geocoding succeeded)
-    if (lat && lng) {
+    if (lat !== null && lng !== null) {
       const margin = 0.0001; // ~10m bounding box
       const { data: existingByCoords } = await supabaseAdmin
         .from('places')
@@ -104,20 +165,24 @@ export class DbService {
         .lte('latitude', lat + margin)
         .gte('longitude', lng - margin)
         .lte('longitude', lng + margin)
-        .limit(1)
-        .maybeSingle();
+        .limit(10);
 
-      if (existingByCoords) {
-        console.log(`[DB] Place already exists at coordinates (${lat}, ${lng}): "${existingByCoords.name}" (ID: ${existingByCoords.id}). Skipping insertion of "${placeData.name}".`);
+      const normalizedName = placeData.name.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+      const samePlaceAtCoordinates = (existingByCoords || []).find((candidate) =>
+        (candidate.name || '').toLowerCase().replace(/[^a-z0-9]/g, '') === normalizedName
+      );
+
+      if (samePlaceAtCoordinates) {
+        console.log(`[DB] Place already exists at coordinates (${lat}, ${lng}): "${samePlaceAtCoordinates.name}" (ID: ${samePlaceAtCoordinates.id}). Skipping insertion of "${placeData.name}".`);
         if (socialPostId) {
-          await DbService.linkPlacesToSocialPost(socialPostId, [existingByCoords.id]);
+          await DbService.linkPlacesToSocialPost(socialPostId, [samePlaceAtCoordinates.id]);
         }
-        return existingByCoords.id;
+        return samePlaceAtCoordinates.id;
       }
     }
 
     // Ensure the city is recorded in our cities table
-    const cityName = (placeData.city || '').trim();
+    const cityName = LocationService.cleanCityName(city);
     if (cityName) {
       try {
         // Query cities table first to avoid redundant geocoding & upsert
@@ -132,7 +197,7 @@ export class DbService {
           let cityLng: number | null = null;
           try {
             const cityCoords = await LocationService.geocodePlace('', cityName);
-            if (cityCoords.lat && cityCoords.lng) {
+            if (cityCoords.lat !== null && cityCoords.lng !== null) {
               cityLat = cityCoords.lat;
               cityLng = cityCoords.lng;
             }
@@ -160,7 +225,7 @@ export class DbService {
       .insert({
         name: placeData.name.trim(),
         address: address || '',
-        city: placeData.city || '',
+        city: LocationService.cleanCityName(city),
         neighborhood,
         category: placeData.category || 'RESTAURANTS',
         description: placeData.description || '',
@@ -184,9 +249,6 @@ export class DbService {
     }
     return newPlace.id;
   }
-
-  // ──────────────────────────────────────────────────────────────────
-  // Link places to a social post via the junction table (social_post_places)
   // ──────────────────────────────────────────────────────────────────
   static async linkPlacesToSocialPost(socialPostId: string, placeIds: string[]): Promise<void> {
     if (!socialPostId || !placeIds.length) return;

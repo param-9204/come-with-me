@@ -5,9 +5,6 @@ import { after } from 'next/server';
 import { ScraperService } from '@/lib/services/scraper.service';
 import { DbService } from '@/lib/services/db.service';
 
-
-export const maxDuration = 300; // Requires Vercel Pro / Fluid Compute
-
 async function runBackgroundPipeline(
   origin: string,
   cleanUrl: string,
@@ -40,7 +37,7 @@ async function runBackgroundPipeline(
       const path = await import('path');
 
       const duration = contentData.videoDuration || 15;
-      const maxFrames = duration <= 15 ? 3 : duration <= 30 ? 5 : 6;
+      const maxFrames = Math.max(1, Math.round(duration));
 
       console.log(`[Background Pipeline] Downloading video once (duration=${duration}s, maxFrames=${maxFrames})...`);
       const tempVideoPath = await MediaService.downloadVideo(contentData.videoUrl);

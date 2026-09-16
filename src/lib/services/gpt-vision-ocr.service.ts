@@ -11,11 +11,11 @@
  * This is the "AI Vision" path shown in the demo comparison.
  */
 
-import { getAIClient } from './ai-client';
+import { getAIClient, executeAICall } from './ai-client';
 import fs from 'fs';
 import type { VideoFrame, GptVisionFrameResult } from '../types/social';
 
-const MAX_FRAMES_FOR_VISION = 30;
+const MAX_FRAMES_FOR_VISION = 120;
 
 const FRAME_SYSTEM_PROMPT = `You are a video frame analyzer for an influencer marketing platform called "Come With Me".
 
@@ -48,14 +48,13 @@ Return a JSON object with these exact fields:
 
 Rules:
 - Include EVERY visible text string, even partial ones
+- Prefer full business / venue display names exactly as shown on signs, menus, and title cards
 - Do NOT invent text that is not visible
 - If a field has no matches, return an empty array []
 - confidence is your overall certainty (0.0 to 1.0)`;
 
 export class GptVisionOcrService {
   static async analyzeFrame(frame: VideoFrame, contextHint?: string): Promise<GptVisionFrameResult> {
-    const { client, model, isGroq } = getAIClient('vision');
-
     let base64Image: string;
     try {
       const buffer = fs.readFileSync(frame.filePath);
@@ -66,46 +65,48 @@ export class GptVisionOcrService {
     }
 
     try {
-      const response = await client.chat.completions.create({
-        model,
-        messages: [
-          { role: 'system', content: FRAME_SYSTEM_PROMPT },
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'image_url',
-                image_url: {
-                  url: `data:image/jpeg;base64,${base64Image}`,
-                  detail: 'high',   // High detail for text extraction
+      return await executeAICall('vision', async ({ client, model }) => {
+        const response = await client.chat.completions.create({
+          model,
+          messages: [
+            { role: 'system', content: FRAME_SYSTEM_PROMPT },
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'image_url',
+                  image_url: {
+                    url: `data:image/jpeg;base64,${base64Image}`,
+                    detail: 'high',   // High detail for text extraction
+                  },
                 },
-              },
-              {
-                type: 'text',
-                text: `Analyze this video frame (timestamp: ${frame.timestamp.toFixed(1)}s). Extract ALL visible text, brands, prices, and locations. Return as JSON.`,
-              },
-            ],
-          },
-        ],
-        response_format: { type: 'json_object' },
-        max_tokens: 600,
+                {
+                  type: 'text',
+                  text: `Analyze this video frame (timestamp: ${frame.timestamp.toFixed(1)}s). Extract ALL visible text, brands, prices, and locations. Return as JSON.`,
+                },
+              ],
+            },
+          ],
+          response_format: { type: 'json_object' },
+          max_tokens: 600,
+        });
+
+        const raw = response.choices[0].message.content || '{}';
+        const parsed = JSON.parse(raw);
+
+        return {
+          frameIndex: frame.frameIndex,
+          timestamp: frame.timestamp,
+          texts: this.cleanArray(parsed.texts),
+          brands: this.cleanArray(parsed.brands),
+          locations: this.cleanArray(parsed.locations),
+          prices: this.cleanArray(parsed.prices),
+          cta: this.cleanArray(parsed.cta),
+          description: parsed.description || '',
+          confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.85,
+          method: 'gpt-4o-vision',
+        };
       });
-
-      const raw = response.choices[0].message.content || '{}';
-      const parsed = JSON.parse(raw);
-
-      return {
-        frameIndex: frame.frameIndex,
-        timestamp: frame.timestamp,
-        texts: this.cleanArray(parsed.texts),
-        brands: this.cleanArray(parsed.brands),
-        locations: this.cleanArray(parsed.locations),
-        prices: this.cleanArray(parsed.prices),
-        cta: this.cleanArray(parsed.cta),
-        description: parsed.description || '',
-        confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.85,
-        method: 'gpt-4o-vision',
-      };
     } catch (err) {
       console.error(`[GPT Vision] Frame ${frame.frameIndex} analysis failed:`, err);
       return this.emptyResult(frame);
@@ -119,7 +120,7 @@ export class GptVisionOcrService {
     if (!frames || frames.length === 0) return [];
 
     const framesToProcess = frames.slice(0, MAX_FRAMES_FOR_VISION);
-    console.log(`[GPT Vision] Analyzing ${framesToProcess.length} frames with GPT-4o Vision...`);
+    console.log(`[GPT Vision] Analyzing ${framesToProcess.length} frames with GPT-5 Vision...`);
 
     const results: GptVisionFrameResult[] = [];
 
