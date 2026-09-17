@@ -15,13 +15,14 @@ export async function GET(request: Request) {
 
     if (status === 'SUCCEEDED' && defaultDatasetId) {
       const { normalized, raw } = await ScraperService.fetchAndNormalize(defaultDatasetId, actorId);
+      const isRestricted = /restricted/i.test(String(raw?.error || raw?.http_error_reason || ''));
       return NextResponse.json({
         success: true,
         status,
         data: normalized,
         raw,
-        partial: raw?.error === 'restricted_page',
-        warning: raw?.error === 'restricted_page'
+        partial: isRestricted,
+        warning: isRestricted
           ? (raw?.errorDescription || 'Restricted access, only partial data available')
           : null,
       });

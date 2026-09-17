@@ -496,7 +496,7 @@ const COMBINED_SYSTEM_PROMPT = `Return JSON: {"places":[...],"analysis":{...}}. 
 
 PLACES (extract ALL, max 12): Scan caption, OCR, transcript start-to-end. Include every distinct named physical place visited/featured/recommended/listed (bonus/last/extra/also). Do NOT trust a stated stop count.
 
-NAME: Prefer OCR/caption venue names over @handles. Never save a bare handle when a real business name exists for that stop. Handle-without-@ is last resort. Name must be only the venue's exact display name—not surrounding caption text, promotional copy, labels, hashtags, rankings, or calls to action. If INPUT cannot isolate the display name, skip the place rather than modify or guess it. Skip people, DJs/artists/hosts, dishes, apps, generic unnamed places.
+NAME: Prefer OCR/caption venue names over @handles. A business handle directly attached to an offer, venue description, or address identifies a stop; use it without @ only when no display name is available. Do not treat ordinary people/creator tags as stops. Name must be only the venue's exact display name—not surrounding caption text, promotional copy, labels, hashtags, rankings, or calls to action. If INPUT cannot isolate the display name, skip the place rather than modify or guess it. Skip people, DJs/artists/hosts, dishes, apps, generic unnamed places.
 
 ADDRESS (critical): Extract the exact street line for each stop whenever present — full ("142 N. 2nd Street") or short ("(140 N. 2nd)", "400 Ranstead", "located at …"). Pair address with the nearest place/handle in the same sentence or parentheses. Never leave address "" if a street number for that stop is in INPUT. Never invent or swap addresses between stops.
 

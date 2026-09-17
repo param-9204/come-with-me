@@ -268,7 +268,8 @@ export class ScraperService {
     if (!items || items.length === 0) throw new Error('No items returned in dataset.');
 
     const firstItem = items[0] as any;
-    if (firstItem?.error === 'restricted_page' && typeof firstItem.description === 'string' && firstItem.description.trim()) {
+    const restrictionCode = String(firstItem?.error || firstItem?.http_error_reason || '');
+    if (/restricted/i.test(restrictionCode) && typeof firstItem.description === 'string' && firstItem.description.trim()) {
       console.warn('[Apify Scraper] Restricted page: using description-only place extraction.');
       return this.normalizeRestrictedInstagramRaw(firstItem);
     }

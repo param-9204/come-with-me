@@ -48,7 +48,8 @@ export async function POST(request: Request) {
     }
 
     console.log(`[API Analyze] Running enrichment for: ${url}`);
-    const restrictedPageMessage = rawApifyData?.error === 'restricted_page'
+    const isRestrictedPage = /restricted/i.test(String(rawApifyData?.error || rawApifyData?.http_error_reason || ''));
+    const restrictedPageMessage = isRestrictedPage
       ? (rawApifyData?.errorDescription || 'Restricted access, only partial data available')
       : null;
 
@@ -67,7 +68,22 @@ export async function POST(request: Request) {
     );
 
     const aiAnalysis = enrichmentResult?.analysis || null;
-    const placeAnalysis = enrichmentResult?.places || [];
+    let placeAnalysis = enrichmentResult?.places || [];
+    // Restricted-page records contain description text only. If the compact
+    // combined response found no place, use the focused extractor as a
+    // recovery path; normal complete posts never make this extra request.
+    if (restrictedPageMessage && placeAnalysis.length === 0) {
+      console.warn('[API Analyze] Restricted page returned no places; running description-only place recovery.');
+      try {
+        placeAnalysis = await AiEnrichmentService.extractPlace(
+          content,
+          transcript || '',
+          apifyAllTexts
+        );
+      } catch (placeError: any) {
+        console.warn('[API Analyze] Restricted-page place recovery failed:', placeError.message);
+      }
+    }
     console.log(`[API Analyze] Schema-valid place count: ${placeAnalysis.length}`);
 
     // 4. Save places to DB (Parallelized geocoding & saving)
