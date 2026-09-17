@@ -438,7 +438,9 @@ export async function POST(request: Request) {
     }
 
     const savedPlaces = await DbService.getPlacesForSocialPost(completedPost.id, completedPost.post_url);
-    const analyzedPlaces = Array.isArray(analyzeData?.places) ? analyzeData.places : [];
+    const analyzedPlaces = Array.isArray(analyzeData?.places)
+      ? analyzeData.places
+      : (analyzeData?.place && typeof analyzeData.place === 'object' ? [analyzeData.place] : []);
     const savedPlaceKeys = new Set(
       savedPlaces.map((place: any) => `${String(place.name || '').trim().toLowerCase()}|${String(place.city || '').trim().toLowerCase()}`)
     );
