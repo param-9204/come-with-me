@@ -2,7 +2,58 @@ import { NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
 import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { DbService } from '@/lib/services/db.service';
+import { AiEnrichmentService } from '@/lib/services/ai-enrichment.service';
+import type { SocialContent } from '@/lib/types/social';
 import { v4 as uuidv4 } from 'uuid';
+
+function restrictedAccessMessage(rawApifyData: any): string | null {
+  const accessFailure = [rawApifyData?.error, rawApifyData?.http_error_reason, rawApifyData?.errorDescription]
+    .filter((value) => typeof value === 'string')
+    .join(' ');
+
+  return /(?:restricted|age[ _-]*restriction|age[ _-]*limited)/i.test(accessFailure)
+    ? (rawApifyData?.errorDescription || 'Restricted access, only partial data available')
+    : null;
+}
+
+function contentFromStoredPost(post: any): SocialContent {
+  const raw = post?.raw_apify_data || {};
+  const platform = post?.platform === 'tiktok' ? 'tiktok' : 'instagram';
+  const contentType = ['post', 'reel', 'video'].includes(post?.content_type)
+    ? post.content_type
+    : 'post';
+
+  return {
+    platform,
+    contentId: String(post?.content_id || raw?.media_id || raw?.shared_entity_id || post?.id || ''),
+    contentType,
+    authorUsername: post?.author_username || raw?.user?.username || 'unknown',
+    authorFullName: post?.owner_full_name || '',
+    caption: post?.caption || raw?.description || '',
+    videoUrl: post?.video_url || '',
+    displayUrl: post?.display_url || '',
+    images: [],
+    shortCode: post?.short_code || '',
+    metrics: {
+      likes: post?.likes ?? null,
+      views: post?.views ?? null,
+      plays: post?.video_plays ?? null,
+      comments: post?.comments ?? null,
+      shares: null,
+      saves: null,
+    },
+    hashtags: Array.isArray(post?.hashtags) ? post.hashtags : [],
+    mentions: Array.isArray(post?.mentions) ? post.mentions : [],
+    taggedUsers: [],
+    musicInfo: null,
+    videoDuration: post?.video_duration ?? null,
+    dimensions: null,
+    paidPartnership: Boolean(post?.is_paid_partnership),
+    productType: post?.product_type || null,
+    publishedAt: null,
+    rawApifyData: raw,
+  };
+}
 
 async function runSynchronousPipeline(origin: string, url: string, socialPostId: string, userId?: string): Promise<{ finalPostId: string; analyzeData: any }> {
   console.log(`[Synchronous Pipeline] Starting process-url for: ${url} (origin: ${origin})`);
@@ -267,11 +318,29 @@ export async function POST(request: Request) {
     const existingPost = foundCompletedPost || (existingPosts && existingPosts.length > 0 ? existingPosts[0] : null);
 
     if (existingPost && existingPost.status === 'completed') {
-      let places = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
+      const savedPlaces = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
+      const partialError = restrictedAccessMessage(existingPost.raw_apify_data);
+      let responseOnlyPlaces: any[] = [];
+      if (partialError && savedPlaces.length === 0 && (existingPost.caption || existingPost.raw_apify_data?.description)) {
+        try {
+          responseOnlyPlaces = await AiEnrichmentService.extractPlace(
+            contentFromStoredPost(existingPost),
+            existingPost.whisper_transcript || '',
+            []
+          );
+          console.log(`[process-url] Recovered ${responseOnlyPlaces.length} place(s) from cached restricted post ${existingPost.id}.`);
+        } catch (placeError: any) {
+          console.warn('[process-url] Cached restricted-place recovery failed:', placeError.message);
+        }
+      }
+
+      const places = [...savedPlaces, ...responseOnlyPlaces];
       const firstPlace = places.length > 0 ? places[0] : null;
 
       return NextResponse.json({
         success: true,
+        partial: Boolean(partialError),
+        error: partialError,
         socialPostId: existingPost.id,
         data: existingPost,
         places,
