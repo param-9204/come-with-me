@@ -22,6 +22,41 @@ function partialResultMessage(placeCount: number): string {
     : 'Restricted post: no places found.';
 }
 
+function formatResponsePlaces(places: any[]): any[] {
+  return places.map((place) => ({
+    ...place,
+    place_id: place?.id || place?.place_id || null,
+  }));
+}
+
+function responsePlaceIds(places: any[]): string[] {
+  return places.map((place) => place?.id || place?.place_id).filter(Boolean);
+}
+
+function ocrComparisonFromStoredPost(post: any) {
+  const apifyFrames = Array.isArray(post?.ocr_frames_apify) ? post.ocr_frames_apify : [];
+  const gptFrames = Array.isArray(post?.ocr_frames_gpt) ? post.ocr_frames_gpt : [];
+
+  return {
+    apifyOcr: {
+      frames: apifyFrames,
+      allTexts: apifyFrames.flatMap((frame: any) => Array.isArray(frame?.texts) ? frame.texts : []),
+      totalFramesProcessed: apifyFrames.length,
+      processingTimeMs: 0,
+    },
+    gptVision: {
+      frames: gptFrames,
+      allTexts: gptFrames.flatMap((frame: any) => Array.isArray(frame?.texts) ? frame.texts : []),
+      allBrands: [],
+      allLocations: [],
+      allPrices: [],
+      allCtas: [],
+      totalFramesProcessed: gptFrames.length,
+      processingTimeMs: 0,
+    },
+  };
+}
+
 function contentFromStoredPost(post: any): SocialContent {
   const raw = post?.raw_apify_data || {};
   const platform = post?.platform === 'tiktok' ? 'tiktok' : 'instagram';
@@ -340,7 +375,7 @@ export async function POST(request: Request) {
         }
       }
 
-      const places = [...savedPlaces, ...responseOnlyPlaces];
+      const places = formatResponsePlaces([...savedPlaces, ...responseOnlyPlaces]);
       const firstPlace = places.length > 0 ? places[0] : null;
 
       return NextResponse.json({
@@ -349,11 +384,16 @@ export async function POST(request: Request) {
         error: partialError ? partialResultMessage(places.length) : null,
         socialPostId: existingPost.id,
         data: existingPost,
+        rawApifyData: existingPost.raw_apify_data || null,
         places,
         place: firstPlace,
-        placeIds: places.map((p: any) => p.id || p.place_id).filter(Boolean),
+        place_id: firstPlace?.id || firstPlace?.place_id || null,
+        placeIds: responsePlaceIds(places),
         aiAnalysis: existingPost.ai_analysis || null,
         transcript: existingPost.whisper_transcript || null,
+        scrapedData: contentFromStoredPost(existingPost),
+        ocrComparison: ocrComparisonFromStoredPost(existingPost),
+        audioUpload: null,
       });
     }
 
@@ -406,7 +446,7 @@ export async function POST(request: Request) {
       const key = `${String(place?.name || '').trim().toLowerCase()}|${String(place?.city || '').trim().toLowerCase()}`;
       return Boolean(place?.name) && !savedPlaceKeys.has(key);
     });
-    const places = [...savedPlaces, ...responseOnlyPlaces];
+    const places = formatResponsePlaces([...savedPlaces, ...responseOnlyPlaces]);
     const firstPlace = places.length > 0 ? places[0] : null;
 
     return NextResponse.json({
@@ -415,14 +455,16 @@ export async function POST(request: Request) {
       error: analyzeData?.partial ? analyzeData.error : null,
       socialPostId: completedPost.id,
       data: completedPost,
+      rawApifyData: analyzeData?.rawApifyData || completedPost.raw_apify_data || null,
       places,
       place: firstPlace,
       place_id: firstPlace?.id || firstPlace?.place_id || null,
-      placeIds: places.map((p: any) => p.id || p.place_id).filter(Boolean),
+      placeIds: responsePlaceIds(places),
       aiAnalysis: analyzeData?.aiAnalysis || completedPost.ai_analysis || null,
       transcript: analyzeData?.transcript || completedPost.whisper_transcript || null,
-      scrapedData: analyzeData?.scrapedData || null,
-      ocrComparison: analyzeData?.ocrComparison || null,
+      scrapedData: analyzeData?.scrapedData || contentFromStoredPost(completedPost),
+      ocrComparison: analyzeData?.ocrComparison || ocrComparisonFromStoredPost(completedPost),
+      audioUpload: analyzeData?.audioUpload || null,
     });
   } catch (error: any) {
     console.error('[Process URL API] Error:', error);
@@ -470,7 +512,7 @@ export async function GET(request: Request) {
 
     const post = posts.find(p => p.status === 'completed') || posts[0];
 
-    let places = await DbService.getPlacesForSocialPost(post.id, post.post_url);
+    const places = formatResponsePlaces(await DbService.getPlacesForSocialPost(post.id, post.post_url));
     const firstPlace = places.length > 0 ? places[0] : null;
 
     return NextResponse.json({
@@ -478,12 +520,16 @@ export async function GET(request: Request) {
       status: post.status,
       socialPostId: post.id,
       data: post,
+      rawApifyData: post.raw_apify_data || null,
       places,
       place: firstPlace,
       place_id: firstPlace?.id || firstPlace?.place_id || null,
-      placeIds: places.map((p: any) => p.id || p.place_id).filter(Boolean),
+      placeIds: responsePlaceIds(places),
       aiAnalysis: post.ai_analysis || null,
       transcript: post.whisper_transcript || null,
+      scrapedData: contentFromStoredPost(post),
+      ocrComparison: ocrComparisonFromStoredPost(post),
+      audioUpload: null,
     });
   } catch (error: any) {
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
