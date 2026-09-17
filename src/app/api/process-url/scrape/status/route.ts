@@ -20,6 +20,10 @@ export async function GET(request: Request) {
         status,
         data: normalized,
         raw,
+        partial: raw?.error === 'restricted_page',
+        warning: raw?.error === 'restricted_page'
+          ? (raw?.errorDescription || 'Restricted access, only partial data available')
+          : null,
       });
     }
 

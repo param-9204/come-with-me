@@ -48,6 +48,9 @@ export async function POST(request: Request) {
     }
 
     console.log(`[API Analyze] Running enrichment for: ${url}`);
+    const restrictedPageMessage = rawApifyData?.error === 'restricted_page'
+      ? (rawApifyData?.errorDescription || 'Restricted access, only partial data available')
+      : null;
 
     // 1. Process OCR results (Deduplicate)
     const gptAggregated = GptVisionOcrService.aggregateResults([]);
@@ -205,6 +208,9 @@ export async function POST(request: Request) {
 
     return NextResponse.json({
       success: true,
+      partial: Boolean(restrictedPageMessage),
+      // Successful partial results still retain the source-access error.
+      error: restrictedPageMessage,
       scrapedData: content,
       rawApifyData,
       transcript,

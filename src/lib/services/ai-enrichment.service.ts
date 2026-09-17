@@ -25,6 +25,7 @@ NAME
 - Prefer the real venue name from OCR, signs, or caption prose (e.g. "Blue Bottle Coffee").
 - Never store a bare @handle as name when a display name for that stop exists in INPUT.
 - Handle-without-@ is last resort only.
+- Name must be only the venue's exact display name—not surrounding caption text, promotional copy, labels, hashtags, rankings, or calls to action. If INPUT cannot isolate the display name, skip the place rather than modify or guess it.
 - Skip people, DJs/artists/hosts, dishes, apps, generic unnamed spots, background refs.
 
 ADDRESS (critical — most common failure)
@@ -65,11 +66,18 @@ function normalizeString(value: unknown): string | null {
   return typeof value === 'string' ? value.trim() : null;
 }
 
+/** Reject metadata-bearing names instead of trying to rewrite an unknown venue name. */
+function normalizePlaceName(value: unknown): string | null {
+  const name = normalizeString(value);
+  if (!name || name.includes('#')) return null;
+  return name;
+}
+
 /** Keep malformed or unexpected shapes out of the place-saving path. */
 function normalizePlace(value: unknown, authorUsername: string): PlaceExtraction | null {
   if (!isRecord(value)) return null;
 
-  const name = normalizeString(value.name);
+  const name = normalizePlaceName(value.name);
   const city = normalizeString(value.city);
   const neighborhood = normalizeString(value.neighborhood);
   const address = normalizeString(value.address);
@@ -488,7 +496,7 @@ const COMBINED_SYSTEM_PROMPT = `Return JSON: {"places":[...],"analysis":{...}}. 
 
 PLACES (extract ALL, max 12): Scan caption, OCR, transcript start-to-end. Include every distinct named physical place visited/featured/recommended/listed (bonus/last/extra/also). Do NOT trust a stated stop count.
 
-NAME: Prefer OCR/caption venue names over @handles. Never save a bare handle when a real business name exists for that stop. Handle-without-@ is last resort. Skip people, DJs/artists/hosts, dishes, apps, generic unnamed places.
+NAME: Prefer OCR/caption venue names over @handles. Never save a bare handle when a real business name exists for that stop. Handle-without-@ is last resort. Name must be only the venue's exact display name—not surrounding caption text, promotional copy, labels, hashtags, rankings, or calls to action. If INPUT cannot isolate the display name, skip the place rather than modify or guess it. Skip people, DJs/artists/hosts, dishes, apps, generic unnamed places.
 
 ADDRESS (critical): Extract the exact street line for each stop whenever present — full ("142 N. 2nd Street") or short ("(140 N. 2nd)", "400 Ranstead", "located at …"). Pair address with the nearest place/handle in the same sentence or parentheses. Never leave address "" if a street number for that stop is in INPUT. Never invent or swap addresses between stops.
 

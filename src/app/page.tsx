@@ -365,6 +365,7 @@ export default function Page() {
   const [url, setUrl] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [partialWarning, setPartialWarning] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<string>("summary");
   const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
 
@@ -393,6 +394,7 @@ export default function Page() {
     if (!url) return;
     setIsLoading(true);
     setError(null);
+    setPartialWarning(null);
     setScrapedData(null);
     setRawApifyData(null);
     setAiAnalysis(null);
@@ -421,6 +423,7 @@ export default function Page() {
     let whisperTranscript = '';
     let ocrResultsList: any[] = [];
     let audioUploadObj: any = null;
+    let isDescriptionOnlyPartial = false;
 
     try {
       // ── STEP 1: Initiate Apify Scrape ──
@@ -457,9 +460,17 @@ export default function Page() {
         if (apifyStatus === 'SUCCEEDED') {
           contentData = statusData.data;
           rawApifyDataObj = statusData.raw;
+          isDescriptionOnlyPartial = Boolean(statusData.partial);
+          if (statusData.warning) setPartialWarning(statusData.warning);
           setScrapedData(contentData);
           setRawApifyData(rawApifyDataObj);
-          addOrUpdateStep(1, 'Apify Scrape', 'success', Date.now() - start, `Succeeded after ${pollCount} polls`);
+          addOrUpdateStep(
+            1,
+            'Apify Scrape',
+            'success',
+            Date.now() - start,
+            isDescriptionOnlyPartial ? (statusData.warning || 'Description-only partial result') : `Succeeded after ${pollCount} polls`
+          );
           break;
         } else if (apifyStatus === 'FAILED' || apifyStatus === 'ABORTED' || apifyStatus === 'TIMED-OUT') {
           throw new Error(`Apify scraping run ended with status: ${apifyStatus}`);
@@ -473,7 +484,7 @@ export default function Page() {
         throw new Error("No content returned from scraper.");
       }
 
-      const isVideo = !!contentData.videoUrl && (contentData.contentType === 'video' || contentData.contentType === 'reel');
+      const isVideo = !isDescriptionOnlyPartial && !!contentData.videoUrl && (contentData.contentType === 'video' || contentData.contentType === 'reel');
 
       // ── STEP 2 & 3: Transcribe and OCR in Parallel ──
       const mediaProcessingStart = Date.now();
@@ -481,7 +492,9 @@ export default function Page() {
       // Define transcription task
       const transcriptionPromise = (async () => {
         const transcribeStart = Date.now();
-        if (isVideo) {
+        if (isDescriptionOnlyPartial) {
+          addOrUpdateStep(2, 'Whisper Transcription', 'skipped', 0, 'Restricted page — description-only extraction');
+        } else if (isVideo) {
           addOrUpdateStep(2, 'Whisper Transcription', 'pending', 0, 'Downloading media and transcribing...');
           try {
             const transcribeRes = await fetch("/api/process-url/transcribe", {
@@ -512,7 +525,9 @@ export default function Page() {
       // Define OCR task
       const ocrPromise = (async () => {
         const ocrStart = Date.now();
-        if (isVideo) {
+        if (isDescriptionOnlyPartial) {
+          addOrUpdateStep(3, 'Frame OCR', 'skipped', 0, 'Restricted page — description-only extraction');
+        } else if (isVideo) {
           addOrUpdateStep(3, 'Frame OCR (Extract & Tesseract)', 'pending', 0, 'Starting frame extraction and OCR...');
           const duration = contentData.videoDuration || 15;
           const numFrames = Math.max(1, Math.round(duration));
@@ -652,6 +667,7 @@ export default function Page() {
       if (analyzeData.place)         setPlace(analyzeData.place);
       if (analyzeData.socialPostId)  setSocialPostId(analyzeData.socialPostId);
       if (analyzeData.audioUpload)   setUploadedAudio(analyzeData.audioUpload);
+      if (analyzeData.partial && analyzeData.error) setPartialWarning(analyzeData.error);
 
       addOrUpdateStep(4, 'AI Analysis & Save', 'success', Date.now() - analyzeStart, 'Enrichment complete and results stored in database');
 
@@ -765,6 +781,19 @@ export default function Page() {
         </div>
 
         {/* ── Error ── */}
+        {partialWarning && (
+          <div className="bg-amber-950/30 border border-amber-900/50 rounded-lg p-4 flex items-start gap-3">
+            <svg className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+            </svg>
+            <div>
+              <p className="text-sm font-medium text-amber-300">Restricted Access</p>
+              <p className="text-xs text-amber-200/80 mt-0.5">{partialWarning}</p>
+              <p className="text-xs text-zinc-500 mt-1">Any places shown were extracted only from the available description.</p>
+            </div>
+          </div>
+        )}
+
         {error && (
           <div className="bg-red-950/40 border border-red-900/50 rounded-lg p-4 flex items-start gap-3">
             <svg className="w-4 h-4 text-red-500 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>

@@ -327,6 +327,8 @@ export async function POST(request: Request) {
 
     return NextResponse.json({
       success: true,
+      partial: Boolean(analyzeData?.partial),
+      error: analyzeData?.partial ? analyzeData.error : null,
       socialPostId: completedPost.id,
       data: completedPost,
       places,
