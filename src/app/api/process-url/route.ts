@@ -18,8 +18,8 @@ function restrictedAccessMessage(rawApifyData: any): string | null {
 
 function partialResultMessage(placeCount: number): string {
   return placeCount > 0
-    ? 'Restricted post: places found.'
-    : 'Restricted post: no places found.';
+    ? 'This post contains age-restricted content. Places were found.'
+    : 'This post contains age-restricted content. No places were found.';
 }
 
 function usableUsername(value: unknown): string | null {
