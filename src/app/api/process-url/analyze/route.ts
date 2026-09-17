@@ -222,7 +222,9 @@ export async function POST(request: Request) {
       creator_handle: finalCreatorHandle,
       creators: finalCreatorHandle ? [{ creator_handle: finalCreatorHandle, post_url: url, platform: content?.platform }] : [],
     }));
-    const partialResultMessage = 'Restricted URL';
+    const partialResultMessage = finalPlaces.length > 0
+      ? 'This post contains Restricted content. Place were found.'
+      : 'This post contains Restricted content. No places were found.';
 
     return NextResponse.json({
       success: true,
