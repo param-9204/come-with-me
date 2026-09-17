@@ -48,7 +48,10 @@ export async function POST(request: Request) {
     }
 
     console.log(`[API Analyze] Running enrichment for: ${url}`);
-    const isRestrictedPage = /restricted/i.test(String(rawApifyData?.error || rawApifyData?.http_error_reason || ''));
+    const accessFailure = [rawApifyData?.error, rawApifyData?.http_error_reason, rawApifyData?.errorDescription]
+      .filter((value) => typeof value === 'string')
+      .join(' ');
+    const isRestrictedPage = /(?:restricted|age[ _-]*restriction|age[ _-]*limited)/i.test(accessFailure);
     const restrictedPageMessage = isRestrictedPage
       ? (rawApifyData?.errorDescription || 'Restricted access, only partial data available')
       : null;

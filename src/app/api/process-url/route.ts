@@ -322,7 +322,16 @@ export async function POST(request: Request) {
       throw new Error(`Failed to fetch completed post: ${fetchErr?.message}`);
     }
 
-    const places = await DbService.getPlacesForSocialPost(completedPost.id, completedPost.post_url);
+    const savedPlaces = await DbService.getPlacesForSocialPost(completedPost.id, completedPost.post_url);
+    const analyzedPlaces = Array.isArray(analyzeData?.places) ? analyzeData.places : [];
+    const savedPlaceKeys = new Set(
+      savedPlaces.map((place: any) => `${String(place.name || '').trim().toLowerCase()}|${String(place.city || '').trim().toLowerCase()}`)
+    );
+    const responseOnlyPlaces = analyzedPlaces.filter((place: any) => {
+      const key = `${String(place?.name || '').trim().toLowerCase()}|${String(place?.city || '').trim().toLowerCase()}`;
+      return Boolean(place?.name) && !savedPlaceKeys.has(key);
+    });
+    const places = [...savedPlaces, ...responseOnlyPlaces];
     const firstPlace = places.length > 0 ? places[0] : null;
 
     return NextResponse.json({
