@@ -12,8 +12,14 @@ function restrictedAccessMessage(rawApifyData: any): string | null {
     .join(' ');
 
   return /(?:restricted|age[ _-]*restriction|age[ _-]*limited)/i.test(accessFailure)
-    ? (rawApifyData?.errorDescription || 'Restricted access, only partial data available')
+    ? 'restricted'
     : null;
+}
+
+function partialResultMessage(placeCount: number): string {
+  return placeCount > 0
+    ? 'Restricted post: places found.'
+    : 'Restricted post: no places found.';
 }
 
 function contentFromStoredPost(post: any): SocialContent {
@@ -340,7 +346,7 @@ export async function POST(request: Request) {
       return NextResponse.json({
         success: true,
         partial: Boolean(partialError),
-        error: partialError,
+        error: partialError ? partialResultMessage(places.length) : null,
         socialPostId: existingPost.id,
         data: existingPost,
         places,

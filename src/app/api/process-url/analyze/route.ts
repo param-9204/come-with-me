@@ -52,9 +52,7 @@ export async function POST(request: Request) {
       .filter((value) => typeof value === 'string')
       .join(' ');
     const isRestrictedPage = /(?:restricted|age[ _-]*restriction|age[ _-]*limited)/i.test(accessFailure);
-    const restrictedPageMessage = isRestrictedPage
-      ? (rawApifyData?.errorDescription || 'Restricted access, only partial data available')
-      : null;
+    const restrictedPageMessage = isRestrictedPage ? 'restricted' : null;
 
     // 1. Process OCR results (Deduplicate)
     const gptAggregated = GptVisionOcrService.aggregateResults([]);
@@ -224,12 +222,16 @@ export async function POST(request: Request) {
       creator_handle: finalCreatorHandle,
       creators: finalCreatorHandle ? [{ creator_handle: finalCreatorHandle, post_url: url, platform: content?.platform }] : [],
     }));
+    const partialResultMessage = finalPlaces.length > 0
+      ? 'Restricted post: places found.'
+      : 'Restricted post: no places found.';
 
     return NextResponse.json({
       success: true,
       partial: Boolean(restrictedPageMessage),
-      // Successful partial results still retain the source-access error.
-      error: restrictedPageMessage,
+      // A successful partial result reports whether the available source text
+      // produced a verifiable place, rather than exposing a generic error.
+      error: restrictedPageMessage ? partialResultMessage : null,
       scrapedData: content,
       rawApifyData,
       transcript,
