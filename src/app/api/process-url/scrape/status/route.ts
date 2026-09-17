@@ -15,11 +15,19 @@ export async function GET(request: Request) {
 
     if (status === 'SUCCEEDED' && defaultDatasetId) {
       const { normalized, raw } = await ScraperService.fetchAndNormalize(defaultDatasetId, actorId);
+      const accessFailure = [raw?.error, raw?.http_error_reason, raw?.errorDescription]
+        .filter((value) => typeof value === 'string')
+        .join(' ');
+      const isRestricted = /(?:restricted|age[ _-]*restriction|age[ _-]*limited)/i.test(accessFailure);
       return NextResponse.json({
         success: true,
         status,
         data: normalized,
         raw,
+        partial: isRestricted,
+        warning: isRestricted
+          ? (raw?.errorDescription || 'Restricted access, only partial data available')
+          : null,
       });
     }
 

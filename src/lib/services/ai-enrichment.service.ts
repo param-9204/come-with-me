@@ -23,8 +23,10 @@ Mentions/handles identify a stop; they are NOT the stored display name.
 
 NAME
 - Prefer the real venue name from OCR, signs, or caption prose (e.g. "Blue Bottle Coffee").
+- If no display name is present, use the directly associated business @handle without @; never use a promotional headline as the name.
 - Never store a bare @handle as name when a display name for that stop exists in INPUT.
 - Handle-without-@ is last resort only.
+- Name must be only the venue's exact display name—not surrounding caption text, promotional copy, labels, hashtags, rankings, or calls to action. If INPUT cannot isolate the display name, skip the place rather than modify or guess it.
 - Skip people, DJs/artists/hosts, dishes, apps, generic unnamed spots, background refs.
 
 ADDRESS (critical — most common failure)
@@ -35,6 +37,7 @@ ADDRESS (critical — most common failure)
   • "located at …", "at …", "address:", pin emoji lines
   • number + direction + street: "140 N 2nd", "209 Chestnut St"
 - Put the street line in "address" (keep number + street text). Do NOT leave address "" if a street number for that stop appears anywhere in INPUT.
+- Copy a complete stated Address/location line, including landmarks and road names. Never turn a size, height, price, date, or offer into an address or invent "Street".
 - Pair each address with the nearest place/handle in the same sentence, parentheses, or bullet.
 - Never invent a street number that is not written in INPUT.
 - Never copy one stop's address onto a different stop.
@@ -65,11 +68,18 @@ function normalizeString(value: unknown): string | null {
   return typeof value === 'string' ? value.trim() : null;
 }
 
+/** Reject metadata-bearing names instead of trying to rewrite an unknown venue name. */
+function normalizePlaceName(value: unknown): string | null {
+  const name = normalizeString(value);
+  if (!name || name.includes('#')) return null;
+  return name;
+}
+
 /** Keep malformed or unexpected shapes out of the place-saving path. */
 function normalizePlace(value: unknown, authorUsername: string): PlaceExtraction | null {
   if (!isRecord(value)) return null;
 
-  const name = normalizeString(value.name);
+  const name = normalizePlaceName(value.name);
   const city = normalizeString(value.city);
   const neighborhood = normalizeString(value.neighborhood);
   const address = normalizeString(value.address);
@@ -488,9 +498,9 @@ const COMBINED_SYSTEM_PROMPT = `Return JSON: {"places":[...],"analysis":{...}}. 
 
 PLACES (extract ALL, max 12): Scan caption, OCR, transcript start-to-end. Include every distinct named physical place visited/featured/recommended/listed (bonus/last/extra/also). Do NOT trust a stated stop count.
 
-NAME: Prefer OCR/caption venue names over @handles. Never save a bare handle when a real business name exists for that stop. Handle-without-@ is last resort. Skip people, DJs/artists/hosts, dishes, apps, generic unnamed places.
+NAME: Prefer OCR/caption venue names over @handles. A business handle directly attached to an offer, venue description, or address identifies a stop; use it without @ only when no display name is available. Never use a promotional headline as a name. Do not treat ordinary people/creator tags as stops. Name must be only the venue's exact display name—not surrounding caption text, promotional copy, labels, hashtags, rankings, or calls to action. If INPUT cannot isolate the display name, skip the place rather than modify or guess it. Skip people, DJs/artists/hosts, dishes, apps, generic unnamed places.
 
-ADDRESS (critical): Extract the exact street line for each stop whenever present — full ("142 N. 2nd Street") or short ("(140 N. 2nd)", "400 Ranstead", "located at …"). Pair address with the nearest place/handle in the same sentence or parentheses. Never leave address "" if a street number for that stop is in INPUT. Never invent or swap addresses between stops.
+ADDRESS (critical): Extract the exact street line or complete stated Address/location line for each stop whenever present — full ("142 N. 2nd Street") or short ("(140 N. 2nd)", "400 Ranstead", "located at …"). Pair address with the nearest place/handle in the same sentence or parentheses. Never turn a size, height, price, date, or offer into an address; never invent or swap addresses.
 
 GEO: Single-city itinerary → apply shared city/neighborhood to stops that omit city. Multi-city or unclear → keep separate / leave city "". Never invent cities or street numbers absent from INPUT.
 
@@ -579,6 +589,7 @@ export class AiEnrichmentService {
       platform: content.platform,
       caption: content.caption ? content.caption.trim() : '',
       author_username: content.authorUsername,
+      mentions: content.mentions || [],
       tagged_users: (content.taggedUsers || []).map(u => typeof u === 'string' ? u : u.username),
       ocr_texts: ocrTexts || [],
       audio_transcript: transcript ? transcript.trim() : null,

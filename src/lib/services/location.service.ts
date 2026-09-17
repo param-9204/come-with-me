@@ -175,6 +175,13 @@ export class LocationService {
     );
   }
 
+  /** Name-only search is safe only for an exact display-name match. */
+  private static namesExactlyMatch(expected: string, actual: string): boolean {
+    const expectedName = this.normalize(expected);
+    const actualName = this.normalize(actual);
+    return !!expectedName && expectedName === actualName;
+  }
+
   private static normalizeAddress(value: string): string {
     return this.normalize(value)
       .replace(/\b(st|str)\b/g, 'street')
@@ -282,6 +289,75 @@ export class LocationService {
     return allKeywords.some(keyword => normalizedAddress.includes(keyword));
   }
 
+  /**
+   * Last-resort web lookup for posts without city/address evidence. Accept only
+   * a single exact POI result; a chain or duplicate name is intentionally left
+   * unresolved rather than mapped to an arbitrary branch.
+   */
+  private static async findUniquePoiByName(name: string, mapboxToken: string): Promise<GeocodeResult> {
+    if (name.trim().length < 3) return this.emptyResult();
+
+    try {
+      const params = new URLSearchParams({
+        q: name.trim(),
+        access_token: mapboxToken,
+        language: 'en',
+        limit: '10',
+        types: 'poi',
+        auto_complete: 'false',
+      });
+      console.log(`[Geocoding] Trying exact global POI fallback for: "${name}"`);
+      const response = await fetch(`https://api.mapbox.com/search/searchbox/v1/forward?${params}`);
+      if (!response.ok) throw new Error(`Mapbox returned HTTP ${response.status}`);
+      const data = await response.json();
+
+      const matches = (data.features || []).flatMap((feature: any) => {
+        const properties = feature?.properties || {};
+        const coordinates = this.coordinatesFromFeature(feature);
+        const city = this.mapboxCity(properties);
+        const address = properties.full_address ||
+          [properties.address, properties.place_formatted].filter(Boolean).join(', ') ||
+          null;
+        if (
+          properties.feature_type !== 'poi' ||
+          !coordinates ||
+          !city ||
+          !address ||
+          !this.namesExactlyMatch(name, properties.name || '')
+        ) {
+          return [];
+        }
+        return [{ coordinates, city, address, neighborhood: this.mapboxNeighborhood(properties) }];
+      });
+
+      const uniqueMatches = Array.from(new Map(
+        matches.map((match: any) => [`${match.coordinates.lat},${match.coordinates.lng}`, match])
+      ).values());
+      if (uniqueMatches.length !== 1) {
+        console.warn(`[Geocoding] Name-only fallback for "${name}" is ambiguous or unverified; skipping it.`);
+        return this.emptyResult();
+      }
+
+      const match = uniqueMatches[0] as {
+        coordinates: { lat: number; lng: number };
+        city: string;
+        address: string;
+        neighborhood: string | null;
+      };
+      console.log(`[Geocoding] Exact unique POI fallback matched: ${match.address}`);
+      return {
+        lat: match.coordinates.lat,
+        lng: match.coordinates.lng,
+        formattedAddress: match.address,
+        city: match.city,
+        neighborhood: match.neighborhood,
+      };
+    } catch (error) {
+      console.warn(`[Geocoding] Exact global POI fallback failed for "${name}":`, error);
+      return this.emptyResult();
+    }
+  }
+
   static async geocodePlace(
     name: string,
     city: string,
@@ -309,6 +385,13 @@ export class LocationService {
 
     if (!cleanName && !cleanAddress && !cityInfo.name && !cleanNeighborhood) {
       return this.emptyResult();
+    }
+
+    if (!cityInfo.name && !cleanAddress) {
+      if (!mapboxToken || mapboxToken === 'your-mapbox-token') {
+        return this.emptyResult();
+      }
+      return this.findUniquePoiByName(cleanName, mapboxToken);
     }
 
     if (cleanAddress && !cityInfo.name) {

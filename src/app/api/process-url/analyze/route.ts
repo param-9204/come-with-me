@@ -48,6 +48,11 @@ export async function POST(request: Request) {
     }
 
     console.log(`[API Analyze] Running enrichment for: ${url}`);
+    const accessFailure = [rawApifyData?.error, rawApifyData?.http_error_reason, rawApifyData?.errorDescription]
+      .filter((value) => typeof value === 'string')
+      .join(' ');
+    const isRestrictedPage = /(?:restricted|age[ _-]*restriction|age[ _-]*limited)/i.test(accessFailure);
+    const restrictedPageMessage = isRestrictedPage ? 'restricted' : null;
 
     // 1. Process OCR results (Deduplicate)
     const gptAggregated = GptVisionOcrService.aggregateResults([]);
@@ -64,7 +69,22 @@ export async function POST(request: Request) {
     );
 
     const aiAnalysis = enrichmentResult?.analysis || null;
-    const placeAnalysis = enrichmentResult?.places || [];
+    let placeAnalysis = enrichmentResult?.places || [];
+    // Restricted-page records contain description text only. If the compact
+    // combined response found no place, use the focused extractor as a
+    // recovery path; normal complete posts never make this extra request.
+    if (restrictedPageMessage && placeAnalysis.length === 0) {
+      console.warn('[API Analyze] Restricted page returned no places; running description-only place recovery.');
+      try {
+        placeAnalysis = await AiEnrichmentService.extractPlace(
+          content,
+          transcript || '',
+          apifyAllTexts
+        );
+      } catch (placeError: any) {
+        console.warn('[API Analyze] Restricted-page place recovery failed:', placeError.message);
+      }
+    }
     console.log(`[API Analyze] Schema-valid place count: ${placeAnalysis.length}`);
 
     // 4. Save places to DB (Parallelized geocoding & saving)
@@ -202,9 +222,16 @@ export async function POST(request: Request) {
       creator_handle: finalCreatorHandle,
       creators: finalCreatorHandle ? [{ creator_handle: finalCreatorHandle, post_url: url, platform: content?.platform }] : [],
     }));
+    const partialResultMessage = finalPlaces.length > 0
+      ? 'This post contains Restricted content. Place were found.'
+      : 'This post contains Restricted content. No places were found.';
 
     return NextResponse.json({
       success: true,
+      partial: Boolean(restrictedPageMessage),
+      // A successful partial result reports whether the available source text
+      // produced a verifiable place, rather than exposing a generic error.
+      error: restrictedPageMessage ? partialResultMessage : null,
       scrapedData: content,
       rawApifyData,
       transcript,

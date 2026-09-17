@@ -170,6 +170,44 @@ export class ScraperService {
     return { normalized, raw };
   }
 
+  /**
+   * Apify can return a restricted-page record with a usable description but no
+   * reliable media. Preserve only that source text for place extraction.
+   */
+  private static normalizeRestrictedInstagramRaw(raw: any): { normalized: SocialContent; raw: any } {
+    const caption = typeof raw.description === 'string' ? raw.description.trim() : '';
+    const hashtags = ((caption.match(/#[\p{L}\p{N}_]+/gu) || []) as string[]).map((tag: string) => tag.slice(1));
+    const mentions = ((caption.match(/@[A-Za-z0-9._]+/g) || []) as string[]).map((mention: string) => mention.slice(1));
+
+    return {
+      normalized: {
+        platform: 'instagram',
+        // No media fields are supplied to the client, so it will skip OCR/audio.
+        contentType: 'post',
+        contentId: raw.media_id || raw.shared_entity_id || Date.now().toString(),
+        authorUsername: raw.user?.username || 'unknown',
+        authorFullName: '',
+        caption,
+        videoUrl: '',
+        displayUrl: '',
+        images: [],
+        shortCode: raw.media_id || '',
+        hashtags,
+        mentions,
+        taggedUsers: [],
+        musicInfo: null,
+        videoDuration: null,
+        dimensions: null,
+        paidPartnership: false,
+        productType: null,
+        publishedAt: null,
+        metrics: { likes: null, views: null, plays: null, comments: null, shares: null, saves: null },
+        rawApifyData: raw,
+      },
+      raw,
+    };
+  }
+
   static async initiateScrape(
     url: string,
     webhookUrl?: string,
@@ -228,6 +266,16 @@ export class ScraperService {
     const client = this.getClient();
     const { items } = await client.dataset(datasetId).listItems({ limit: 1 });
     if (!items || items.length === 0) throw new Error('No items returned in dataset.');
+
+    const firstItem = items[0] as any;
+    const accessFailure = [firstItem?.error, firstItem?.http_error_reason, firstItem?.errorDescription]
+      .filter((value) => typeof value === 'string')
+      .join(' ');
+    if (/(?:restricted|age[ _-]*restriction|age[ _-]*limited)/i.test(accessFailure) &&
+      typeof firstItem.description === 'string' && firstItem.description.trim()) {
+      console.warn('[Apify Scraper] Restricted page: using description-only place extraction.');
+      return this.normalizeRestrictedInstagramRaw(firstItem);
+    }
 
     if (actorId.includes('tiktok')) {
       return this.normalizeTikTokRaw(items[0] as unknown as ApifyTikTokPost);
