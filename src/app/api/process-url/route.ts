@@ -22,10 +22,42 @@ function partialResultMessage(placeCount: number): string {
     : 'Restricted post: no places found.';
 }
 
-function formatResponsePlaces(places: any[]): any[] {
+function usableUsername(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const username = value.trim().replace(/^@/, '');
+  return username && username.toLowerCase() !== 'unknown' ? username : null;
+}
+
+function authorUsernameFromPost(post: any): string | null {
+  return usableUsername(post?.author_username) || usableUsername(post?.raw_apify_data?.user?.username);
+}
+
+function tokensFromText(text: string, prefix: '#' | '@'): string[] {
+  const escapedPrefix = prefix === '#' ? '\\#' : '@';
+  const matches = text.match(new RegExp(`${escapedPrefix}([A-Za-z0-9._]+)`, 'g')) || [];
+  return [...new Set(matches.map((match) => match.slice(1)))];
+}
+
+function formatResponsePlaces(
+  places: any[],
+  metadata?: { authorUsername?: string | null; sourceUrl?: string | null; platform?: string | null }
+): any[] {
+  const authorUsername = usableUsername(metadata?.authorUsername);
+  const creatorHandle = authorUsername ? `@${authorUsername}` : null;
+
   return places.map((place) => ({
     ...place,
+    id: place?.id || place?.place_id || null,
     place_id: place?.id || place?.place_id || null,
+    latitude: place?.latitude ?? null,
+    longitude: place?.longitude ?? null,
+    author_username: usableUsername(place?.author_username) || authorUsername,
+    creator_handle: usableUsername(place?.creator_handle) ? `@${usableUsername(place.creator_handle)}` : creatorHandle,
+    creators: Array.isArray(place?.creators) && place.creators.length > 0
+      ? place.creators
+      : creatorHandle
+        ? [{ creator_handle: creatorHandle, post_url: metadata?.sourceUrl || '', platform: metadata?.platform || '' }]
+        : [],
   }));
 }
 
@@ -59,6 +91,7 @@ function ocrComparisonFromStoredPost(post: any) {
 
 function contentFromStoredPost(post: any): SocialContent {
   const raw = post?.raw_apify_data || {};
+  const caption = post?.caption || raw?.description || '';
   const platform = post?.platform === 'tiktok' ? 'tiktok' : 'instagram';
   const contentType = ['post', 'reel', 'video'].includes(post?.content_type)
     ? post.content_type
@@ -68,9 +101,9 @@ function contentFromStoredPost(post: any): SocialContent {
     platform,
     contentId: String(post?.content_id || raw?.media_id || raw?.shared_entity_id || post?.id || ''),
     contentType,
-    authorUsername: post?.author_username || raw?.user?.username || 'unknown',
+    authorUsername: authorUsernameFromPost(post) || 'unknown',
     authorFullName: post?.owner_full_name || '',
-    caption: post?.caption || raw?.description || '',
+    caption,
     videoUrl: post?.video_url || '',
     displayUrl: post?.display_url || '',
     images: [],
@@ -83,8 +116,8 @@ function contentFromStoredPost(post: any): SocialContent {
       shares: null,
       saves: null,
     },
-    hashtags: Array.isArray(post?.hashtags) ? post.hashtags : [],
-    mentions: Array.isArray(post?.mentions) ? post.mentions : [],
+    hashtags: Array.isArray(post?.hashtags) && post.hashtags.length > 0 ? post.hashtags : tokensFromText(caption, '#'),
+    mentions: Array.isArray(post?.mentions) && post.mentions.length > 0 ? post.mentions : tokensFromText(caption, '@'),
     taggedUsers: [],
     musicInfo: null,
     videoDuration: post?.video_duration ?? null,
@@ -359,31 +392,82 @@ export async function POST(request: Request) {
     const existingPost = foundCompletedPost || (existingPosts && existingPosts.length > 0 ? existingPosts[0] : null);
 
     if (existingPost && existingPost.status === 'completed') {
-      const savedPlaces = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
+      let savedPlaces = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
       const partialError = restrictedAccessMessage(existingPost.raw_apify_data);
       let responseOnlyPlaces: any[] = [];
+      const cachedContent = contentFromStoredPost(existingPost);
+
+      // Restricted records saved by older versions may contain only the raw
+      // Apify payload. Repair the source-backed post fields before returning
+      // it so creator metadata is never reported as "unknown".
+      if (partialError && (existingPost.author_username !== cachedContent.authorUsername || existingPost.caption !== cachedContent.caption)) {
+        const { error: postRepairError } = await supabaseAdmin
+          .from('social_posts')
+          .update({
+            author_username: cachedContent.authorUsername,
+            caption: cachedContent.caption,
+            hashtags: cachedContent.hashtags,
+            mentions: cachedContent.mentions,
+          })
+          .eq('id', existingPost.id);
+        if (postRepairError) {
+          console.warn('[process-url] Failed to repair cached restricted post fields:', postRepairError.message);
+        }
+      }
+
       if (partialError && savedPlaces.length === 0 && (existingPost.caption || existingPost.raw_apify_data?.description)) {
         try {
           responseOnlyPlaces = await AiEnrichmentService.extractPlace(
-            contentFromStoredPost(existingPost),
+            cachedContent,
             existingPost.whisper_transcript || '',
             []
           );
+          const savedIds = await Promise.all(responseOnlyPlaces.map((place) =>
+            DbService.savePlace(
+              place,
+              existingPost.post_url,
+              cachedContent.platform,
+              existingPost.whisper_transcript || '',
+              undefined,
+              existingPost.id,
+              cachedContent.authorUsername
+            )
+          ));
+          if (savedIds.some(Boolean)) {
+            savedPlaces = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
+            const savedPlaceKeys = new Set(savedPlaces.map((place: any) =>
+              `${String(place.name || '').trim().toLowerCase()}|${String(place.city || '').trim().toLowerCase()}`
+            ));
+            responseOnlyPlaces = responseOnlyPlaces.filter((place) =>
+              !savedPlaceKeys.has(`${String(place.name || '').trim().toLowerCase()}|${String(place.city || '').trim().toLowerCase()}`)
+            );
+          }
           console.log(`[process-url] Recovered ${responseOnlyPlaces.length} place(s) from cached restricted post ${existingPost.id}.`);
         } catch (placeError: any) {
           console.warn('[process-url] Cached restricted-place recovery failed:', placeError.message);
         }
       }
 
-      const places = formatResponsePlaces([...savedPlaces, ...responseOnlyPlaces]);
+      const places = formatResponsePlaces([...savedPlaces, ...responseOnlyPlaces], {
+        authorUsername: cachedContent.authorUsername,
+        sourceUrl: existingPost.post_url,
+        platform: cachedContent.platform,
+      });
       const firstPlace = places.length > 0 ? places[0] : null;
+      const responseData = {
+        ...existingPost,
+        author_username: cachedContent.authorUsername,
+        caption: cachedContent.caption,
+        hashtags: cachedContent.hashtags,
+        mentions: cachedContent.mentions,
+      };
 
       return NextResponse.json({
         success: true,
         partial: Boolean(partialError),
         error: partialError ? partialResultMessage(places.length) : null,
         socialPostId: existingPost.id,
-        data: existingPost,
+        data: responseData,
         rawApifyData: existingPost.raw_apify_data || null,
         places,
         place: firstPlace,
@@ -391,7 +475,7 @@ export async function POST(request: Request) {
         placeIds: responsePlaceIds(places),
         aiAnalysis: existingPost.ai_analysis || null,
         transcript: existingPost.whisper_transcript || null,
-        scrapedData: contentFromStoredPost(existingPost),
+        scrapedData: cachedContent,
         ocrComparison: ocrComparisonFromStoredPost(existingPost),
         audioUpload: null,
       });
@@ -448,7 +532,11 @@ export async function POST(request: Request) {
       const key = `${String(place?.name || '').trim().toLowerCase()}|${String(place?.city || '').trim().toLowerCase()}`;
       return Boolean(place?.name) && !savedPlaceKeys.has(key);
     });
-    const places = formatResponsePlaces([...savedPlaces, ...responseOnlyPlaces]);
+    const places = formatResponsePlaces([...savedPlaces, ...responseOnlyPlaces], {
+      authorUsername: authorUsernameFromPost(completedPost),
+      sourceUrl: completedPost.post_url,
+      platform: completedPost.platform,
+    });
     const firstPlace = places.length > 0 ? places[0] : null;
 
     return NextResponse.json({
@@ -514,7 +602,11 @@ export async function GET(request: Request) {
 
     const post = posts.find(p => p.status === 'completed') || posts[0];
 
-    const places = formatResponsePlaces(await DbService.getPlacesForSocialPost(post.id, post.post_url));
+    const places = formatResponsePlaces(await DbService.getPlacesForSocialPost(post.id, post.post_url), {
+      authorUsername: authorUsernameFromPost(post),
+      sourceUrl: post.post_url,
+      platform: post.platform,
+    });
     const firstPlace = places.length > 0 ? places[0] : null;
 
     return NextResponse.json({
