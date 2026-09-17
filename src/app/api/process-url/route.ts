@@ -16,10 +16,8 @@ function restrictedAccessMessage(rawApifyData: any): string | null {
     : null;
 }
 
-function partialResultMessage(placeCount: number): string {
-  return placeCount > 0
-    ? 'This post contains age-restricted content. Place were found.'
-    : 'This post contains age-restricted content. No places were found.';
+function partialResultMessage(): string {
+  return 'Restricted URL';
 }
 
 function usableUsername(value: unknown): string | null {
@@ -465,7 +463,7 @@ export async function POST(request: Request) {
       return NextResponse.json({
         success: true,
         partial: Boolean(partialError),
-        error: partialError ? partialResultMessage(places.length) : null,
+        error: partialError ? partialResultMessage() : null,
         socialPostId: existingPost.id,
         data: responseData,
         rawApifyData: existingPost.raw_apify_data || null,
