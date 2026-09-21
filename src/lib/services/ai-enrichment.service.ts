@@ -704,12 +704,11 @@ export class AiEnrichmentService {
     content: SocialContent,
     rawApifyData: any,
     transcript: string,
-    gptOcrTexts: string[],
     apifyOcrTexts: string[]
   ): Promise<{ analysis: AiAnalysisResult; places: PlaceExtraction[] } | null> {
-    const ocrTexts = Array.from(new Set([...gptOcrTexts, ...apifyOcrTexts].map(text => text.trim()).filter(Boolean)));
+    const ocrTexts = Array.from(new Set(apifyOcrTexts.map(text => text.trim()).filter(Boolean)));
     const caption = content.caption ? content.caption.trim() : '';
-    const trimmedTranscript = transcript ? transcript.trim().substring(0, 500) : '';
+    const trimmedTranscript = transcript ? transcript.trim() : '';
     const taggedUsers = (content.taggedUsers || []).map(u => typeof u === 'string' ? u : u.username).filter(Boolean);
 
     const condensedInput: Record<string, unknown> = {
@@ -721,10 +720,12 @@ export class AiEnrichmentService {
     if ((content.hashtags || []).length > 0) condensedInput.hashtags = content.hashtags;
     if ((content.mentions || []).length > 0) condensedInput.mentions = content.mentions;
     if (taggedUsers.length > 0) condensedInput.tagged_users = taggedUsers;
-    if (ocrTexts.length > 0) condensedInput.ocr_texts = ocrTexts.slice(0, 5);
+    // OCR lines are source evidence. Keep every deduplicated line so later
+    // frames in a list-style video cannot lose their venue names.
+    if (ocrTexts.length > 0) condensedInput.ocr_texts = ocrTexts;
     if (trimmedTranscript) condensedInput.audio_transcript = trimmedTranscript;
 
-    const ocrAvailable = gptOcrTexts.length > 0 || apifyOcrTexts.length > 0;
+    const ocrAvailable = apifyOcrTexts.length > 0;
     const transcriptAvailable = !!transcript && transcript.trim().length > 0;
 
     const userMessage = JSON.stringify(condensedInput);

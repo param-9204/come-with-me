@@ -565,7 +565,7 @@ export default function Page() {
                   videoUrl: contentData.videoUrl,
                   frameIndex: item.index,
                   timestamp: item.timestamp,
-                  isVideo: true
+                  isVideo: true,
                 }),
               });
               const resData = await res.json();
@@ -617,10 +617,10 @@ export default function Page() {
                     frameIndex: index,
                     isVideo: false
                   }),
-                });
-                const resData = await res.json();
-                if (res.ok && resData.success && resData.ocrFrameResult) {
-                  return resData.ocrFrameResult;
+              });
+              const resData = await res.json();
+              if (res.ok && resData.success && resData.ocrFrameResult) {
+                return resData.ocrFrameResult;
                 }
               } catch (e) {
                 console.error(`Image OCR error for index ${index}:`, e);

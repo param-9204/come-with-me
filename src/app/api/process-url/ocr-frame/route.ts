@@ -59,7 +59,7 @@ export async function POST(request: Request) {
       hash,
     };
 
-    // 4. Run local Tesseract OCR on the single frame
+    // 4. Run local Apify/Tesseract OCR on the single frame.
     const ocrResults = await ApifyOcrService.extractTextFromFrames([virtualFrame], false);
     
     // 5. Clean up local files immediately
