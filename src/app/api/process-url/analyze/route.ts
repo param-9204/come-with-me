@@ -4,7 +4,6 @@ import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { AiEnrichmentService } from '@/lib/services/ai-enrichment.service';
 import { DbService } from '@/lib/services/db.service';
 import { ApifyOcrService } from '@/lib/services/apify-ocr.service';
-import { GptVisionOcrService } from '@/lib/services/gpt-vision-ocr.service';
 import type { PlaceExtraction } from '@/lib/types/social';
 
 function normalizedPlaceName(name: string | null | undefined): string {
@@ -55,7 +54,6 @@ export async function POST(request: Request) {
     const restrictedPageMessage = isRestrictedPage ? 'restricted' : null;
 
     // 1. Process OCR results (Deduplicate)
-    const gptAggregated = GptVisionOcrService.aggregateResults([]);
     const apifyAllTexts = ApifyOcrService.deduplicateAcrossFrames(apifyOcrFrames);
 
     // 2. One strict response supplies both lightweight content intelligence and
@@ -64,7 +62,6 @@ export async function POST(request: Request) {
       content,
       rawApifyData,
       transcript || '',
-      gptAggregated.allTexts,
       apifyAllTexts
     );
 

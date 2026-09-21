@@ -489,7 +489,7 @@ export async function POST(request: Request) {
               rawApifyDataObj = dbPost.raw_apify_data;
               if (rawApifyDataObj) {
                 const { normalized } = platform === 'tiktok'
-                  ? ScraperService.normalizeTikTokRaw(rawApifyDataObj)
+                  ? await ScraperService.normalizeTikTokRaw(rawApifyDataObj)
                   : ScraperService.normalizeInstagramRaw(rawApifyDataObj);
                 contentData = normalized;
               }

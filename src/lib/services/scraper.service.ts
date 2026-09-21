@@ -6,7 +6,55 @@ export class ScraperService {
     return new ApifyClient({ token: process.env.APIFY_API_TOKEN });
   }
 
-  static normalizeTikTokRaw(raw: ApifyTikTokPost): { normalized: SocialContent; raw: ApifyTikTokPost } {
+  /** Keep actor output-field variation at the ingestion boundary. */
+  private static firstHttpsUrl(...candidates: unknown[]): string {
+    for (const candidate of candidates) {
+      if (typeof candidate !== 'string') continue;
+      const url = candidate.trim();
+      if (/^https:\/\//i.test(url)) return url;
+    }
+    return '';
+  }
+
+  /**
+   * Apify's video-download add-on returns a private KVS record URL. Convert
+   * only that exact record shape into a record-scoped signed URL; never put
+   * the account token in a browser-visible media URL.
+   */
+  private static async signApifyRecordUrl(url: string): Promise<string> {
+    try {
+      const parsed = new URL(url);
+      if (parsed.hostname !== 'api.apify.com') return url;
+
+      const match = parsed.pathname.match(/^\/v2\/key-value-stores\/([^/]+)\/records\/([^/]+)$/);
+      if (!match) return url;
+
+      const [, storeId, recordKey] = match;
+      return await this.getClient()
+        .keyValueStore(decodeURIComponent(storeId))
+        .getRecordPublicUrl(decodeURIComponent(recordKey));
+    } catch (error: any) {
+      // Keep normal metadata processing available if a signed media link
+      // cannot be made (for example, a record was already deleted).
+      console.warn('[Apify TikTok] Could not sign downloaded-video record:', error.message);
+      return url;
+    }
+  }
+
+  static async normalizeTikTokRaw(raw: ApifyTikTokPost): Promise<{ normalized: SocialContent; raw: ApifyTikTokPost }> {
+    const downloadedMediaUrls = Array.isArray((raw as any).mediaUrls)
+      ? (raw as any).mediaUrls.flatMap((media: unknown) => {
+        if (typeof media === 'string') return [media];
+        if (media && typeof media === 'object') {
+          const value = media as Record<string, unknown>;
+          return [value.url, value.downloadUrl, value.downloadLink, value.videoUrl].filter(
+            (candidate): candidate is string => typeof candidate === 'string'
+          );
+        }
+        return [];
+      })
+      : [];
+
     // Try to extract image URLs from various possible fields for slideshow/photo-mode posts
     let images: string[] = [];
     if (Array.isArray((raw as any).slideshowImageLinks)) {
@@ -36,6 +84,16 @@ export class ScraperService {
     const isSlideshow = (raw as any).isSlideshow === true || images.length > 0 || (raw as any).postType === 'slideshow';
     const contentType = isSlideshow ? 'post' : 'video';
 
+    const videoUrl = await this.signApifyRecordUrl(this.firstHttpsUrl(
+      raw.videoUrl,
+      (raw as any).videoMeta?.videoUrl,
+      (raw as any).videoMeta?.playUrl,
+      (raw as any).videoMeta?.downloadAddr,
+      (raw as any).video?.playAddr,
+      (raw as any).video?.downloadAddr,
+      ...downloadedMediaUrls,
+    ));
+
     const normalized: SocialContent = {
       platform: 'tiktok',
       contentType: contentType as 'video' | 'post',
@@ -43,8 +101,13 @@ export class ScraperService {
       authorUsername: raw.authorMeta?.name || 'unknown',
       authorFullName: raw.authorMeta?.nickName || '',
       caption: raw.text || '',
-      videoUrl: raw.videoUrl || '',
-      displayUrl: raw.videoMeta?.originalCoverUrl || raw.videoMeta?.dynamicCoverUrl || '',
+      videoUrl,
+      displayUrl: this.firstHttpsUrl(
+        raw.videoMeta?.originalCoverUrl,
+        (raw as any).videoMeta?.coverUrl,
+        raw.videoMeta?.dynamicCoverUrl,
+        (raw as any).coverUrl,
+      ),
       images: images.length > 0 ? images : undefined,
       shortCode: raw.id || '',
       hashtags: (raw.hashtags || []).map((h: any) => h.name || h.title || h),
@@ -237,6 +300,10 @@ export class ScraperService {
       const run = await client.actor('clockworks/tiktok-scraper').start({
         postURLs: [url],
         maxItems: 1,
+        // Place names are often only present in the video frames. A caption and
+        // cover alone cannot support a complete itinerary extraction.
+        shouldDownloadVideos: true,
+        shouldDownloadCovers: true,
       }, startOptions);
       return { runId: run.id, actorId: 'clockworks/tiktok-scraper' };
     } else if (url.includes('instagram.com')) {
@@ -278,7 +345,7 @@ export class ScraperService {
     }
 
     if (actorId.includes('tiktok')) {
-      return this.normalizeTikTokRaw(items[0] as unknown as ApifyTikTokPost);
+      return await this.normalizeTikTokRaw(items[0] as unknown as ApifyTikTokPost);
     } else {
       return this.normalizeInstagramRaw(items[0] as unknown as ApifyInstagramPost);
     }
