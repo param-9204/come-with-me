@@ -1,152 +1,221 @@
-import { getAIClient, executeAICall } from './ai-client';
+import { executeAICall, supportsTemperature } from './ai-client';
 import { LocationService } from './location.service';
-import type { SocialContent, AiAnalysisResult, PlaceExtraction } from '../types/social';
-import * as stringSimilarity from 'string-similarity';
-import { removeStopwords, eng } from 'stopword';
-import nlp from 'compromise';
+import { plog } from './pipeline-log';
+import {
+  BASE_CATEGORIES, buildEvidence, formatEvidenceForPrompt, mergeSameEntities, resolveHiddenGem,
+  sanitizeCandidateLocation, scoreAndFilterCandidates,
+  type BaseCategory, type EvidenceBundle, type MediaEvidenceInput, type RawPlaceCandidate,
+} from './place-evidence.service';
+import type { SocialContent, AiAnalysisResult, PlaceExtraction, PlaceCategory } from '../types/social';
 
 const PLACE_CATEGORIES = [
   'RESTAURANTS', 'COFFEE', 'TRAVEL', 'ADVENTURE', 'NATURE', 'CITY',
   'SHOPPING', 'NIGHTLIFE', 'CULTURE', 'HIDDEN GEMS', 'BARS',
 ] as const;
 
-// Provider wire format uses integer percentages so Groq can enforce one
-// homogeneous strict enum. Values are converted back to app decimals below.
-const PLACE_CONFIDENCE_CODES = [60, 80, 100] as const;
-type PlaceConfidenceCode = (typeof PLACE_CONFIDENCE_CODES)[number];
+const MENTION_TYPES = ['explicit', 'handle', 'indirect'] as const;
+const ROLES = ['featured', 'recommended', 'mentioned_only', 'background'] as const;
 
-const PLACE_SYSTEM_PROMPT = `You extract map-ready places from social posts. Return every distinct physical place the creator visits, features, recommends, or lists as a stop (including bonus/last/extra/also). Return {"places":[]} only when none is supported.
+/**
+ * Output budget. Only generated tokens are billed, so the model maximum
+ * (16,384 for gpt-4o) costs nothing unless a long list actually needs it.
+ */
+const MAX_OUTPUT_TOKENS = 16_000;
+const RECOVERY_OUTPUT_TOKENS = 16_000;
 
-SOURCE PRIORITY
-1) caption  2) OCR / on-screen text  3) audio transcript  4) tagged business accounts
-Mentions/handles identify a stop; they are NOT the stored display name.
+// ──────────────────────────────────────────────────────────────────────
+// Prompt
+// ──────────────────────────────────────────────────────────────────────
+
+const PLACE_RULES = `You extract real-world places from ONE Instagram/TikTok post. Use ONLY the numbered EVIDENCE lines — never your own knowledge of places, cities, or addresses.
+
+EVIDENCE SOURCES (id prefix)
+C caption · L platform location tag · A tagged / collab / mentioned account with its display name · O on-screen text from OCR (may contain letter errors; t = seconds) · V on-screen text from high-accuracy OCR · S speech transcript (seconds) · H hashtags · K comments (creator's own comments are marked) · X image description · B creator bio (context only, never enough on its own).
+The place can appear in only ONE source. Captions are often silent while the venue name is only on screen, only spoken, only a tagged account, or only the location tag. Read every line before answering.
+
+WHAT IS A PLACE
+A specific, named, physical location someone can visit: restaurant, cafe, bar, club, shop, market, hotel, museum, gallery, park, beach, trail, viewpoint, landmark, street, or a town/island that is itself the destination.
+Not places: people, the creator, DJs/artists, the audio track, brands or products with no specific location (a drink brand, an app), dishes, events without a venue, generic phrases ("this cafe", "the best pizza spot").
+A city, state, or country that only says WHERE the other places are is location context: put it in those places' "city" field instead of returning it as a place.
+Posts often contain several places (lists, itineraries, guides, "3 spots in…", "bonus stop"); guides with 20–40 places are normal. Return every one separately — never stop early or summarise. Do not trust a stated count; return what the evidence shows. Every 📍 line is a candidate: return it unless it is clearly not a place.
+
+ROLE (return every candidate; the system keeps only featured and recommended)
+featured = shown, visited, reviewed · recommended = suggested but not shown · mentioned_only = comparison, joke, "better than X", passing reference · background = visible but not the subject (a logo on a cup, a passing sign, a photo credit).
+Entries of a guide, itinerary or list ("Day 2 - Evening plans @brasseriecognac", "SHOPS: Vowels, PHOS") are featured or recommended — never mentioned_only.
 
 NAME
-- Prefer the real venue name from OCR, signs, or caption prose (e.g. "Blue Bottle Coffee").
-- If no display name is present, use the directly associated business @handle without @; never use a promotional headline as the name.
-- Never store a bare @handle as name when a display name for that stop exists in INPUT.
-- Handle-without-@ is last resort only.
-- Name must be only the venue's exact display name—not surrounding caption text, promotional copy, labels, hashtags, rankings, or calls to action. If INPUT cannot isolate the display name, skip the place rather than modify or guess it.
-- Skip people, DJs/artists/hosts, dishes, apps, generic unnamed spots, background refs.
+- Copy the venue's display name as written in the evidence. Fix an OCR letter error only when another line confirms the spelling (O3 "CAFE LUMIFRE" + A1 "Café Lumière" → "Café Lumière").
+- If an account identifies the venue, prefer its display name from the A line ("Joe's Pizza" for @joespizzanyc). With no display name anywhere, use the handle without @ and set mention_type "handle".
+- Never use a headline, slogan, ranking ("#1"), price, hashtag, or caption sentence as a name.
+- mention_type "indirect": the creator clearly describes ONE specific place without naming it ("the horror bookstore on Frankford Ave"). Set name "" and search_query to words copied from the evidence plus the city ("horror bookstore Frankford Ave Philadelphia"). Otherwise search_query "".
+- mention_type "explicit" for every normally named place.
 
-ADDRESS (critical — most common failure)
-- Hunt aggressively for street addresses near each stop in caption, OCR, and transcript.
-- Capture ALL of these forms when present:
-  • "142 N. 2nd Street" / "142 North 2nd St"
-  • short forms in parentheses: "(140 N. 2nd)", "(400 Ranstead)"
-  • "located at …", "at …", "address:", pin emoji lines
-  • number + direction + street: "140 N 2nd", "209 Chestnut St"
-- Put the street line in "address" (keep number + street text). Do NOT leave address "" if a street number for that stop appears anywhere in INPUT.
-- Copy a complete stated Address/location line, including landmarks and road names. Never turn a size, height, price, date, or offer into an address or invent "Street".
-- Pair each address with the nearest place/handle in the same sentence, parentheses, or bullet.
-- Never invent a street number that is not written in INPUT.
-- Never copy one stop's address onto a different stop.
+LOCATION
+- city / neighborhood / address only when the evidence states them: a line, the location tag, or a location hashtag (#phillyeats → Philadelphia).
+- One-city post: when the location tag, caption, or hashtags name a single city and nothing contradicts it, that city applies to every place.
+- address: copy the street line exactly ("140 N. 2nd", "209 Chestnut St", "(400 Ranstead)") and pair it with the place in the same line, the same list item, or the same moment. Never invent, complete, or move an address. Sizes, prices, dates, and counts are not addresses.
+- Same moment: on-screen text and speech within about 3 seconds of each other describe the same scene. Use this to pair a name on screen with a city or address spoken aloud, and the reverse.
+- "📍" marks a location marker. Creators use many styles (📍 📌 🗺️ pins, map-pin icons, location stickers, "Location:"/"Address:" labels); all are shown as "📍". Everything on one marker belongs to the same place: "📍 Buvette · 42 Grove St · West Village" gives name, address and neighbourhood. A marker holding only an address or area locates the venue shown or named in the same scene.
+- A short on-screen label that appears only for one scene (often a location marker, e.g. "📍 Buvette" or just "Buvette") names the place shown in that scene, while text repeated on every frame is the post's title.
+- Text that is physically inside the scene — posters, artwork, menus, plates, product labels, film titles — is role "background", not a venue, unless it is the storefront sign of the place being visited. When the post labels its places with pin stickers or overlays, only those labels are places.
 
-CITY / NEIGHBORHOOD
-- For a clear single-city itinerary/tour, apply that shared city (and neighborhood when stated) to stops that omit city.
-- Multi-city or conflicting stops: keep each stop's own city; if unclear, city "".
-- Street addresses in a single-city itinerary inherit that city when city is established in INPUT.
-- Do not invent cities absent from INPUT (direct text, hashtag, or location handle).
+EVIDENCE IDS (required)
+name_evidence: ids of the lines that contain the name or identify the venue. location_evidence: ids supporting city / neighborhood / address. Cite only ids present in EVIDENCE.
 
-category: exactly one of ${PLACE_CATEGORIES.join(', ')}.
-description: one short supported fact or "".
-creator_handle: exactly author_username.
-confidence: 100 = name + street address (or name + explicit full location), 80 = named stop with city/neighborhood only, 60 = handle-only / weak location.
+CATEGORY
+base_category = what the place IS: RESTAURANTS (restaurants, food spots, bakeries, street food) · COFFEE (cafes, coffee, tea) · BARS (bars, pubs, cocktail/wine bars, breweries) · NIGHTLIFE (clubs, live music, late-night venues) · SHOPPING (shops, markets, malls, boutiques) · CULTURE (museums, galleries, theatres, historic or religious sites) · NATURE (parks, beaches, lakes, mountains, gardens, trails) · ADVENTURE (activities: tours, diving, climbing, theme parks, water sports) · TRAVEL (hotels, resorts, stays; towns/islands visited as a trip) · CITY (streets, squares, neighbourhoods, city viewpoints, urban landmarks).
+category = base_category, or "HIDDEN GEMS" only when the evidence explicitly calls the place a hidden gem, secret, underrated, hole-in-the-wall, or locals-only spot.
+description: at most 12 words taken from the evidence, or "".`;
 
-Return one JSON object only: {"places":[...]}.
-Each item: name, city, neighborhood, address, category, description, creator_handle, confidence.
-Non-confidence values are strings; unknown = "". No markdown, prose, nulls, or extra keys.`;
+const ANALYSIS_RULES = `ANALYSIS (compact, from evidence only): {"summary":"<20 words","primary_category":"","topics":[max 3],"keywords":[max 3],"tone":[max 2],"niche":"","is_promotional":false,"is_sponsored":false,"promotion_type":"","call_to_actions":[],"offers":[],"primary_audience":"","audience_interests":[max 2],"geographic_focus":[max 2],"audience_intent":"","audience_confidence":0}. Use ""/[]/false when unsupported.`;
 
-type PlaceCategory = (typeof PLACE_CATEGORIES)[number];
+const COMBINED_SYSTEM_PROMPT = `${PLACE_RULES}
+
+${ANALYSIS_RULES}
+
+Return one JSON object: {"places":[...],"analysis":{...}}. No markdown.`;
+
+const PLACES_ONLY_SYSTEM_PROMPT = `${PLACE_RULES}
+
+Return one JSON object: {"places":[...]}. No markdown.`;
+
+const PLACE_ITEM_SCHEMA = {
+  type: 'object',
+  properties: {
+    name: { type: 'string' },
+    mention_type: { type: 'string', enum: [...MENTION_TYPES] },
+    role: { type: 'string', enum: [...ROLES] },
+    name_evidence: { type: 'array', items: { type: 'string' } },
+    location_evidence: { type: 'array', items: { type: 'string' } },
+    city: { type: 'string' },
+    neighborhood: { type: 'string' },
+    address: { type: 'string' },
+    base_category: { type: 'string', enum: [...BASE_CATEGORIES] },
+    category: { type: 'string', enum: [...PLACE_CATEGORIES] },
+    description: { type: 'string' },
+    search_query: { type: 'string' },
+  },
+  required: ['name', 'mention_type', 'role', 'name_evidence', 'location_evidence', 'city', 'neighborhood', 'address', 'base_category', 'category', 'description', 'search_query'],
+  additionalProperties: false,
+};
+
+const ANALYSIS_SCHEMA = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' }, primary_category: { type: 'string' }, topics: { type: 'array', items: { type: 'string' } }, keywords: { type: 'array', items: { type: 'string' } },
+    tone: { type: 'array', items: { type: 'string' } }, niche: { type: 'string' },
+    is_promotional: { type: 'boolean' }, is_sponsored: { type: 'boolean' }, promotion_type: { type: 'string' },
+    call_to_actions: { type: 'array', items: { type: 'string' } }, offers: { type: 'array', items: { type: 'string' } },
+    primary_audience: { type: 'string' }, audience_interests: { type: 'array', items: { type: 'string' } }, geographic_focus: { type: 'array', items: { type: 'string' } },
+    audience_intent: { type: 'string' }, audience_confidence: { type: 'number' },
+  },
+  required: ['summary', 'primary_category', 'topics', 'keywords', 'tone', 'niche', 'is_promotional', 'is_sponsored', 'promotion_type', 'call_to_actions', 'offers', 'primary_audience', 'audience_interests', 'geographic_focus', 'audience_intent', 'audience_confidence'],
+  additionalProperties: false,
+};
+
+function responseFormat(includeAnalysis: boolean): any {
+  return {
+    type: 'json_schema',
+    json_schema: {
+      name: includeAnalysis ? 'places_with_analysis' : 'places',
+      strict: true,
+      schema: {
+        type: 'object',
+        properties: {
+          places: { type: 'array', items: PLACE_ITEM_SCHEMA },
+          ...(includeAnalysis ? { analysis: ANALYSIS_SCHEMA } : {}),
+        },
+        required: includeAnalysis ? ['places', 'analysis'] : ['places'],
+        additionalProperties: false,
+      },
+    },
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Response parsing (lenient: Groq JSON mode is not schema-enforced)
+// ──────────────────────────────────────────────────────────────────────
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function normalizeString(value: unknown): string | null {
-  if (value === null || value === undefined) return '';
-  return typeof value === 'string' ? value.trim() : null;
+function str(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
 }
 
-/** Reject metadata-bearing names instead of trying to rewrite an unknown venue name. */
-function normalizePlaceName(value: unknown): string | null {
-  const name = normalizeString(value);
-  if (!name || name.includes('#')) return null;
-  return name;
+function strList(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(str).filter(Boolean) : [];
 }
 
-/** Keep malformed or unexpected shapes out of the place-saving path. */
-function normalizePlace(value: unknown, authorUsername: string): PlaceExtraction | null {
-  if (!isRecord(value)) return null;
-
-  const name = normalizePlaceName(value.name);
-  const city = normalizeString(value.city);
-  const neighborhood = normalizeString(value.neighborhood);
-  const address = normalizeString(value.address);
-  const description = normalizeString(value.description);
-  const category = normalizeString(value.category);
-  const rawConfidence = value.confidence;
-  // Groq JSON mode can represent an otherwise valid confidence as 0.6/0.8/1.
-  // Convert only the three documented wire equivalents; reject every other value.
-  const confidenceCode = typeof rawConfidence === 'number' && rawConfidence > 0 && rawConfidence <= 1
-    ? Math.round(rawConfidence * 100)
-    : rawConfidence;
-
-  if (
-    !name ||
-    city === null ||
-    neighborhood === null ||
-    address === null ||
-    description === null ||
-    !category ||
-    !PLACE_CATEGORIES.includes(category as PlaceCategory) ||
-    typeof confidenceCode !== 'number' ||
-    !Number.isInteger(confidenceCode) ||
-    !PLACE_CONFIDENCE_CODES.includes(confidenceCode as PlaceConfidenceCode)
-  ) {
-    console.warn('[AI Place Extraction] Dropped a response item that did not match the place schema.');
-    return null;
-  }
-
-  return {
-    name,
-    city: LocationService.cleanCityName(city),
-    neighborhood,
-    address,
-    category: category as PlaceCategory,
-    description,
-    // The creator is input metadata, not a fact the model may generate.
-    creator_handle: authorUsername,
-    confidence: confidenceCode / 100,
-  };
+function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
+  const candidate = str(value) as T;
+  return allowed.includes(candidate) ? candidate : fallback;
 }
 
-function parsePlaceResponse(raw: string, authorUsername: string): PlaceExtraction[] {
+export function parseCandidates(raw: string): RawPlaceCandidate[] {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
     throw new Error('[AI Place Extraction] Model returned invalid JSON.');
   }
-
   if (!isRecord(parsed) || !Array.isArray(parsed.places)) {
     throw new Error('[AI Place Extraction] Model response did not match the required {"places": []} shape.');
   }
-
-  return parsed.places
-    .map((place) => normalizePlace(place, authorUsername))
-    .filter((place): place is PlaceExtraction => place !== null);
+  const candidates: RawPlaceCandidate[] = [];
+  for (const value of parsed.places) {
+    if (!isRecord(value)) continue;
+    const category = str(value.category) as PlaceCategory;
+    const baseRaw = str(value.base_category) as BaseCategory;
+    const base = BASE_CATEGORIES.includes(baseRaw)
+      ? baseRaw
+      : (BASE_CATEGORIES.includes(category as BaseCategory) ? category as BaseCategory : null);
+    if (!base) continue;
+    // Trademark signs and emoji come from account display names ("L'industrie Pizzeria ™️").
+    const name = str(value.name)
+      .replace(/^@/, '')
+      .replace(/[\u2122\u00AE\u00A9]\uFE0F?/g, '')
+      .replace(/[\p{Extended_Pictographic}\uFE0F\u200D]/gu, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (name.includes('#')) continue;
+    candidates.push({
+      name,
+      mention_type: oneOf(value.mention_type, MENTION_TYPES, 'explicit'),
+      role: oneOf(value.role, ROLES, 'featured'),
+      name_evidence: strList(value.name_evidence),
+      location_evidence: strList(value.location_evidence),
+      city: str(value.city),
+      neighborhood: str(value.neighborhood),
+      address: str(value.address),
+      base_category: base,
+      category: PLACE_CATEGORIES.includes(category as any) ? category : base,
+      description: str(value.description).split(/\s+/).slice(0, 16).join(' '),
+      search_query: str(value.search_query),
+    });
+  }
+  return candidates;
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Source-text refinement (deterministic, grounded by construction)
+// ──────────────────────────────────────────────────────────────────────
 
 function collapseAlnum(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
+/**
+ * Handle-shaped names only: "@joespizzanyc", "gaslamphotel", "cafe_lumiere".
+ * A capitalised single word ("Tatte", "Kasama") is a real display name and
+ * must never be replaced by a longer line that merely contains it.
+ */
 function looksLikeHandleName(name: string): boolean {
   const trimmed = name.trim();
   if (!trimmed || /\s/.test(trimmed)) return false;
-  // Single token with no spaces — typical IG/TikTok username storage.
-  return /^@?[a-z0-9._]+$/i.test(trimmed);
+  if (!/^@?[a-z0-9._]+$/i.test(trimmed)) return false;
+  return trimmed.startsWith('@') || /[._\d]/.test(trimmed) || trimmed === trimmed.toLowerCase();
 }
 
 /** Prefer OCR/caption display names over bare @handles when they clearly refer to the same venue. */
@@ -159,8 +228,9 @@ function resolveDisplayNameFromSources(name: string, sources: string[]): string 
   const candidates = new Set<string>();
   for (const source of sources) {
     for (const part of source.split(/[\n|;•·]+/)) {
-      const trimmed = part.trim();
-      if (trimmed.length >= 4 && /\s/.test(trimmed) && trimmed.length <= 80) {
+      // Drop list numbering ("3. Kasama") before comparing.
+      const trimmed = part.trim().replace(/^\d{1,2}[.)]\s*/, '');
+      if (trimmed.length >= 4 && /\s/.test(trimmed) && trimmed.length <= 80 && !trimmed.includes('@')) {
         candidates.add(trimmed.replace(/^[@#]+/, '').trim());
       }
     }
@@ -179,6 +249,9 @@ function resolveDisplayNameFromSources(name: string, sources: string[]): string 
   for (const candidate of candidates) {
     const candidateKey = collapseAlnum(candidate);
     if (candidateKey.length < 4) continue;
+    // A display name is about as long as the handle ("The Gas Lamp Hotel" vs
+    // "gaslamphotel"); a sentence that happens to contain it is not a name.
+    if (candidateKey.length > handleKey.length + 6) continue;
     const handleStem = handleKey.replace(/(food|phl|nyc|la|the|bar|cafe|hotel|shop|store|official)$/i, '');
     const score =
       candidateKey === handleKey ? 1 :
@@ -240,7 +313,7 @@ function isPlausibleStreetAddress(value: string): boolean {
   if (/^\d{4}$/.test(normalized)) return false;
   // Avoid converting list copy such as "5 cozy restaurants" into the
   // fabricated address "5 cozy Street".
-  if (/^\d{1,6}\s+(?:cozy|best|top|great|favorite|popular|new|nice|amazing|restaurants?|cafes?|bars?|places?|spots?)\b/i.test(normalized)) {
+  if (/^\d{1,6}\s+(?:cozy|best|top|great|favorite|popular|new|nice|amazing|restaurants?|cafes?|bars?|places?|spots?|stops?|things?|days?|hours?|minutes?|mins?|people|dollars?|years?)\b/i.test(normalized)) {
     return false;
   }
   return true;
@@ -345,14 +418,8 @@ function attachAddressesFromSources(
     const idx = found.indexOf(best.addr);
     if (idx >= 0) used.add(idx);
 
-    console.log(
-      `[AI Place Extraction] Attached address "${best.addr.address}" to "${place.name}" from source text`
-    );
-    return {
-      ...placeWithoutInvalidAddress,
-      address: best.addr.address,
-      confidence: Math.max(place.confidence, 0.8),
-    };
+    plog('candidates', 'Address attached from source text', { place: place.name, address: best.addr.address });
+    return { ...placeWithoutInvalidAddress, address: best.addr.address };
   });
 }
 
@@ -453,148 +520,176 @@ function applySharedGeoContext(
   });
 }
 
-function refineExtractedPlaces(
-  places: PlaceExtraction[],
-  sources: {
-    caption?: string;
-    ocrTexts?: string[];
-    transcript?: string;
-    mentions?: string[];
-    hashtags?: string[];
-  }
-): PlaceExtraction[] {
-  // Prefer OCR for display-name upgrades; caption/transcript are fallback only.
+function refineExtractedPlaces(places: PlaceExtraction[], bundle: EvidenceBundle): PlaceExtraction[] {
+  const textOf = (sources: string[]) => bundle.items.filter((item) => sources.includes(item.source)).map((item) => item.text);
+  // Prefer on-screen text for display-name upgrades; caption/speech are fallback only.
   // This avoids renaming places from unrelated prose in long talking-head videos.
-  const primarySources = (sources.ocrTexts || []).filter(Boolean);
-  const fallbackSources = [sources.caption || '', sources.transcript || ''].filter(Boolean);
-  const addressSources = [
-    sources.caption || '',
-    ...(sources.ocrTexts || []),
-    sources.transcript || '',
-  ].filter(Boolean);
+  const primarySources = textOf(['ocr', 'vision_ocr']);
+  const caption = textOf(['caption']).join('\n');
+  const speech = textOf(['speech']).join(' ');
+  const fallbackSources = [caption, speech].filter(Boolean);
+  const addressSources = [caption, ...textOf(['ocr', 'vision_ocr', 'comment_creator']), speech].filter(Boolean);
 
   const withNames = places.map((place) => {
     if (!place.name) return place;
     const fromOcr = resolveDisplayNameFromSources(place.name, primarySources);
-    const resolved = fromOcr !== place.name
-      ? fromOcr
-      : resolveDisplayNameFromSources(place.name, fallbackSources);
+    const resolved = fromOcr !== place.name ? fromOcr : resolveDisplayNameFromSources(place.name, fallbackSources);
     if (resolved === place.name) return place;
-    console.log(`[AI Place Extraction] Preferring display name "${resolved}" over handle-like "${place.name}"`);
-    return {
-      ...place,
-      name: resolved,
-      confidence: Math.max(place.confidence, 0.8),
-    };
+    plog('candidates', 'Display name preferred over handle', { handle: place.name, name: resolved });
+    return { ...place, name: resolved };
   });
 
   const withAddresses = attachAddressesFromSources(withNames, addressSources);
-
-  const inputBlob = [
-    sources.caption || '',
-    ...(sources.ocrTexts || []),
-    sources.transcript || '',
-    ...(sources.mentions || []),
-    ...(sources.hashtags || []),
-  ].join(' ');
-
+  const inputBlob = bundle.items.map((item) => item.text).join(' ');
   return applySharedGeoContext(withAddresses, inputBlob);
 }
 
-const COMBINED_SYSTEM_PROMPT = `Return JSON: {"places":[...],"analysis":{...}}. PLACES FIRST, then analysis. Analyze only INPUT.
-
-PLACES (extract ALL, max 1000): Scan caption, OCR, transcript start-to-end. Include every distinct named physical place visited/featured/recommended/listed (bonus/last/extra/also). Do NOT trust a stated stop count.
-
-NAME: Prefer OCR/caption venue names over @handles. A business handle directly attached to an offer, venue description, or address identifies a stop; use it without @ only when no display name is available. Never use a promotional headline as a name. Do not treat ordinary people/creator tags as stops. Name must be only the venue's exact display name—not surrounding caption text, promotional copy, labels, hashtags, rankings, or calls to action. If INPUT cannot isolate the display name, skip the place rather than modify or guess it. Skip people, DJs/artists/hosts, dishes, apps, generic unnamed places.
-
-ADDRESS (critical): Extract the exact street line or complete stated Address/location line for each stop whenever present — full ("142 N. 2nd Street") or short ("(140 N. 2nd)", "400 Ranstead", "located at …"). Pair address with the nearest place/handle in the same sentence or parentheses. Never turn a size, height, price, date, or offer into an address; never invent or swap addresses.
-
-GEO: Single-city itinerary → apply shared city/neighborhood to stops that omit city. Multi-city or unclear → keep separate / leave city "". Never invent cities or street numbers absent from INPUT.
-
-category: one of ${PLACE_CATEGORIES.join(', ')}.
-confidence: 100=name+street address, 80=named stop with city/area, 60=handle-only/weak.
-description: max 12 words from input or "". creator_handle = author_username.
-
-Each place: {"name":"","city":"","neighborhood":"","address":"","category":"","description":"","creator_handle":"","confidence":60}
-
-ANALYSIS (compact): {"summary":"<20 words","primary_category":"","topics":[max 3],"keywords":[max 3],"tone":[max 2],"niche":"","is_promotional":false,"is_sponsored":false,"promotion_type":"","call_to_actions":[],"offers":[],"primary_audience":"","audience_interests":[max 2],"geographic_focus":[max 2],"audience_intent":"","audience_confidence":0}. Use ""/[]/false when unsupported. Do NOT invent. JSON only, no markdown.`;
-
-const COMBINED_RESPONSE_FORMAT: any = {
-  type: 'json_schema',
-  json_schema: {
-    name: 'content_analysis_with_places',
-    strict: true,
-    schema: {
-      type: 'object',
-      properties: {
-        places: {
-          type: 'array',
-          maxItems: 1000,
-          items: {
-            type: 'object',
-            properties: {
-              name: { type: 'string' }, city: { type: 'string' }, neighborhood: { type: 'string' }, address: { type: 'string' },
-              category: { type: 'string', enum: [...PLACE_CATEGORIES] }, description: { type: 'string' }, creator_handle: { type: 'string' },
-              confidence: { type: 'integer', enum: [...PLACE_CONFIDENCE_CODES] },
-            },
-            required: ['name', 'city', 'neighborhood', 'address', 'category', 'description', 'creator_handle', 'confidence'],
-            additionalProperties: false,
-          },
-        },
-        analysis: {
-          type: 'object',
-          properties: {
-            summary: { type: 'string' }, primary_category: { type: 'string' }, topics: { type: 'array', items: { type: 'string' } }, keywords: { type: 'array', items: { type: 'string' } },
-            tone: { type: 'array', items: { type: 'string' } }, niche: { type: 'string' },
-            is_promotional: { type: 'boolean' }, is_sponsored: { type: 'boolean' }, promotion_type: { type: 'string' },
-            call_to_actions: { type: 'array', items: { type: 'string' } }, offers: { type: 'array', items: { type: 'string' } },
-            primary_audience: { type: 'string' }, audience_interests: { type: 'array', items: { type: 'string' } }, geographic_focus: { type: 'array', items: { type: 'string' } },
-            audience_intent: { type: 'string' }, audience_confidence: { type: 'number' },
-          },
-          required: ['summary', 'primary_category', 'topics', 'keywords', 'tone', 'niche', 'is_promotional', 'is_sponsored', 'promotion_type', 'call_to_actions', 'offers', 'primary_audience', 'audience_interests', 'geographic_focus', 'audience_intent', 'audience_confidence'],
-          additionalProperties: false,
-        },
-      },
-      required: ['places', 'analysis'],
-      additionalProperties: false,
-    },
-  },
-};
-
+/**
+ * Distinct street addresses in the evidence, keyed by number + street name so
+ * the same address read twice ("1207 Nostrand" by local OCR, "1207 Nostrand
+ * Ave" by vision) counts once.
+ */
 function distinctSourceAddressCount(sources: string[]): number {
-  const addresses = findStreetAddressesInText(sources.filter(Boolean).join('\n'))
-    .map((entry) => collapseAlnum(entry.address));
-  return new Set(addresses).size;
+  const keys = findStreetAddressesInText(sources.filter(Boolean).join('\n')).map((entry) => {
+    const match = entry.address.toLowerCase().match(/^(\d+)\s+(?:(?:north|south|east|west)\s+)?([a-z0-9]+)/);
+    return match ? `${match[1]} ${match[2]}` : collapseAlnum(entry.address);
+  });
+  return new Set(keys).size;
 }
 
-function sameSourcePlace(a: PlaceExtraction, b: PlaceExtraction): boolean {
-  const aAddress = collapseAlnum(a.address || '');
-  const bAddress = collapseAlnum(b.address || '');
-  if (aAddress && bAddress && aAddress === bAddress) return true;
+// ──────────────────────────────────────────────────────────────────────
+// Candidate → final place pipeline
+// ──────────────────────────────────────────────────────────────────────
 
-  const aName = collapseAlnum(a.name || '');
-  const bName = collapseAlnum(b.name || '');
-  return !!aName && !!bName && (
-    aName === bName ||
-    (Math.min(aName.length, bName.length) >= 6 && (aName.includes(bName) || bName.includes(aName)))
-  );
+export interface PlaceExtractionOutcome {
+  places: PlaceExtraction[];
+  rejected: Array<{ name: string; reason: string }>;
 }
 
-function mergeSourcePlaces(primary: PlaceExtraction[], recovered: PlaceExtraction[]): PlaceExtraction[] {
-  const merged = [...primary];
-  for (const candidate of recovered) {
-    if (!merged.some((existing) => sameSourcePlace(existing, candidate))) {
-      merged.push(candidate);
+/**
+ * Deterministic post-processing of model candidates:
+ * ground location fields → refine from source text → verify names against
+ * evidence and score → HIDDEN GEMS check → merge duplicates → resolve
+ * indirect mentions (Google, single-result only).
+ */
+export async function finalizeCandidates(
+  candidates: RawPlaceCandidate[],
+  bundle: EvidenceBundle,
+  authorUsername: string,
+  options: { resolveIndirect?: boolean } = {}
+): Promise<PlaceExtractionOutcome> {
+  const asPlaces: PlaceExtraction[] = candidates.map((candidate) => {
+    const located = sanitizeCandidateLocation({
+      city: LocationService.cleanCityName(candidate.city),
+      neighborhood: candidate.neighborhood,
+      address: candidate.address,
+    }, bundle);
+    return {
+      name: candidate.name || null,
+      city: located.city,
+      neighborhood: located.neighborhood,
+      address: located.address,
+      category: candidate.category,
+      base_category: candidate.base_category,
+      description: candidate.description,
+      creator_handle: authorUsername,
+      confidence: 0,
+      mention_type: candidate.mention_type,
+      role: candidate.role === 'featured' || candidate.role === 'recommended' ? candidate.role : undefined,
+      search_query: candidate.search_query,
+    };
+  });
+  const candidateRoles = candidates.map((candidate) => candidate.role);
+  plog('candidates', `Model returned ${candidates.length} candidate(s)`, {
+    candidates: candidates.map((candidate) => ({
+      name: candidate.name || `(indirect: ${candidate.search_query})`,
+      role: candidate.role,
+      mention: candidate.mention_type,
+      city: candidate.city,
+      address: candidate.address,
+      category: candidate.category,
+      nameEvidence: candidate.name_evidence,
+    })),
+  });
+
+  const refined = refineExtractedPlaces(asPlaces, bundle).map((place, index) => ({
+    ...place,
+    ...sanitizeCandidateLocation(place, bundle),
+    // The model's raw role, so background/mentioned_only are rejected with a reason.
+    candidateRole: candidateRoles[index],
+  }));
+
+  const { places: scored, rejected } = scoreAndFilterCandidates(refined, bundle);
+  for (const item of rejected) plog('candidates', `Rejected "${item.name}"`, { reason: item.reason });
+
+  const categorized = scored.map((place) => ({ ...place, category: resolveHiddenGem(place, bundle) }));
+  let merged = mergeSameEntities(categorized, bundle);
+
+  if (options.resolveIndirect !== false) {
+    const resolved: PlaceExtraction[] = [];
+    for (const place of merged) {
+      if (place.mention_type !== 'indirect' || place.name) {
+        resolved.push(place);
+        continue;
+      }
+      const match = await LocationService.findUniquePlace(place.search_query || '', place.city).catch(() => null);
+      if (!match) {
+        rejected.push({ name: place.search_query || '(indirect)', reason: 'indirect mention has no unique Google match' });
+        continue;
+      }
+      resolved.push({
+        ...place,
+        name: match.name,
+        city: place.city || match.city || '',
+        explanation: `${place.explanation?.replace(/\.$/, '')}; Google Maps returned a single match for "${place.search_query}".`,
+      });
     }
+    merged = mergeSameEntities(resolved, bundle);
   }
-  return merged;
+
+  for (const place of merged) {
+    plog('candidates', `Accepted "${place.name}"`, {
+      score: place.confidence,
+      category: place.category,
+      city: place.city,
+      neighborhood: place.neighborhood,
+      address: place.address,
+      evidence: place.evidence_ids,
+      why: place.explanation,
+    });
+  }
+  return { places: merged, rejected };
 }
 
-function tokenBudgetForPlaceCount(baseTokens: number, expectedPlaceCount: number): number {
-  // A structured venue requires substantially more output than a short video
-  // summary. Scale with source-backed address lines, but retain a hard limit.
-  const evidenceBudget = expectedPlaceCount > 0 ? 700 + expectedPlaceCount * 140 : baseTokens;
-  return Math.min(6_000, Math.max(baseTokens, evidenceBudget));
+async function callExtractionModel(
+  bundle: EvidenceBundle,
+  includeAnalysis: boolean,
+  maxTokens: number,
+  note?: string
+): Promise<{ raw: string; truncated: boolean }> {
+  const userMessage = note ? `${note}\n\n${formatEvidenceForPrompt(bundle)}` : formatEvidenceForPrompt(bundle);
+  return executeAICall('chat', async ({ client, model, isGroq }) => {
+    const response = await client.chat.completions.create({
+      model,
+      ...(supportsTemperature(model) ? { temperature: 0 } : {}),
+      max_completion_tokens: maxTokens,
+      messages: [
+        { role: 'system', content: includeAnalysis ? COMBINED_SYSTEM_PROMPT : PLACES_ONLY_SYSTEM_PROMPT },
+        { role: 'user', content: userMessage },
+      ],
+      response_format: isGroq ? { type: 'json_object' } : responseFormat(includeAnalysis),
+    });
+    const choice = response.choices[0];
+    plog('model', includeAnalysis ? 'Extraction + analysis call' : 'Places-only call', {
+      provider: isGroq ? 'groq' : 'openai',
+      model,
+      promptChars: userMessage.length,
+      promptTokens: response.usage?.prompt_tokens,
+      completionTokens: response.usage?.completion_tokens,
+      finishReason: choice?.finish_reason,
+    }, choice?.finish_reason === 'length' ? 'warn' : 'info');
+    return { raw: choice?.message?.content || '{}', truncated: choice?.finish_reason === 'length' };
+  });
 }
 
 export class AiEnrichmentService {
@@ -602,353 +697,209 @@ export class AiEnrichmentService {
     return distinctSourceAddressCount(texts);
   }
 
-  static formatCondensedCaption(caption: string | null | undefined, maxLen = 1000): string {
-    if (!caption) return '';
-    const trimmed = caption.trim();
-    if (trimmed.length <= maxLen) return trimmed;
-
-    const lines = trimmed.split('\n');
-    const locationRegex = /(📍|📌|🗺️|located|location|address|st\b|street|ave\b|avenue|blvd|rd\b|road|dr\b|drive|way\b|unit|suite|#)/i;
-
-    const importantLines: string[] = [];
-    let charCount = 0;
-
-    for (const line of lines) {
-      const isLoc = locationRegex.test(line);
-      if (charCount < 400 || isLoc) {
-        importantLines.push(line);
-        charCount += line.length + 1;
-      }
-    }
-
-    return importantLines.join('\n').substring(0, maxLen);
+  static buildEvidence(content: SocialContent, media: MediaEvidenceInput): EvidenceBundle {
+    return buildEvidence(content, media);
   }
 
-  // ──────────────────────────────────────────────────────────────────────
-  // 1. Place extraction (for map feature)
-  // ──────────────────────────────────────────────────────────────────────
+  /** Places only (restricted posts, cached re-extraction). */
+  static async extractPlaces(content: SocialContent, media: MediaEvidenceInput): Promise<PlaceExtractionOutcome> {
+    const bundle = buildEvidence(content, media);
+    if (bundle.items.length === 0) return { places: [], rejected: [] };
+    const { raw, truncated } = await callExtractionModel(bundle, false, RECOVERY_OUTPUT_TOKENS);
+    if (truncated) plog('model', 'Places-only response hit the output budget', undefined, 'warn');
+    return finalizeCandidates(parseCandidates(raw), bundle, content.authorUsername);
+  }
+
+  /** Legacy signature: plain transcript text and OCR strings. */
   static async extractPlace(
     content: SocialContent,
     transcript: string,
-    ocrTexts: string[],
-    maxTokens?: number
+    ocrTexts: string[]
   ): Promise<PlaceExtraction[]> {
-    const condensedInput = {
-      platform: content.platform,
-      caption: content.caption ? content.caption.trim() : '',
-      author_username: content.authorUsername,
-      mentions: content.mentions || [],
-      tagged_users: (content.taggedUsers || []).map(u => typeof u === 'string' ? u : u.username),
-      ocr_texts: ocrTexts || [],
-      audio_transcript: transcript ? transcript.trim() : null,
-    };
-
-    const responseFormat: any = {
-      type: 'json_schema',
-      json_schema: {
-        name: 'place_extraction_list',
-        strict: true,
-        schema: {
-          type: 'object',
-          properties: {
-            places: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  name: { type: 'string' },
-                  city: { type: 'string' },
-                  neighborhood: { type: 'string' },
-                  address: { type: 'string' },
-                  category: {
-                    type: 'string',
-                    enum: [...PLACE_CATEGORIES],
-                    description: 'One fixed map category',
-                  },
-                  description: { type: 'string' },
-                  creator_handle: { type: 'string' },
-                  confidence: {
-                    type: 'integer',
-                    enum: [...PLACE_CONFIDENCE_CODES],
-                    description: 'Confidence percent: 100, 80, or 60',
-                  },
-                },
-                required: ['name', 'city', 'neighborhood', 'address', 'category', 'description', 'creator_handle', 'confidence'],
-                additionalProperties: false,
-              },
-            },
-          },
-          required: ['places'],
-          additionalProperties: false,
-        },
-      },
-    };
-
-    return executeAICall('chat', async ({ client, model, isGroq }) => {
-      const response = await client.chat.completions.create({
-        model,
-        temperature: 0,
-        ...(typeof maxTokens === 'number' ? { max_tokens: maxTokens } : {}),
-        messages: [
-          { role: 'system', content: PLACE_SYSTEM_PROMPT },
-          { role: 'user', content: JSON.stringify(condensedInput) },
-        ],
-        response_format: isGroq ? { type: 'json_object' } : responseFormat,
-      });
-
-      const raw = response.choices[0].message.content;
-      if (!raw) return [];
-      const places = parsePlaceResponse(raw, content.authorUsername);
-      return refineExtractedPlaces(places, {
-        caption: content.caption,
-        ocrTexts: ocrTexts || [],
-        transcript,
-        mentions: content.mentions,
-        hashtags: content.hashtags,
-      });
+    const { WhisperService } = await import('./whisper.service');
+    const outcome = await this.extractPlaces(content, {
+      ocrTexts,
+      transcript: WhisperService.fromStoredText(transcript),
     });
+    return outcome.places;
   }
 
-  // ──────────────────────────────────────────────────────────────────────
-  // 2. Full analysis
-  // ──────────────────────────────────────────────────────────────────────
-  static compressOcrTexts(texts: string[]): string[] {
-    if (!texts || texts.length === 0) return [];
-
-    let compressed = texts.map(text => {
-      const words = text.split(/\s+/);
-      return removeStopwords(words, eng).join(' ').trim();
-    }).filter(t => t.length > 2);
-
-    const unique: string[] = [];
-    for (const text of compressed) {
-      if (unique.length === 0) {
-        unique.push(text);
-        continue;
-      }
-
-      const bestMatch = stringSimilarity.findBestMatch(text.toLowerCase(), unique.map(u => u.toLowerCase()));
-      if (bestMatch.bestMatch.rating < 0.85) {
-        unique.push(text);
-      }
-    }
-
-    return unique;
-  }
-
-  static extractTranscriptEntities(transcript: string): string {
-    if (!transcript || transcript.trim().length === 0) return '';
-    const doc = nlp(transcript);
-    const places = doc.places().out('array');
-    const nouns = doc.nouns().out('array');
-    const entities = Array.from(new Set([...places, ...nouns]))
-      .filter(w => w.length > 3)
-      .slice(0, 30)
-      .join(', ');
-    return entities;
-  }
-
+  /** One model call returns both the content analysis and the place candidates. */
   static async analyzeContent(
     content: SocialContent,
     rawApifyData: any,
-    transcript: string,
-    gptOcrTexts: string[],
-    apifyOcrTexts: string[]
-  ): Promise<{ analysis: AiAnalysisResult; places: PlaceExtraction[] } | null> {
-    const ocrTexts = Array.from(new Set([...gptOcrTexts, ...apifyOcrTexts].map(text => text.trim()).filter(Boolean)));
-    const caption = content.caption ? content.caption.trim() : '';
-    const trimmedTranscript = transcript ? transcript.trim() : '';
-    const taggedUsers = (content.taggedUsers || []).map(u => typeof u === 'string' ? u : u.username).filter(Boolean);
+    media: MediaEvidenceInput
+  ): Promise<{ analysis: AiAnalysisResult; places: PlaceExtraction[]; rejected: PlaceExtractionOutcome['rejected'] } | null> {
+    const bundle = buildEvidence(content, media);
+    plog('evidence', `Evidence built: ${bundle.items.length} items`, {
+      availability: bundle.availability,
+      bySource: bundle.items.reduce<Record<string, number>>((counts, item) => ({ ...counts, [item.source]: (counts[item.source] || 0) + 1 }), {}),
+      items: bundle.items.map((item) => `${item.id} ${item.source}: ${item.text.slice(0, 120)}`),
+    });
 
-    const condensedInput: Record<string, unknown> = {
-      platform: content.platform,
-      author_username: content.authorUsername,
-    };
-    if (caption) condensedInput.caption = caption;
-    if (content.contentType) condensedInput.content_type = content.contentType;
-    if ((content.hashtags || []).length > 0) condensedInput.hashtags = content.hashtags;
-    if ((content.mentions || []).length > 0) condensedInput.mentions = content.mentions;
-    if (taggedUsers.length > 0) condensedInput.tagged_users = taggedUsers;
-    // OCR lines are source evidence. Keep every deduplicated line so later
-    // frames in a list-style video cannot lose their venue names.
-    if (ocrTexts.length > 0) condensedInput.ocr_texts = ocrTexts;
-    if (trimmedTranscript) condensedInput.audio_transcript = trimmedTranscript;
+    let parsed: any = {};
+    let outcome: PlaceExtractionOutcome = { places: [], rejected: [] };
 
-    const ocrAvailable = gptOcrTexts.length > 0 || apifyOcrTexts.length > 0;
-    const transcriptAvailable = !!transcript && transcript.trim().length > 0;
-
-    const userMessage = JSON.stringify(condensedInput);
-
-    const isVideoContent = content.contentType === 'video' || content.contentType === 'reel';
-    const durationSec = content.videoDuration ?? 0;
-    let maxTokens: number | undefined;
-    if (isVideoContent) {
-      if (durationSec <= 60) {
-        maxTokens = 1500;
-      } else if (durationSec <= 90) {
-        maxTokens = 2500;
-      } else if (durationSec <= 120) {
-        maxTokens = 2500;
-      } else {
-        maxTokens = 3500;
-      }
-    }
-    const sourceAddressCount = distinctSourceAddressCount([caption, ...ocrTexts, trimmedTranscript]);
-    if (isVideoContent && maxTokens !== undefined) {
-      maxTokens = tokenBudgetForPlaceCount(maxTokens, sourceAddressCount);
-    }
-
-    return executeAICall('chat', async ({ client, model, isGroq }) => {
-      const response = await client.chat.completions.create({
-        model,
-        temperature: 0,
-        messages: [
-          { role: 'system', content: COMBINED_SYSTEM_PROMPT },
-          { role: 'user', content: userMessage },
-        ],
-        response_format: isGroq ? { type: 'json_object' } : COMBINED_RESPONSE_FORMAT,
-        ...(typeof maxTokens === 'number' ? { max_tokens: maxTokens } : {}),
-      });
-      const raw = response.choices[0].message.content || '{}';
-      if (maxTokens !== undefined && response.choices[0].finish_reason === 'length') {
-        console.warn(`[AI Place Extraction] Combined response reached its ${maxTokens}-token budget.`);
-      }
-
+    if (bundle.items.length > 0) {
+      const { raw, truncated } = await callExtractionModel(bundle, true, MAX_OUTPUT_TOKENS);
       let parsedJson: unknown;
       try {
         parsedJson = JSON.parse(raw);
       } catch {
         throw new Error('[AI Analysis] Model returned invalid JSON.');
       }
-      if (!isRecord(parsedJson)) {
-        throw new Error('[AI Analysis] Model response was not a JSON object.');
-      }
-      const parsed = isRecord(parsedJson.analysis) ? parsedJson.analysis as any : {};
-      let places: PlaceExtraction[] = [];
-      try {
-        places = refineExtractedPlaces(
-          parsePlaceResponse(raw, content.authorUsername),
-          {
-            caption: content.caption,
-            ocrTexts,
-            transcript: trimmedTranscript,
-            mentions: content.mentions,
-            hashtags: content.hashtags,
-          }
-        );
-      } catch (placeError) {
-        console.warn('[AI Place Extraction] Combined response had no usable places:', placeError);
-      }
+      parsed = isRecord(parsedJson) && isRecord(parsedJson.analysis) ? parsedJson.analysis : {};
 
-      // Do not silently accept a shorter model list when OCR contains more
-      // distinct, source-backed street-address rows. A focused second pass is
-      // merged by address/name, never by generated data.
-      if (sourceAddressCount > places.length) {
-        console.warn(
-          `[AI Place Extraction] Found ${sourceAddressCount} source address rows but only ${places.length} places; running recovery.`
-        );
+      let candidates: RawPlaceCandidate[] = [];
+      try {
+        candidates = parseCandidates(raw);
+      } catch (placeError) {
+        plog('model', 'Combined response had no usable places', { error: String(placeError) }, 'warn');
+      }
+      outcome = await finalizeCandidates(candidates, bundle, content.authorUsername);
+
+      // Recovery: the list was cut off, or the evidence has more distinct
+      // street-address rows than places returned. A places-only pass is merged
+      // by entity; generated data is never trusted without the same checks.
+      const sourceAddressCount = distinctSourceAddressCount(bundle.items.map((item) => item.text));
+      // Every 📍-marked line (any pin style, normalised) is a location the creator pointed at.
+      const markedLocations = bundle.items.filter((item) => /^📍/u.test(item.text)).length;
+      const expected = Math.max(sourceAddressCount, markedLocations);
+      if (truncated || expected > outcome.places.length) {
+        plog('model', 'Running places-only recovery pass', {
+          truncated,
+          sourceAddresses: sourceAddressCount,
+          markedLocations,
+          placesSoFar: outcome.places.length,
+        }, 'warn');
         try {
-          const recovered = await this.extractPlace(
-            content,
-            trimmedTranscript,
-            ocrTexts,
-            isVideoContent ? tokenBudgetForPlaceCount(2_000, sourceAddressCount) : undefined
-          );
-          places = mergeSourcePlaces(places, recovered);
-          console.log(`[AI Place Extraction] Recovery produced ${places.length} total distinct places.`);
+          const found = outcome.places.map((place) => place.name).filter(Boolean).join(', ');
+          const note = `CHECK: the evidence marks ${markedLocations} location(s) with 📍 and ${sourceAddressCount} street address(es), ` +
+            `but only ${outcome.places.length} place(s) were returned${found ? ` (${found})` : ''}. Return EVERY place, including those already found.`;
+          const recovery = await callExtractionModel(bundle, false, RECOVERY_OUTPUT_TOKENS, note);
+          const recovered = await finalizeCandidates(parseCandidates(recovery.raw), bundle, content.authorUsername);
+          outcome = {
+            places: mergeSameEntities([...outcome.places, ...recovered.places], bundle),
+            rejected: [...outcome.rejected, ...recovered.rejected],
+          };
         } catch (recoveryError: any) {
-          console.warn('[AI Place Extraction] Source-backed recovery failed:', recoveryError.message || recoveryError);
+          plog('model', 'Recovery pass failed', { error: recoveryError.message || String(recoveryError) }, 'warn');
         }
       }
+    } else {
+      plog('model', 'No evidence available; skipping the model call', undefined, 'warn');
+    }
 
-      const analysis: AiAnalysisResult = {
-        platform: parsed.platform || content.platform,
-        content: {
-          content_id: content.contentId,
-          content_type: content.contentType,
-          url: rawApifyData.url || rawApifyData.webVideoUrl || '',
-          video_url: content.videoUrl || null,
-          thumbnail_url: content.displayUrl || null,
-          published_at: content.publishedAt,
-          duration_seconds: content.videoDuration,
-          dimensions: content.dimensions
-            ? { ...content.dimensions, orientation: content.dimensions.height > content.dimensions.width ? 'vertical' : 'horizontal' }
-            : null,
-          summary: parsed.summary || '',
-          primary_category: parsed.primary_category || '',
-          secondary_categories: [],
-          topics: parsed.topics || [],
-          keywords: parsed.keywords || [],
-        },
-        creator: {
-          id: rawApifyData.ownerId || rawApifyData.authorMeta?.id || '',
-          username: content.authorUsername,
-          full_name: content.authorFullName,
-          profile_url: parsed.creator?.profile_url || null,
-          verified: parsed.creator?.verified || null,
-        },
-        caption_analysis: {
-          original_caption: content.caption,
-          summary: parsed.summary || '',
-          keywords: parsed.keywords || [],
-          hashtags: content.hashtags,
-          mentions: content.mentions,
-          call_to_actions: parsed.call_to_actions || [],
-        },
-        entities: { brands: [], products: [], companies: [], restaurants: [], services: [], people: [], locations: [], websites: [] },
-        visual_analysis: parsed.visual_analysis || { visible_text: [], products_visible: [], brands_visible: [], people_visible: [], locations_visible: [], objects_visible: [], logos_visible: [] },
-        audio_analysis: parsed.audio_analysis || {
-          artist: content.musicInfo?.artist_name || null,
-          song_name: content.musicInfo?.song_name || null,
-          audio_id: content.musicInfo?.audio_id || null,
-          uses_original_audio: content.musicInfo?.uses_original_audio || null,
-          transcript: transcript || null,
-          spoken_information: [],
-        },
-        promotion: {
-          is_promotional: parsed.is_promotional ?? false,
-          is_sponsored: parsed.is_sponsored ?? false,
-          is_paid_partnership: content.paidPartnership,
-          promotion_type: parsed.promotion_type || null,
-          promoted_entities: [],
-          offers: parsed.offers || [],
-          discounts: [],
-          call_to_actions: parsed.call_to_actions || [],
-        },
-        audience: {
-          primary_audience: parsed.primary_audience || '',
-          interests: parsed.audience_interests || [],
-          geographic_focus: parsed.geographic_focus || [],
-          intent: parsed.audience_intent || '',
-          confidence: parsed.audience_confidence || 0,
-        },
-        content_style: {
-          tone: parsed.tone || [],
-          style: [],
-          format: '',
-        },
-        engagement: parsed.engagement || {
-          likes: content.metrics.likes,
-          comments: content.metrics.comments,
-          shares: content.metrics.shares,
-          saves: content.metrics.saves,
-          views: content.metrics.views,
-          plays: content.metrics.plays,
-          reach: null,
-          impressions: null,
-          engagement_rate: null,
-          engagement_rate_formula: null,
-        },
-        hashtags: parsed.hashtags || { all: content.hashtags, brand: [], product: [], industry: [], location: [], campaign: [], topic: [], generic: [] },
-        campaign_insights: parsed.campaign_insights || { relevant_industries: [], relevant_brand_categories: [], relevant_product_categories: [], relevant_audiences: [], relevant_locations: [], potential_campaign_themes: [], potential_collaboration_categories: [], campaign_suitability: '', reasoning: '' },
-        influencer_analysis: { niche: parsed.niche || '', sub_niches: [], content_strengths: [], potential_collaboration_types: [], potential_brand_categories: [] },
-        data_quality: parsed.data_quality || {
-          available_fields: Object.keys(condensedInput).filter(k => (condensedInput as any)[k] != null),
-        },
-        extracted_information: parsed.extracted_information || [],
-      };
+    const places = outcome.places;
+    const ocrAvailable = bundle.items.some((item) => item.source === 'ocr' || item.source === 'vision_ocr');
+    const transcriptItems = bundle.items.filter((item) => item.source === 'speech');
+    const transcriptText = transcriptItems.map((item) => item.text).join(' ');
 
-      return { analysis, places };
-    });
+    const analysis: AiAnalysisResult = {
+      platform: content.platform,
+      content: {
+        content_id: content.contentId,
+        content_type: content.contentType,
+        url: rawApifyData?.url || rawApifyData?.webVideoUrl || '',
+        video_url: content.videoUrl || null,
+        thumbnail_url: content.displayUrl || null,
+        published_at: content.publishedAt,
+        duration_seconds: content.videoDuration,
+        dimensions: content.dimensions
+          ? { ...content.dimensions, orientation: content.dimensions.height > content.dimensions.width ? 'vertical' : 'horizontal' }
+          : null,
+        summary: parsed.summary || '',
+        primary_category: parsed.primary_category || '',
+        secondary_categories: [],
+        topics: parsed.topics || [],
+        keywords: parsed.keywords || [],
+      },
+      creator: {
+        id: rawApifyData?.ownerId || rawApifyData?.authorMeta?.id || '',
+        username: content.authorUsername,
+        full_name: content.authorFullName,
+        profile_url: null,
+        verified: null,
+      },
+      caption_analysis: {
+        original_caption: content.caption,
+        summary: parsed.summary || '',
+        keywords: parsed.keywords || [],
+        hashtags: content.hashtags,
+        mentions: content.mentions,
+        call_to_actions: parsed.call_to_actions || [],
+      },
+      entities: {
+        brands: [], products: [], companies: [], restaurants: [], services: [], people: [], websites: [],
+        locations: places.map((place) => ({
+          name: place.name || '',
+          type: place.category,
+          source: (place.evidence_sources || []).join(','),
+          explicit: place.mention_type !== 'indirect',
+          confidence: place.confidence,
+          context: place.explanation,
+          city: place.city || null,
+          address: place.address || null,
+        })),
+      },
+      visual_analysis: { visible_text: [], products_visible: [], brands_visible: [], people_visible: [], locations_visible: [], objects_visible: [], logos_visible: [] },
+      audio_analysis: {
+        artist: content.musicInfo?.artist_name || null,
+        song_name: content.musicInfo?.song_name || null,
+        audio_id: content.musicInfo?.audio_id || null,
+        uses_original_audio: content.musicInfo?.uses_original_audio ?? null,
+        transcript: transcriptText || null,
+        spoken_information: [],
+      },
+      promotion: {
+        is_promotional: parsed.is_promotional ?? false,
+        is_sponsored: parsed.is_sponsored ?? false,
+        is_paid_partnership: content.paidPartnership,
+        promotion_type: parsed.promotion_type || null,
+        promoted_entities: [],
+        offers: parsed.offers || [],
+        discounts: [],
+        call_to_actions: parsed.call_to_actions || [],
+      },
+      audience: {
+        primary_audience: parsed.primary_audience || '',
+        interests: parsed.audience_interests || [],
+        geographic_focus: parsed.geographic_focus || [],
+        intent: parsed.audience_intent || '',
+        confidence: parsed.audience_confidence || 0,
+      },
+      content_style: { tone: parsed.tone || [], style: [], format: '' },
+      engagement: {
+        likes: content.metrics.likes,
+        comments: content.metrics.comments,
+        shares: content.metrics.shares,
+        saves: content.metrics.saves,
+        views: content.metrics.views,
+        plays: content.metrics.plays,
+        reach: null,
+        impressions: null,
+        engagement_rate: null,
+        engagement_rate_formula: null,
+      },
+      hashtags: { all: content.hashtags, brand: [], product: [], industry: [], location: [], campaign: [], topic: [], generic: [] },
+      campaign_insights: { relevant_industries: [], relevant_brand_categories: [], relevant_product_categories: [], relevant_audiences: [], relevant_locations: [], potential_campaign_themes: [], potential_collaboration_categories: [], campaign_suitability: '', reasoning: '' },
+      influencer_analysis: { niche: parsed.niche || '', sub_niches: [], content_strengths: [], potential_collaboration_types: [], potential_brand_categories: [] },
+      data_quality: {
+        available_fields: Object.entries(bundle.availability).filter(([, value]) => !/^(none|0|not available|no video)$/.test(value)).map(([key]) => key),
+        missing_fields: Object.entries(bundle.availability).filter(([, value]) => /^(none|0|not available)$/.test(value)).map(([key]) => key),
+        unavailable_metrics: [],
+        media_analysis_available: ocrAvailable || transcriptItems.length > 0,
+        ocr_available: ocrAvailable,
+        transcript_available: transcriptItems.length > 0,
+      },
+      extracted_information: places.map((place) => ({
+        field: 'place',
+        value: place.name || '',
+        source: (place.evidence_ids || []).join(','),
+        confidence: place.confidence,
+      })),
+    };
+
+    return { analysis, places, rejected: outcome.rejected };
   }
 }

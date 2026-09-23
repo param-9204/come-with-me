@@ -5,7 +5,49 @@ import { AiEnrichmentService } from '@/lib/services/ai-enrichment.service';
 import { DbService } from '@/lib/services/db.service';
 import { ApifyOcrService } from '@/lib/services/apify-ocr.service';
 import { GptVisionOcrService } from '@/lib/services/gpt-vision-ocr.service';
-import type { PlaceExtraction } from '@/lib/types/social';
+import { WhisperService } from '@/lib/services/whisper.service';
+import { mergeSameEntities } from '@/lib/services/place-evidence.service';
+import { PipelineLog, plog, withPipelineLog } from '@/lib/services/pipeline-log';
+import { googleMapsUrl } from '@/lib/maps-url';
+import type { PlaceExtraction, TranscriptResult, TranscriptSegment } from '@/lib/types/social';
+
+export const maxDuration = 300;
+
+/** Concurrent Google lookups + inserts per post. */
+const SAVE_CONCURRENCY = 4;
+
+async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await fn(items[index]);
+    }
+  }));
+  return results;
+}
+
+function transcriptFromBody(
+  text: string,
+  segments: unknown,
+  source: unknown,
+  language: unknown
+): TranscriptResult | null {
+  const validSegments: TranscriptSegment[] = Array.isArray(segments)
+    ? segments
+      .filter((segment: any) => segment && typeof segment.text === 'string')
+      .map((segment: any) => ({ start: Number(segment.start) || 0, end: Number(segment.end) || 0, text: segment.text }))
+    : [];
+  if (validSegments.length === 0) return WhisperService.fromStoredText(text);
+  return {
+    text: validSegments.map((segment) => segment.text).join(' '),
+    language: typeof language === 'string' ? language : null,
+    segments: validSegments,
+    source: source === 'platform-subtitles' ? 'platform-subtitles' : 'whisper',
+    droppedSegments: 0,
+  };
+}
 
 function normalizedPlaceName(name: string | null | undefined): string {
   return (name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -25,6 +67,17 @@ function isSamePlace(a: PlaceExtraction, b: PlaceExtraction): boolean {
 }
 
 export async function POST(request: Request) {
+  const log = new PipelineLog(`analyze-${Date.now()}`, { route: 'analyze' });
+  return withPipelineLog(log, async () => {
+    try {
+      return await handleAnalyze(request, log);
+    } finally {
+      log.flush();
+    }
+  });
+}
+
+async function handleAnalyze(request: Request, log: PipelineLog) {
   try {
     const user = await getAuthUser(request);
     const resolvedUserId = user?.id || null;
@@ -33,6 +86,9 @@ export async function POST(request: Request) {
       content,
       rawApifyData,
       transcript,
+      transcriptSegments,
+      transcriptSource,
+      transcriptLanguage,
       apifyOcrFrames = [],
       gptVisionFrames = [],
       url,
@@ -40,6 +96,7 @@ export async function POST(request: Request) {
       audioUploadId,
       socialPostId: inputSocialPostId,
     } = body;
+    const transcriptResult = transcriptFromBody(transcript || '', transcriptSegments, transcriptSource, transcriptLanguage);
 
 
     const finalUserId = (userId || resolvedUserId) || undefined;
@@ -48,7 +105,16 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Missing required fields: content and url' }, { status: 400 });
     }
 
-    console.log(`[API Analyze] Running enrichment for: ${url}`);
+    log.runId = String(content.contentId || url);
+    Object.assign(log.context, { url, platform: content.platform, socialPostId: inputSocialPostId || null });
+    plog('run', 'Analysis started', {
+      url,
+      platform: content.platform,
+      contentType: content.contentType,
+      ocrFrames: apifyOcrFrames.length,
+      visionFrames: gptVisionFrames.length,
+      transcript: transcriptResult ? `${transcriptResult.source}, ${transcriptResult.segments.length} segment(s)` : 'none',
+    });
     const accessFailure = [rawApifyData?.error, rawApifyData?.http_error_reason, rawApifyData?.errorDescription]
       .filter((value) => typeof value === 'string')
       .join(' ');
@@ -59,69 +125,54 @@ export async function POST(request: Request) {
     const apifyAllTexts = ApifyOcrService.deduplicateAcrossFrames(apifyOcrFrames);
     const gptAggregated = GptVisionOcrService.aggregateResults(gptVisionFrames);
 
-    // 2. One strict response supplies both lightweight content intelligence and
-    // the authoritative place list. This avoids sending caption/OCR/transcript twice.
-    const enrichmentResult = await AiEnrichmentService.analyzeContent(
-      content,
-      rawApifyData,
-      transcript || '',
-      gptAggregated.allTexts,
-      apifyAllTexts
-    );
+    // 2. One model call supplies both lightweight content intelligence and the
+    // place candidates; every candidate is then verified against the evidence.
+    const media = {
+      ocrFrames: apifyOcrFrames,
+      visionFrames: gptVisionFrames,
+      transcript: transcriptResult,
+    };
+    const enrichmentResult = await AiEnrichmentService.analyzeContent(content, rawApifyData, media);
 
     const aiAnalysis = enrichmentResult?.analysis || null;
     let placeAnalysis = enrichmentResult?.places || [];
-    // Restricted-page records contain description text only. If the compact
-    // combined response found no place, use the focused extractor as a
-    // recovery path; normal complete posts never make this extra request.
+    // Restricted-page records contain description text only. If the combined
+    // response found no place, run the places-only extractor as a recovery
+    // path; normal complete posts never make this extra request.
     if (restrictedPageMessage && placeAnalysis.length === 0) {
-      console.warn('[API Analyze] Restricted page returned no places; running description-only place recovery.');
+      plog('run', 'Restricted page returned no places; running description-only recovery', undefined, 'warn');
       try {
-        placeAnalysis = await AiEnrichmentService.extractPlace(
-          content,
-          transcript || '',
-          apifyAllTexts
-        );
+        placeAnalysis = (await AiEnrichmentService.extractPlaces(content, media)).places;
       } catch (placeError: any) {
-        console.warn('[API Analyze] Restricted-page place recovery failed:', placeError.message);
+        plog('run', 'Restricted-page recovery failed', { error: placeError.message }, 'warn');
       }
     }
-    console.log(`[API Analyze] Schema-valid place count: ${placeAnalysis.length}`);
+    plog('run', `${placeAnalysis.length} evidence-verified place(s) to save`, {
+      places: placeAnalysis.map((place) => `${place.name} (${place.category}, ${place.confidence})`),
+    });
 
-    // 4. Save places to DB (Parallelized geocoding & saving)
+    // 4. Save places to DB (bounded concurrency: Google lookups + inserts)
     let placeIds: string[] = [];
     let unresolvedPlaces: PlaceExtraction[] = [];
     if (placeAnalysis && placeAnalysis.length > 0) {
-      // In-memory deduplication by name and city
-      const seenPlaces = new Set<string>();
-      const uniquePlaces = placeAnalysis.filter((place) => {
-        if (!place.name) return false;
-        const key = `${place.name.toLowerCase().trim()}_${(place.city || '').toLowerCase().trim()}`;
-        if (seenPlaces.has(key)) {
-          console.log(`[API Analyze] Skipping duplicate place extraction in-memory: "${place.name}" in "${place.city}"`);
-          return false;
-        }
-        seenPlaces.add(key);
-        return true;
-      });
+      const bundle = AiEnrichmentService.buildEvidence(content, media);
+      const uniquePlaces = mergeSameEntities(placeAnalysis.filter((place) => !!place.name), bundle);
 
-      const savePlacePromises = uniquePlaces.map(async (place) => {
+      const saveResults = await mapWithConcurrency(uniquePlaces, SAVE_CONCURRENCY, async (place) => {
         try {
           const id = await DbService.savePlace(place, url, content.platform, transcript || '', finalUserId, inputSocialPostId, content.authorUsername);
           return { place, id };
         } catch (placeErr: any) {
-          console.error('[API Analyze] Error saving individual place:', place.name, placeErr.message);
+          plog('db', `Error saving "${place.name}"`, { error: placeErr.message }, 'error');
           return { place, id: null };
         }
       });
-      const saveResults = await Promise.all(savePlacePromises);
-      placeIds = saveResults.map((result) => result.id).filter(Boolean) as string[];
+      placeIds = [...new Set(saveResults.map((result) => result.id).filter(Boolean) as string[])];
       unresolvedPlaces = saveResults.filter((result) => !result.id).map((result) => result.place);
       if (unresolvedPlaces.length > 0) {
-        console.warn(
-          `[API Analyze] Returning ${unresolvedPlaces.length} unresolved place(s): ` +
-          unresolvedPlaces.map((place) => place.name).join(', ')
-        );
+        plog('run', `${unresolvedPlaces.length} place(s) not saved (no verified location); returned without coordinates`, {
+          places: unresolvedPlaces.map((place) => place.name),
+        }, 'warn');
       }
     }
 
@@ -141,7 +192,7 @@ export async function POST(request: Request) {
         inputSocialPostId
       );
     } catch (dbErr: any) {
-      console.error('[API Analyze] Error saving social post to DB:', dbErr.message);
+      plog('db', 'Error saving the social post', { error: dbErr.message }, 'error');
       // We throw this error because saving the social post is critical
       throw dbErr;
     }
@@ -159,12 +210,11 @@ export async function POST(request: Request) {
 
         if (!dbError && dbData) {
           linkedAudio = dbData;
-          console.log('[API Analyze] Successfully linked audio upload to social post:', socialPostId);
         } else {
-          console.warn('[API Analyze] Failed to link audio upload in DB:', dbError?.message);
+          plog('db', 'Failed to link the audio upload', { error: dbError?.message }, 'warn');
         }
       } catch (audioLinkErr: any) {
-        console.error('[API Analyze] Audio link error:', audioLinkErr.message);
+        plog('db', 'Audio link error', { error: audioLinkErr.message }, 'warn');
       }
     }
 
@@ -219,10 +269,21 @@ export async function POST(request: Request) {
     const finalPlaces = placesSource.map((p: any) => ({
       ...p,
       place_id: p.id || p.place_id,
+      map_url: googleMapsUrl(p),
       author_username: finalAuthorUsername,
       creator_handle: finalCreatorHandle,
       creators: finalCreatorHandle ? [{ creator_handle: finalCreatorHandle, post_url: url, platform: content?.platform }] : [],
     }));
+    plog('run', `Analysis finished: ${finalPlaces.length} place(s)`, {
+      socialPostId,
+      places: finalPlaces.map((p: any) => ({
+        name: p.name,
+        saved: !!p.id,
+        lat: p.latitude ?? null,
+        lng: p.longitude ?? null,
+        mapUrl: p.map_url,
+      })),
+    });
     const partialResultMessage = finalPlaces.length > 0
       ? 'This post contains Restricted content. Place were found.'
       : 'This post contains Restricted content. No places were found.';
@@ -243,13 +304,15 @@ export async function POST(request: Request) {
       placeIds,
       socialPostId,
       audioUpload: linkedAudio,
+      log: log.events,
     });
 
   } catch (error: any) {
-    console.error('[API Analyze] Unhandled error:', error);
+    plog('run', 'Analysis failed', { error: error.message || String(error) }, 'error');
     return NextResponse.json({
       success: false,
       error: error.message || 'Analysis processing failed',
+      log: log.events,
     }, { status: 500 });
   }
 }

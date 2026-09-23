@@ -214,6 +214,14 @@ CREATE TABLE IF NOT EXISTS public.social_post_places (
   UNIQUE(social_post_id, place_id)
 );
 
+-- 13c. Multi-signal extraction (migration v25)
+ALTER TABLE public.places ADD COLUMN IF NOT EXISTS google_place_id text;
+CREATE UNIQUE INDEX IF NOT EXISTS places_google_place_id_unique
+  ON public.places (google_place_id) WHERE google_place_id IS NOT NULL;
+ALTER TABLE public.social_post_places ADD COLUMN IF NOT EXISTS confidence numeric(4, 3);
+ALTER TABLE public.social_post_places ADD COLUMN IF NOT EXISTS explanation text;
+ALTER TABLE public.social_post_places ADD COLUMN IF NOT EXISTS evidence jsonb;
+
 -- 14. ROW LEVEL SECURITY (RLS)
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.places ENABLE ROW LEVEL SECURITY;

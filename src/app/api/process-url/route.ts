@@ -3,8 +3,13 @@ import { supabaseAdmin } from '@/lib/supabase';
 import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { DbService } from '@/lib/services/db.service';
 import { AiEnrichmentService } from '@/lib/services/ai-enrichment.service';
+import { MediaEvidenceService } from '@/lib/services/media-evidence.service';
+import { PipelineLog, withPipelineLog } from '@/lib/services/pipeline-log';
+import { ScraperService } from '@/lib/services/scraper.service';
 import type { SocialContent } from '@/lib/types/social';
 import { v4 as uuidv4 } from 'uuid';
+
+export const maxDuration = 300;
 
 function restrictedAccessMessage(rawApifyData: any): string | null {
   const accessFailure = [rawApifyData?.error, rawApifyData?.http_error_reason, rawApifyData?.errorDescription]
@@ -126,6 +131,7 @@ function contentFromStoredPost(post: any): SocialContent {
     productType: post?.product_type || null,
     publishedAt: null,
     rawApifyData: raw,
+    ...ScraperService.extractPlaceSignals(raw, platform),
   };
 }
 
@@ -186,124 +192,15 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
       .update({ status: 'processing' })
       .eq('id', socialPostId);
 
-    const isVideo =
-      !!contentData.videoUrl &&
-      (contentData.contentType === 'video' ||
-        contentData.contentType === 'reel');
-
-    let whisperTranscript = '';
-    let audioUploadObj: any = null;
-    let ocrResultsList: any[] = [];
-    let gptVisionResultsList: any[] = [];
-
-    // 2. Transcribe (if video) and OCR in parallel
-    const transcriptionPromise = (async () => {
-      if (isVideo) {
-        try {
-          const transcribeRes = await fetch(`${origin}/api/process-url/transcribe`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ videoUrl: contentData.videoUrl }),
-          });
-          const transcribeData = await transcribeRes.json();
-          if (transcribeRes.ok && transcribeData.success) {
-            whisperTranscript = transcribeData.transcript;
-            audioUploadObj = transcribeData.audioUpload;
-          }
-        } catch (err: any) {
-          console.warn('[Synchronous Pipeline] Transcription failed, proceeding:', err.message);
-        }
-      }
-    })();
-
-    const ocrPromise = (async () => {
-      const runWithConcurrency = async <T, R>(
-        items: T[],
-        limit: number,
-        fn: (item: T, idx: number) => Promise<R>
-      ): Promise<R[]> => {
-        const results: R[] = new Array(items.length);
-        let idx = 0;
-        async function worker() {
-          while (idx < items.length) {
-            const current = idx++;
-            results[current] = await fn(items[current], current);
-          }
-        }
-        const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
-        await Promise.all(workers);
-        return results;
-      };
-
-      if (isVideo) {
-        const duration = contentData.videoDuration || 15;
-        const numFrames = Math.max(1, Math.round(duration));
-        const timestamps: { index: number; timestamp: number }[] = [];
-        for (let i = 0; i < numFrames; i++) {
-          timestamps.push({ index: i, timestamp: i });
-        }
-
-        const rawOcr = await runWithConcurrency(timestamps, 10, async (item) => {
-          try {
-            const res = await fetch(`${origin}/api/process-url/ocr-frame`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                videoUrl: contentData.videoUrl,
-                frameIndex: item.index,
-                timestamp: item.timestamp,
-                isVideo: true,
-                platform: contentData.platform,
-              }),
-            });
-            const resData = await res.json();
-            if (res.ok && resData.success && resData.ocrFrameResult) {
-              if (resData.gptVisionFrameResult) gptVisionResultsList.push(resData.gptVisionFrameResult);
-              return resData.ocrFrameResult;
-            }
-          } catch (e) {
-            console.error(`Frame OCR error for index ${item.index}:`, e);
-          }
-          return null;
-        });
-        ocrResultsList = rawOcr.filter(Boolean);
-      } else {
-        const imageUrls =
-          contentData.images && contentData.images.length > 0
-            ? contentData.images
-            : [contentData.displayUrl || contentData.videoUrl].filter(
-              Boolean
-            ) as string[];
-
-        if (imageUrls.length > 0) {
-          const rawOcr = await runWithConcurrency(imageUrls, 10, async (imageUrl, index) => {
-            try {
-              const res = await fetch(`${origin}/api/process-url/ocr-frame`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  imageUrl,
-                  frameIndex: index,
-                  isVideo: false,
-                  platform: contentData.platform,
-                }),
-              });
-              const resData = await res.json();
-              if (res.ok && resData.success && resData.ocrFrameResult) {
-                if (resData.gptVisionFrameResult) gptVisionResultsList.push(resData.gptVisionFrameResult);
-                return resData.ocrFrameResult;
-              }
-            } catch (e) {
-              console.error(`Image OCR error for index ${index}:`, e);
-            }
-            return null;
-          });
-          ocrResultsList = rawOcr.filter(Boolean);
-        }
-      }
-    })();
-
-    await Promise.all([transcriptionPromise, ocrPromise]);
+    // 2. Media evidence in-process: one download, key frames, local OCR,
+    // vision fallback only for hard frames, platform subtitles or Whisper.
+    const mediaLog = new PipelineLog(String(contentData?.contentId || socialPostId), { route: 'process-url', socialPostId, url });
+    const media = await withPipelineLog(mediaLog, () => MediaEvidenceService.collect(contentData, rawApifyDataObj));
+    mediaLog.flush();
+    const whisperTranscript = media.transcriptText;
+    const audioUploadObj = media.audioUpload;
+    const ocrResultsList = media.ocrFrames;
+    const gptVisionResultsList = media.visionFrames;
 
     // 4. Final synthesis and analysis
     const analyzeRes = await fetch(`${origin}/api/process-url/analyze`, {
@@ -313,6 +210,9 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
         content: contentData,
         rawApifyData: rawApifyDataObj,
         transcript: whisperTranscript,
+        transcriptSegments: media.transcript?.segments || [],
+        transcriptSource: media.transcript?.source || 'none',
+        transcriptLanguage: media.transcript?.language || null,
         apifyOcrFrames: ocrResultsList,
         gptVisionFrames: gptVisionResultsList,
         url,

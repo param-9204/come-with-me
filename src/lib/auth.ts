@@ -159,7 +159,7 @@ export async function getAuthUser(request?: Request) {
     console.error('[Auth] Clerk auth() helper failed:', clerkError.message);
   }
 
-  console.error('[Auth] ❌ All auth methods exhausted. Returning null.');
+  // console.error('[Auth] ❌ All auth methods exhausted. Returning null.');
   return null;
 }
 
