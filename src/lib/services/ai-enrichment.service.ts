@@ -255,7 +255,7 @@ function expandShortStreetAddress(address: string): string {
   // "140 North 2nd" / "400 Ranstead" → add Street when clearly a bare street name
   if (!/\b(street|st|avenue|ave|boulevard|blvd|road|rd|drive|dr|lane|ln|way|court|ct|place|pl|parkway|pkwy)\b/i.test(next)) {
     if (/^\d{1,6}\s+(north|south|east|west)\s+\d+(st|nd|rd|th)?$/i.test(next) ||
-        /^\d{1,6}\s+[A-Za-z][A-Za-z.'-]+$/i.test(next)) {
+      /^\d{1,6}\s+[A-Za-z][A-Za-z.'-]+$/i.test(next)) {
       next = `${next} Street`;
     }
   }
@@ -496,7 +496,7 @@ function refineExtractedPlaces(
 
 const COMBINED_SYSTEM_PROMPT = `Return JSON: {"places":[...],"analysis":{...}}. PLACES FIRST, then analysis. Analyze only INPUT.
 
-PLACES (extract ALL, max 12): Scan caption, OCR, transcript start-to-end. Include every distinct named physical place visited/featured/recommended/listed (bonus/last/extra/also). Do NOT trust a stated stop count.
+PLACES (extract ALL, max 1000): Scan caption, OCR, transcript start-to-end. Include every distinct named physical place visited/featured/recommended/listed (bonus/last/extra/also). Do NOT trust a stated stop count.
 
 NAME: Prefer OCR/caption venue names over @handles. A business handle directly attached to an offer, venue description, or address identifies a stop; use it without @ only when no display name is available. Never use a promotional headline as a name. Do not treat ordinary people/creator tags as stops. Name must be only the venue's exact display name—not surrounding caption text, promotional copy, labels, hashtags, rankings, or calls to action. If INPUT cannot isolate the display name, skip the place rather than modify or guess it. Skip people, DJs/artists/hosts, dishes, apps, generic unnamed places.
 
