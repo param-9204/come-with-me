@@ -704,9 +704,10 @@ export class AiEnrichmentService {
     content: SocialContent,
     rawApifyData: any,
     transcript: string,
+    gptOcrTexts: string[],
     apifyOcrTexts: string[]
   ): Promise<{ analysis: AiAnalysisResult; places: PlaceExtraction[] } | null> {
-    const ocrTexts = Array.from(new Set(apifyOcrTexts.map(text => text.trim()).filter(Boolean)));
+    const ocrTexts = Array.from(new Set([...gptOcrTexts, ...apifyOcrTexts].map(text => text.trim()).filter(Boolean)));
     const caption = content.caption ? content.caption.trim() : '';
     const trimmedTranscript = transcript ? transcript.trim() : '';
     const taggedUsers = (content.taggedUsers || []).map(u => typeof u === 'string' ? u : u.username).filter(Boolean);
@@ -725,7 +726,7 @@ export class AiEnrichmentService {
     if (ocrTexts.length > 0) condensedInput.ocr_texts = ocrTexts;
     if (trimmedTranscript) condensedInput.audio_transcript = trimmedTranscript;
 
-    const ocrAvailable = apifyOcrTexts.length > 0;
+    const ocrAvailable = gptOcrTexts.length > 0 || apifyOcrTexts.length > 0;
     const transcriptAvailable = !!transcript && transcript.trim().length > 0;
 
     const userMessage = JSON.stringify(condensedInput);

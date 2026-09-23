@@ -25,12 +25,14 @@ async function runBackgroundPipeline(
     let whisperTranscript = '';
     let audioUploadObj: any = null;
     let ocrResultsList: any[] = [];
+    let gptVisionResultsList: any[] = [];
 
     // ── BRANCH A: Video / Reel — download video ONCE, share between OCR + Whisper ──
     if (isVideo && contentData.videoUrl) {
       const { MediaService } = await import('@/lib/services/media.service');
       const { VideoFrameService } = await import('@/lib/services/video-frame.service');
       const { ApifyOcrService } = await import('@/lib/services/apify-ocr.service');
+      const { GptVisionOcrService } = await import('@/lib/services/gpt-vision-ocr.service');
       const { WhisperService } = await import('@/lib/services/whisper.service');
       const { S3Service } = await import('@/lib/services/s3.service');
       const fs = await import('fs');
@@ -52,11 +54,21 @@ async function runBackgroundPipeline(
         console.log(`[Background Pipeline] Got ${frames.length} frames + audio. Running Tesseract + Whisper in parallel...`);
 
         // ── Parallel: Tesseract OCR on frames + Whisper on audio ──────────────
-        const [ocrResults, whisperResult] = await Promise.all([
-          ApifyOcrService.extractTextFromFrames(frames, false).catch((err: any) => {
+        const [ocrResults, gptVisionResults, whisperResult] = await Promise.all([
+          ApifyOcrService.extractTextFromFrames(
+            frames,
+            false,
+            contentData.platform === 'tiktok' ? frames.length : undefined
+          ).catch((err: any) => {
             console.warn('[Background Pipeline] OCR failed (non-fatal):', err.message);
             return [];
           }),
+          contentData.platform === 'tiktok'
+            ? GptVisionOcrService.extractTextFromFrames(frames).catch((err: any) => {
+              console.warn('[Background Pipeline] TikTok vision OCR failed (non-fatal):', err.message);
+              return [];
+            })
+            : Promise.resolve([]),
           tempAudioPath
             ? WhisperService.processAudio(tempAudioPath).catch((err: any) => {
               console.warn('[Background Pipeline] Whisper failed (non-fatal):', err.message);
@@ -66,6 +78,7 @@ async function runBackgroundPipeline(
         ]);
 
         ocrResultsList = ocrResults.filter(Boolean);
+        gptVisionResultsList = gptVisionResults.filter(Boolean);
 
         if (whisperResult) {
           whisperTranscript = `Original Transcript:\n${whisperResult.originalTranscript}\n\nEnglish Translation:\n${whisperResult.englishTranscript}`;
@@ -132,6 +145,7 @@ async function runBackgroundPipeline(
         const { MediaService } = await import('@/lib/services/media.service');
         const { VideoFrameService } = await import('@/lib/services/video-frame.service');
         const { ApifyOcrService } = await import('@/lib/services/apify-ocr.service');
+        const { GptVisionOcrService } = await import('@/lib/services/gpt-vision-ocr.service');
         const { WhisperService } = await import('@/lib/services/whisper.service');
         const fs = await import('fs');
         const crypto = await import('crypto');
@@ -150,8 +164,11 @@ async function runBackgroundPipeline(
                 MediaService.extractAudio(tempVideoPath).catch(() => null)
               ]);
 
-              const [ocrResults, whisperResult] = await Promise.all([
+              const [ocrResults, gptVisionResults, whisperResult] = await Promise.all([
                 ApifyOcrService.extractTextFromFrames(frames, false).catch(() => []),
+                contentData.platform === 'tiktok'
+                  ? GptVisionOcrService.extractTextFromFrames(frames).catch(() => [])
+                  : Promise.resolve([]),
                 tempAudioPath ? WhisperService.processAudio(tempAudioPath).catch(() => null) : Promise.resolve(null)
               ]);
 
@@ -161,6 +178,7 @@ async function runBackgroundPipeline(
               return {
                 type: 'video',
                 ocr: ocrResults.filter(Boolean),
+                gptVision: gptVisionResults.filter(Boolean),
                 transcript: whisperResult ? `Slide ${index} Transcript:\n${whisperResult.originalTranscript}\n` : ''
               };
             } catch (err: any) {
@@ -179,12 +197,18 @@ async function runBackgroundPipeline(
                 const hash = crypto.default.createHash('md5').update(buffer).digest('hex');
                 const frames = [{ frameIndex: index, timestamp: 0, filePath, hash }];
 
-                const ocrResults = await ApifyOcrService.extractTextFromFrames(frames as any, false).catch(() => []);
+                const [ocrResults, gptVisionResults] = await Promise.all([
+                  ApifyOcrService.extractTextFromFrames(frames as any, false).catch(() => []),
+                  contentData.platform === 'tiktok'
+                    ? GptVisionOcrService.extractTextFromFrames(frames as any).catch(() => [])
+                    : Promise.resolve([]),
+                ]);
                 MediaService.cleanupFiles([filePath]);
 
                 return {
                   type: 'image',
                   ocr: ocrResults.filter(Boolean),
+                  gptVision: gptVisionResults.filter(Boolean),
                   transcript: ''
                 };
               } catch (err: any) {
@@ -199,16 +223,19 @@ async function runBackgroundPipeline(
         const slideResults = (await Promise.all(slidePromises)).filter(Boolean);
 
         const ocrCombined: any[] = [];
+        const gptVisionCombined: any[] = [];
         let mergedTranscript = '';
         for (const res of slideResults) {
           if (res) {
             ocrCombined.push(...res.ocr);
+            gptVisionCombined.push(...(res.gptVision || []));
             if (res.transcript) {
               mergedTranscript += res.transcript + '\n';
             }
           }
         }
         ocrResultsList = ocrCombined;
+        gptVisionResultsList = gptVisionCombined;
         whisperTranscript = mergedTranscript.trim();
       } else {
         const imageUrls: string[] =
@@ -220,6 +247,7 @@ async function runBackgroundPipeline(
           try {
             const { MediaService } = await import('@/lib/services/media.service');
             const { ApifyOcrService } = await import('@/lib/services/apify-ocr.service');
+            const { GptVisionOcrService } = await import('@/lib/services/gpt-vision-ocr.service');
             const fs = await import('fs');
             const crypto = await import('crypto');
 
@@ -235,8 +263,14 @@ async function runBackgroundPipeline(
                 })
               );
 
-            const ocrResults = await ApifyOcrService.extractTextFromFrames(frames as any, false).catch(() => []);
+            const [ocrResults, gptVisionResults] = await Promise.all([
+              ApifyOcrService.extractTextFromFrames(frames as any, false).catch(() => []),
+              contentData.platform === 'tiktok'
+                ? GptVisionOcrService.extractTextFromFrames(frames as any).catch(() => [])
+                : Promise.resolve([]),
+            ]);
             ocrResultsList = ocrResults.filter(Boolean);
+            gptVisionResultsList = gptVisionResults.filter(Boolean);
             MediaService.cleanupFiles(frames.map((f) => f.filePath));
           } catch (err: any) {
             console.warn('[Background Pipeline] Carousel OCR failed (non-fatal):', err.message);
@@ -251,6 +285,7 @@ async function runBackgroundPipeline(
         try {
           const { MediaService } = await import('@/lib/services/media.service');
           const { ApifyOcrService } = await import('@/lib/services/apify-ocr.service');
+          const { GptVisionOcrService } = await import('@/lib/services/gpt-vision-ocr.service');
           const fs = await import('fs');
           const crypto = await import('crypto');
 
@@ -260,8 +295,14 @@ async function runBackgroundPipeline(
           const hash = crypto.default.createHash('md5').update(buffer).digest('hex');
           const frames = [{ frameIndex: 0, timestamp: 0, filePath, hash }];
 
-          const ocrResults = await ApifyOcrService.extractTextFromFrames(frames as any, false).catch(() => []);
+          const [ocrResults, gptVisionResults] = await Promise.all([
+            ApifyOcrService.extractTextFromFrames(frames as any, false).catch(() => []),
+            contentData.platform === 'tiktok'
+              ? GptVisionOcrService.extractTextFromFrames(frames as any).catch(() => [])
+              : Promise.resolve([]),
+          ]);
           ocrResultsList = ocrResults.filter(Boolean);
+          gptVisionResultsList = gptVisionResults.filter(Boolean);
           MediaService.cleanupFiles([filePath]);
         } catch (err: any) {
           console.warn('[Background Pipeline] Single image OCR failed (non-fatal):', err.message);
@@ -284,6 +325,7 @@ async function runBackgroundPipeline(
         rawApifyData: rawApifyDataObj,
         transcript: whisperTranscript,
         apifyOcrFrames: ocrResultsList,
+        gptVisionFrames: gptVisionResultsList,
         url: cleanUrl,
         audioUploadId: audioUploadObj?.id,
         userId,

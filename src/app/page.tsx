@@ -422,6 +422,7 @@ export default function Page() {
     let rawApifyDataObj: any = null;
     let whisperTranscript = '';
     let ocrResultsList: any[] = [];
+    let gptVisionResultsList: any[] = [];
     let audioUploadObj: any = null;
     let isDescriptionOnlyPartial = false;
 
@@ -566,10 +567,12 @@ export default function Page() {
                   frameIndex: item.index,
                   timestamp: item.timestamp,
                   isVideo: true,
+                  platform: contentData.platform,
                 }),
               });
               const resData = await res.json();
               if (res.ok && resData.success && resData.ocrFrameResult) {
+                if (resData.gptVisionFrameResult) gptVisionResultsList.push(resData.gptVisionFrameResult);
                 return resData.ocrFrameResult;
               }
             } catch (e) {
@@ -613,13 +616,15 @@ export default function Page() {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({
-                    imageUrl,
-                    frameIndex: index,
-                    isVideo: false
+                  imageUrl,
+                  frameIndex: index,
+                  isVideo: false,
+                  platform: contentData.platform,
                   }),
               });
               const resData = await res.json();
               if (res.ok && resData.success && resData.ocrFrameResult) {
+                if (resData.gptVisionFrameResult) gptVisionResultsList.push(resData.gptVisionFrameResult);
                 return resData.ocrFrameResult;
                 }
               } catch (e) {
@@ -651,6 +656,7 @@ export default function Page() {
           rawApifyData: rawApifyDataObj,
           transcript: whisperTranscript,
           apifyOcrFrames: ocrResultsList,
+          gptVisionFrames: gptVisionResultsList,
           url,
           audioUploadId: audioUploadObj?.id
         }),

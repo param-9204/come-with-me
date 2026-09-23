@@ -194,6 +194,7 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
     let whisperTranscript = '';
     let audioUploadObj: any = null;
     let ocrResultsList: any[] = [];
+    let gptVisionResultsList: any[] = [];
 
     // 2. Transcribe (if video) and OCR in parallel
     const transcriptionPromise = (async () => {
@@ -252,10 +253,12 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
                 frameIndex: item.index,
                 timestamp: item.timestamp,
                 isVideo: true,
+                platform: contentData.platform,
               }),
             });
             const resData = await res.json();
             if (res.ok && resData.success && resData.ocrFrameResult) {
+              if (resData.gptVisionFrameResult) gptVisionResultsList.push(resData.gptVisionFrameResult);
               return resData.ocrFrameResult;
             }
           } catch (e) {
@@ -282,10 +285,12 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
                   imageUrl,
                   frameIndex: index,
                   isVideo: false,
+                  platform: contentData.platform,
                 }),
               });
               const resData = await res.json();
               if (res.ok && resData.success && resData.ocrFrameResult) {
+                if (resData.gptVisionFrameResult) gptVisionResultsList.push(resData.gptVisionFrameResult);
                 return resData.ocrFrameResult;
               }
             } catch (e) {
@@ -309,6 +314,7 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
         rawApifyData: rawApifyDataObj,
         transcript: whisperTranscript,
         apifyOcrFrames: ocrResultsList,
+        gptVisionFrames: gptVisionResultsList,
         url,
         audioUploadId: audioUploadObj?.id,
         userId: userId || null,

@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import { MediaService } from '@/lib/services/media.service';
 import { VideoFrameService } from '@/lib/services/video-frame.service';
 import { ApifyOcrService } from '@/lib/services/apify-ocr.service';
+import { GptVisionOcrService } from '@/lib/services/gpt-vision-ocr.service';
 import type { VideoFrame } from '@/lib/types/social';
 
 export async function POST(request: Request) {
@@ -12,7 +13,7 @@ export async function POST(request: Request) {
 
   try {
     const body = await request.json();
-    const { videoUrl, imageUrl, frameIndex, timestamp, isVideo } = body;
+    const { videoUrl, imageUrl, frameIndex, timestamp, isVideo, platform } = body;
 
     const idx = typeof frameIndex === 'number' ? frameIndex : 0;
     const ts = typeof timestamp === 'number' ? timestamp : 0;
@@ -59,8 +60,14 @@ export async function POST(request: Request) {
       hash,
     };
 
-    // 4. Run local Apify/Tesseract OCR on the single frame.
-    const ocrResults = await ApifyOcrService.extractTextFromFrames([virtualFrame], false);
+    // TikTok uses both OCR engines on the same temporary frame. Instagram
+    // remains local-OCR only, so vision calls cannot affect that platform.
+    const [ocrResults, gptVisionResults] = await Promise.all([
+      ApifyOcrService.extractTextFromFrames([virtualFrame], false),
+      platform === 'tiktok'
+        ? GptVisionOcrService.extractTextFromFrames([virtualFrame])
+        : Promise.resolve([]),
+    ]);
     
     // 5. Clean up local files immediately
     MediaService.cleanupFiles([tempMediaPath, tempFramePath].filter(Boolean));
@@ -70,6 +77,7 @@ export async function POST(request: Request) {
     return NextResponse.json({
       success: true,
       ocrFrameResult: result,
+      gptVisionFrameResult: gptVisionResults[0] || null,
     });
 
   } catch (error: any) {

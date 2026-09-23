@@ -4,6 +4,7 @@ import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { AiEnrichmentService } from '@/lib/services/ai-enrichment.service';
 import { DbService } from '@/lib/services/db.service';
 import { ApifyOcrService } from '@/lib/services/apify-ocr.service';
+import { GptVisionOcrService } from '@/lib/services/gpt-vision-ocr.service';
 import type { PlaceExtraction } from '@/lib/types/social';
 
 function normalizedPlaceName(name: string | null | undefined): string {
@@ -33,6 +34,7 @@ export async function POST(request: Request) {
       rawApifyData,
       transcript,
       apifyOcrFrames = [],
+      gptVisionFrames = [],
       url,
       userId,
       audioUploadId,
@@ -55,6 +57,7 @@ export async function POST(request: Request) {
 
     // 1. Process OCR results (Deduplicate)
     const apifyAllTexts = ApifyOcrService.deduplicateAcrossFrames(apifyOcrFrames);
+    const gptAggregated = GptVisionOcrService.aggregateResults(gptVisionFrames);
 
     // 2. One strict response supplies both lightweight content intelligence and
     // the authoritative place list. This avoids sending caption/OCR/transcript twice.
@@ -62,6 +65,7 @@ export async function POST(request: Request) {
       content,
       rawApifyData,
       transcript || '',
+      gptAggregated.allTexts,
       apifyAllTexts
     );
 
@@ -173,13 +177,13 @@ export async function POST(request: Request) {
         processingTimeMs: 0, // client-tracked
       },
       gptVision: {
-        frames: [],
-        allTexts: [],
-        allBrands: [],
-        allLocations: [],
-        allPrices: [],
-        allCtas: [],
-        totalFramesProcessed: 0,
+        frames: gptVisionFrames,
+        allTexts: gptAggregated.allTexts,
+        allBrands: gptAggregated.allBrands,
+        allLocations: gptAggregated.allLocations,
+        allPrices: gptAggregated.allPrices,
+        allCtas: gptAggregated.allCtas,
+        totalFramesProcessed: gptVisionFrames.length,
         processingTimeMs: 0,
       },
     };

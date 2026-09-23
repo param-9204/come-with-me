@@ -97,7 +97,8 @@ function buildCleanLines(tsv: string): string[] {
 export class ApifyOcrService {
   static async extractTextFromFrames(
     frames: VideoFrame[],
-    skipForSingleImage = false
+    skipForSingleImage = false,
+    maxFrames = MAX_FRAMES_FOR_OCR
   ): Promise<ApifyOcrFrameResult[]> {
     if (!frames || frames.length === 0) return [];
 
@@ -106,7 +107,7 @@ export class ApifyOcrService {
       return [];
     }
 
-    const framesToProcess = frames.slice(0, MAX_FRAMES_FOR_OCR);
+    const framesToProcess = frames.slice(0, maxFrames);
     console.log(`[Local OCR] Starting Tesseract.js OCR on ${framesToProcess.length} frames...`);
 
     const tesseract = await import('tesseract.js');
