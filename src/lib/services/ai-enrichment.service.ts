@@ -522,7 +522,7 @@ const COMBINED_RESPONSE_FORMAT: any = {
       properties: {
         places: {
           type: 'array',
-          maxItems: 12,
+          maxItems: 1000,
           items: {
             type: 'object',
             properties: {
