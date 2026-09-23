@@ -133,7 +133,7 @@ export async function POST(request: Request) {
         rawApifyData,
         aiAnalysis,
         apifyOcrFrames,
-        [], // empty GPT vision frames
+        gptVisionFrames,
         transcript || '',
         placeIds,
         url,

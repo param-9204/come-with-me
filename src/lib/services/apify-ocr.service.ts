@@ -94,6 +94,33 @@ function buildCleanLines(tsv: string): string[] {
   return lines;
 }
 
+/**
+ * Preserve source lines such as "Paul's - 283 Nostrand Ave" when Tesseract's
+ * per-word confidence filter keeps the address but drops the venue name. The
+ * address shape is mandatory, so noisy prose is never promoted as a place.
+ */
+function extractStructuredVenueAddressLines(rawText: string): string[] {
+  const streetSuffix = '(?:st|ave|avenue|blvd|boulevard|rd|road|dr|drive|ln|lane|way|ct|court|pl|place|pkwy|parkway)\\.?';
+  const addressPattern = new RegExp(`^\\d{1,6}\\s+.+?\\b${streetSuffix}\\b.*$`, 'i');
+  const output: string[] = [];
+
+  for (const sourceLine of rawText.split(/\r?\n/)) {
+    const match = sourceLine.match(/^\s*(.{2,100}?)\s*[-*]\s*(\d{1,6}\s+.+)$/);
+    if (!match) continue;
+
+    const name = match[1]
+      .replace(/^[^A-Za-z0-9]+/, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const address = match[2].replace(/\s+/g, ' ').trim();
+    if (!name || !/[A-Za-z]/.test(name) || !addressPattern.test(address)) continue;
+
+    output.push(`${name} - ${address}`);
+  }
+
+  return [...new Set(output)];
+}
+
 export class ApifyOcrService {
   static async extractTextFromFrames(
     frames: VideoFrame[],
@@ -143,8 +170,10 @@ export class ApifyOcrService {
         const cleanLines = buildCleanLines(tsv);
         const wordCount = parseTsv(tsv).length;
 
-        // Within-frame dedup
-        const withinFrameUnique = [...new Set<string>(cleanLines)];
+        // Within-frame dedup. Keep valid venue-address lines from raw OCR as
+        // evidence when confidence filtering removed only the venue name.
+        const structuredRawLines = extractStructuredVenueAddressLines(data.text || '');
+        const withinFrameUnique = [...new Set<string>([...cleanLines, ...structuredRawLines])];
 
         // Cross-frame dedup: only keep text NOT seen in any previous frame
         const newTextsOnly: string[] = [];

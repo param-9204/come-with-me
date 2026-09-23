@@ -92,7 +92,7 @@ export class DbService {
     let lat: number | null = null;
     let lng: number | null = null;
     let neighborhood = placeData.neighborhood;
-    let address = placeData.address;
+    let address = LocationService.sanitizeSourceAddress(placeData.address);
     let city = LocationService.cleanCityName(placeData.city);
 
     try {
@@ -136,7 +136,7 @@ export class DbService {
       return null;
     }
 
-    // A source post may omit the city. Once Mapbox verifies it, check the
+    // A source post may omit the city. Once Google Maps verifies it, check the
     // canonical name/city pair before creating a duplicate record.
     if (city.trim() && city.trim().toLowerCase() !== (placeData.city || '').trim().toLowerCase()) {
       const { data: existingWithResolvedCity } = await supabaseAdmin

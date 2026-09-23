@@ -212,6 +212,7 @@ function looksLikeSingleAreaItinerary(inputBlob: string, placeCount: number): bo
 function hasStreetAddress(address: string): boolean {
   const value = (address || '').trim();
   if (!value || !/\d/.test(value)) return false;
+  if (!isPlausibleStreetAddress(value)) return false;
   if (/(st|street|ave|avenue|blvd|rd|road|dr|drive|ln|lane|way|ct|court|pl|place|pkwy|parkway|#|suite|unit)\b/i.test(value)) {
     return true;
   }
@@ -237,6 +238,11 @@ function isPlausibleStreetAddress(value: string): boolean {
   if (normalized.length < 5 || normalized.length > 80) return false;
   // Reject pure years / prices mistaken as addresses.
   if (/^\d{4}$/.test(normalized)) return false;
+  // Avoid converting list copy such as "5 cozy restaurants" into the
+  // fabricated address "5 cozy Street".
+  if (/^\d{1,6}\s+(?:cozy|best|top|great|favorite|popular|new|nice|amazing|restaurants?|cafes?|bars?|places?|spots?)\b/i.test(normalized)) {
+    return false;
+  }
   return true;
 }
 
@@ -299,13 +305,14 @@ function attachAddressesFromSources(
 
   return places.map((place) => {
     const current = (place.address || '').trim();
-    if (hasStreetAddress(current) && /\d/.test(current)) {
+    if (hasStreetAddress(current) && isPlausibleStreetAddress(current)) {
       // Already has a usable street address; still expand short forms.
       return { ...place, address: expandShortStreetAddress(current) };
     }
+    const placeWithoutInvalidAddress = current ? { ...place, address: '' } : place;
 
     const nameKey = collapseAlnum(place.name || '');
-    if (!nameKey) return place;
+    if (!nameKey) return placeWithoutInvalidAddress;
 
     // Prefer address in the same window as the place name / handle.
     let best: { addr: FoundAddress; distance: number } | null = null;
@@ -333,7 +340,7 @@ function attachAddressesFromSources(
       }
     }
 
-    if (!best) return place;
+    if (!best) return placeWithoutInvalidAddress;
 
     const idx = found.indexOf(best.addr);
     if (idx >= 0) used.add(idx);
@@ -342,7 +349,7 @@ function attachAddressesFromSources(
       `[AI Place Extraction] Attached address "${best.addr.address}" to "${place.name}" from source text`
     );
     return {
-      ...place,
+      ...placeWithoutInvalidAddress,
       address: best.addr.address,
       confidence: Math.max(place.confidence, 0.8),
     };
@@ -554,7 +561,47 @@ const COMBINED_RESPONSE_FORMAT: any = {
   },
 };
 
+function distinctSourceAddressCount(sources: string[]): number {
+  const addresses = findStreetAddressesInText(sources.filter(Boolean).join('\n'))
+    .map((entry) => collapseAlnum(entry.address));
+  return new Set(addresses).size;
+}
+
+function sameSourcePlace(a: PlaceExtraction, b: PlaceExtraction): boolean {
+  const aAddress = collapseAlnum(a.address || '');
+  const bAddress = collapseAlnum(b.address || '');
+  if (aAddress && bAddress && aAddress === bAddress) return true;
+
+  const aName = collapseAlnum(a.name || '');
+  const bName = collapseAlnum(b.name || '');
+  return !!aName && !!bName && (
+    aName === bName ||
+    (Math.min(aName.length, bName.length) >= 6 && (aName.includes(bName) || bName.includes(aName)))
+  );
+}
+
+function mergeSourcePlaces(primary: PlaceExtraction[], recovered: PlaceExtraction[]): PlaceExtraction[] {
+  const merged = [...primary];
+  for (const candidate of recovered) {
+    if (!merged.some((existing) => sameSourcePlace(existing, candidate))) {
+      merged.push(candidate);
+    }
+  }
+  return merged;
+}
+
+function tokenBudgetForPlaceCount(baseTokens: number, expectedPlaceCount: number): number {
+  // A structured venue requires substantially more output than a short video
+  // summary. Scale with source-backed address lines, but retain a hard limit.
+  const evidenceBudget = expectedPlaceCount > 0 ? 700 + expectedPlaceCount * 140 : baseTokens;
+  return Math.min(6_000, Math.max(baseTokens, evidenceBudget));
+}
+
 export class AiEnrichmentService {
+  static countDistinctSourceAddresses(texts: string[]): number {
+    return distinctSourceAddressCount(texts);
+  }
+
   static formatCondensedCaption(caption: string | null | undefined, maxLen = 1000): string {
     if (!caption) return '';
     const trimmed = caption.trim();
@@ -583,7 +630,8 @@ export class AiEnrichmentService {
   static async extractPlace(
     content: SocialContent,
     transcript: string,
-    ocrTexts: string[]
+    ocrTexts: string[],
+    maxTokens?: number
   ): Promise<PlaceExtraction[]> {
     const condensedInput = {
       platform: content.platform,
@@ -640,7 +688,7 @@ export class AiEnrichmentService {
       const response = await client.chat.completions.create({
         model,
         temperature: 0,
-        max_tokens: 2000,
+        ...(typeof maxTokens === 'number' ? { max_tokens: maxTokens } : {}),
         messages: [
           { role: 'system', content: PLACE_SYSTEM_PROMPT },
           { role: 'user', content: JSON.stringify(condensedInput) },
@@ -731,16 +779,23 @@ export class AiEnrichmentService {
 
     const userMessage = JSON.stringify(condensedInput);
 
+    const isVideoContent = content.contentType === 'video' || content.contentType === 'reel';
     const durationSec = content.videoDuration ?? 0;
-    let maxTokens: number;
-    if (durationSec <= 60) {
-      maxTokens = 1500;
-    } else if (durationSec <= 90) {
-      maxTokens = 2500;
-    } else if (durationSec <= 120) {
-      maxTokens = 2500;
-    } else {
-      maxTokens = 3500;
+    let maxTokens: number | undefined;
+    if (isVideoContent) {
+      if (durationSec <= 60) {
+        maxTokens = 1500;
+      } else if (durationSec <= 90) {
+        maxTokens = 2500;
+      } else if (durationSec <= 120) {
+        maxTokens = 2500;
+      } else {
+        maxTokens = 3500;
+      }
+    }
+    const sourceAddressCount = distinctSourceAddressCount([caption, ...ocrTexts, trimmedTranscript]);
+    if (isVideoContent && maxTokens !== undefined) {
+      maxTokens = tokenBudgetForPlaceCount(maxTokens, sourceAddressCount);
     }
 
     return executeAICall('chat', async ({ client, model, isGroq }) => {
@@ -752,9 +807,12 @@ export class AiEnrichmentService {
           { role: 'user', content: userMessage },
         ],
         response_format: isGroq ? { type: 'json_object' } : COMBINED_RESPONSE_FORMAT,
-        max_tokens: maxTokens,
+        ...(typeof maxTokens === 'number' ? { max_tokens: maxTokens } : {}),
       });
       const raw = response.choices[0].message.content || '{}';
+      if (maxTokens !== undefined && response.choices[0].finish_reason === 'length') {
+        console.warn(`[AI Place Extraction] Combined response reached its ${maxTokens}-token budget.`);
+      }
 
       let parsedJson: unknown;
       try {
@@ -780,6 +838,27 @@ export class AiEnrichmentService {
         );
       } catch (placeError) {
         console.warn('[AI Place Extraction] Combined response had no usable places:', placeError);
+      }
+
+      // Do not silently accept a shorter model list when OCR contains more
+      // distinct, source-backed street-address rows. A focused second pass is
+      // merged by address/name, never by generated data.
+      if (sourceAddressCount > places.length) {
+        console.warn(
+          `[AI Place Extraction] Found ${sourceAddressCount} source address rows but only ${places.length} places; running recovery.`
+        );
+        try {
+          const recovered = await this.extractPlace(
+            content,
+            trimmedTranscript,
+            ocrTexts,
+            isVideoContent ? tokenBudgetForPlaceCount(2_000, sourceAddressCount) : undefined
+          );
+          places = mergeSourcePlaces(places, recovered);
+          console.log(`[AI Place Extraction] Recovery produced ${places.length} total distinct places.`);
+        } catch (recoveryError: any) {
+          console.warn('[AI Place Extraction] Source-backed recovery failed:', recoveryError.message || recoveryError);
+        }
       }
 
       const analysis: AiAnalysisResult = {

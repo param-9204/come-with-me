@@ -11,6 +11,29 @@ type CityInfo = {
   country?: string;
 };
 
+type GoogleAddressComponent = {
+  longText?: string;
+  shortText?: string;
+  types?: string[];
+};
+
+type GooglePlace = {
+  displayName?: { text?: string };
+  formattedAddress?: string;
+  location?: { latitude?: number; longitude?: number };
+  addressComponents?: GoogleAddressComponent[];
+};
+
+type GoogleGeocodeResult = {
+  formatted_address?: string;
+  geometry?: { location?: { lat?: number; lng?: number } };
+  address_components?: Array<{
+    long_name?: string;
+    short_name?: string;
+    types?: string[];
+  }>;
+};
+
 const CITY_ALIASES: Record<string, CityInfo> = {
   nyc: { name: 'New York', country: 'US' },
   'new york': { name: 'New York', country: 'US' },
@@ -51,9 +74,15 @@ const CITY_ALIASES: Record<string, CityInfo> = {
   bengaluru: { name: 'Bengaluru', country: 'IN' },
 };
 
+/** Google Maps is the only geocoding provider used by this service. */
 export class LocationService {
   private static emptyResult(): GeocodeResult {
     return { lat: null, lng: null, formattedAddress: null, neighborhood: null, city: null };
+  }
+
+  private static apiKey(): string | null {
+    const key = process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_PLACES_API_KEY;
+    return key && !key.startsWith('your-google-') ? key : null;
   }
 
   private static normalize(value: string): string {
@@ -66,120 +95,69 @@ export class LocationService {
   }
 
   static cleanCityName(city: string | null | undefined): string {
-    if (!city) return '';
-    let cleaned = city.trim();
-    if (!cleaned) return '';
-
-    // Strip details after comma if it looks like state/country (e.g. "Philadelphia, PA, USA" -> "Philadelphia")
-    if (cleaned.includes(',')) {
-      const parts = cleaned.split(',').map(p => p.trim()).filter(Boolean);
-      if (parts.length > 0) {
-        cleaned = parts[0];
-      }
-    }
-
-    // Strip leading "City of ", "Town of ", "Borough of ", "Village of ", "County of ", "Municipality of ", "Township of "
+    if (!city?.trim()) return '';
+    let cleaned = city.trim().split(',')[0].trim();
     cleaned = cleaned.replace(/^(city|town|borough|village|county|municipality|township)\s+of\s+/i, '');
+    const normalized = this.normalize(cleaned);
+    if (CITY_ALIASES[normalized]) return CITY_ALIASES[normalized].name;
 
-    // List of legitimate city names ending with "City"
-    const legitCityNames = [
+    const legitimateCityNames = new Set([
       'new york city', 'mexico city', 'salt lake city', 'kansas city', 'panama city',
       'quebec city', 'oklahoma city', 'guatemala city', 'ho chi minh city', 'carson city',
       'iowa city', 'jersey city', 'park city', 'dodge city', 'atlantic city', 'culver city',
       'studio city', 'rapid city', 'redwood city', 'traverse city', 'daly city', 'union city',
-      'foster city', 'yuba city', 'cathedral city', 'sun city', 'universal city', 'city of industry'
-    ];
-
-    const norm = this.normalize(cleaned);
-
-    // If it's a known alias in CITY_ALIASES, use that exact canonical city name!
-    if (CITY_ALIASES[norm]) {
-      return CITY_ALIASES[norm].name;
-    }
-
-    const isLegitCity = legitCityNames.includes(norm);
-
-    if (!isLegitCity) {
-      // Strip trailing " City", " city", " County", " county", " Township", " township", " Borough", " borough"
+      'foster city', 'yuba city', 'cathedral city', 'sun city', 'universal city', 'city of industry',
+    ]);
+    if (!legitimateCityNames.has(normalized)) {
       cleaned = cleaned.replace(/\s+(city|county|township|borough|municipality)$/i, '');
     }
-
-    const normAfter = this.normalize(cleaned);
-    if (CITY_ALIASES[normAfter]) {
-      return CITY_ALIASES[normAfter].name;
-    }
-
-    // Fix casing if it's ALL LOWERCASE or ALL UPPERCASE
+    const normalizedAfterSuffixRemoval = this.normalize(cleaned);
+    if (CITY_ALIASES[normalizedAfterSuffixRemoval]) return CITY_ALIASES[normalizedAfterSuffixRemoval].name;
     if (cleaned === cleaned.toLowerCase() || cleaned === cleaned.toUpperCase()) {
-      cleaned = cleaned.replace(/\w\S*/g, (txt) => txt.charAt(0).toUpperCase() + txt.slice(1).toLowerCase());
+      cleaned = cleaned.replace(/\w\S*/g, (word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase());
     }
-
     return cleaned;
   }
 
-  /**
-   * Detect a canonical city from caption/OCR/mentions using known aliases only.
-   * Uses word boundaries for normal prose. Collapsed handle matching is limited
-   * to longer aliases (>=5) so short ones like "nola" do not match inside "granola".
-   */
   static detectCityFromText(text: string | null | undefined): string {
     if (!text?.trim()) return '';
-
     const normalized = this.normalize(text);
     const handleTokens = (text.match(/[@#]?[A-Za-z][A-Za-z0-9._]{3,}/g) || [])
       .map((token) => token.replace(/^[@#]/, '').toLowerCase().replace(/[^a-z0-9]/g, ''))
       .filter((token) => token.length >= 4);
-
-    const ranked = Object.entries(CITY_ALIASES)
-      .map(([alias, info]) => ({ alias, info, len: alias.replace(/\s+/g, '').length }))
-      .sort((a, b) => b.len - a.len);
-
-    for (const { alias, info, len } of ranked) {
-      const aliasCollapsed = alias.replace(/\s+/g, '');
-      const tokenRe = new RegExp(`(?:^|\\s)${aliasCollapsed.replace(/\s+/g, '\\s+')}(?:\\s|$)`);
-      if (tokenRe.test(normalized)) return info.name;
-
-      // Handle/hashtag tokens only (e.g. oldcityphilly → philly). Require longer alias.
-      if (len >= 5 && handleTokens.some((token) => token.includes(aliasCollapsed))) {
-        return info.name;
-      }
+    const aliases = Object.entries(CITY_ALIASES)
+      .map(([alias, info]) => ({ alias, info, length: alias.replace(/\s+/g, '').length }))
+      .sort((a, b) => b.length - a.length);
+    for (const { alias, info, length } of aliases) {
+      const pattern = new RegExp(`(?:^|\\s)${alias.replace(/\s+/g, '\\s+')}(?:\\s|$)`);
+      if (pattern.test(normalized)) return info.name;
+      const compactAlias = alias.replace(/\s+/g, '');
+      if (length >= 5 && handleTokens.some((token) => token.includes(compactAlias))) return info.name;
     }
-
     return '';
   }
 
   private static cityInfo(city: string): CityInfo {
     const cleaned = this.cleanCityName(city);
-    const norm = this.normalize(cleaned);
-    return CITY_ALIASES[norm] || { name: cleaned };
+    return CITY_ALIASES[this.normalize(cleaned)] || { name: cleaned };
   }
 
   private static namesMatch(expected: string, actual: string): boolean {
     const expectedName = this.normalize(expected);
     const actualName = this.normalize(actual);
     if (!expectedName || !actualName) return false;
-    if (
-      expectedName === actualName ||
-      actualName.includes(expectedName) ||
-      expectedName.includes(actualName)
-    ) {
-      return true;
-    }
-    // Handles like "gaslamphotel" should match "Gas Lamp Hotel"
-    const expectedCollapsed = expectedName.replace(/\s+/g, '');
-    const actualCollapsed = actualName.replace(/\s+/g, '');
-    return !!expectedCollapsed && (
-      expectedCollapsed === actualCollapsed ||
-      (expectedCollapsed.length >= 5 && actualCollapsed.includes(expectedCollapsed)) ||
-      (actualCollapsed.length >= 5 && expectedCollapsed.includes(actualCollapsed))
+    if (expectedName === actualName || expectedName.includes(actualName) || actualName.includes(expectedName)) return true;
+    const compactExpected = expectedName.replace(/\s+/g, '');
+    const compactActual = actualName.replace(/\s+/g, '');
+    return compactExpected.length >= 5 && (
+      compactExpected === compactActual ||
+      compactExpected.includes(compactActual) ||
+      compactActual.includes(compactExpected)
     );
   }
 
-  /** Name-only search is safe only for an exact display-name match. */
   private static namesExactlyMatch(expected: string, actual: string): boolean {
-    const expectedName = this.normalize(expected);
-    const actualName = this.normalize(actual);
-    return !!expectedName && expectedName === actualName;
+    return this.normalize(expected) === this.normalize(actual) && !!this.normalize(expected);
   }
 
   private static normalizeAddress(value: string): string {
@@ -199,18 +177,14 @@ export class LocationService {
       .replace(/\bw\b/g, 'west');
   }
 
-  private static addressesMatch(expectedAddress: string, candidateAddresses: string[]): boolean {
-    if (!expectedAddress.trim()) return true;
-    const expected = this.normalizeAddress(expectedAddress);
-    if (!expected) return true;
-
-    return candidateAddresses.some((candidate) => {
+  private static addressesMatch(expected: string, candidates: string[]): boolean {
+    if (!expected.trim()) return true;
+    const normalizedExpected = this.normalizeAddress(expected);
+    return candidates.some((candidate) => {
       const normalizedCandidate = this.normalizeAddress(candidate);
-      return !!normalizedCandidate && (
-        normalizedCandidate === expected ||
-        normalizedCandidate.includes(expected) ||
-        expected.includes(normalizedCandidate)
-      );
+      return normalizedCandidate === normalizedExpected ||
+        normalizedCandidate.includes(normalizedExpected) ||
+        normalizedExpected.includes(normalizedCandidate);
     });
   }
 
@@ -219,480 +193,258 @@ export class LocationService {
     const normalizedExpected = this.normalize(expected);
     return candidates.some((candidate) => {
       const normalizedCandidate = this.normalize(candidate);
-      return !!normalizedCandidate && (
-        normalizedCandidate === normalizedExpected ||
+      return !!normalizedCandidate && (normalizedCandidate === normalizedExpected ||
         normalizedCandidate.includes(normalizedExpected) ||
-        normalizedExpected.includes(normalizedCandidate)
-      );
-    });
-  }
-
-  private static coordinatesFromFeature(feature: any): { lat: number; lng: number } | null {
-    const geometryCoordinates = feature?.geometry?.coordinates;
-    const propertiesCoordinates = feature?.properties?.coordinates;
-    const lng = Array.isArray(geometryCoordinates)
-      ? geometryCoordinates[0]
-      : propertiesCoordinates?.longitude;
-    const lat = Array.isArray(geometryCoordinates)
-      ? geometryCoordinates[1]
-      : propertiesCoordinates?.latitude;
-
-    return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : null;
-  }
-
-  private static mapboxCity(properties: any): string | null {
-    const context = properties?.context || {};
-    const rawCity = (
-      (['city', 'place', 'locality'].includes(properties?.feature_type) ? properties?.name : null) ||
-      context.place?.name ||
-      context.city?.name ||
-      context.locality?.name ||
-      null
-    );
-    return rawCity ? this.cleanCityName(rawCity) : null;
-  }
-
-  private static mapboxNeighborhood(properties: any): string | null {
-    const context = properties?.context || {};
-    return context.neighborhood?.name || context.locality?.name || null;
-  }
-
-  private static cityNamesMatch(expectedCity: string, candidateCities: string[]): boolean {
-    if (!expectedCity.trim()) return true;
-    const expectedCanonical = this.normalize(this.cityInfo(expectedCity).name);
-    const expectedRaw = this.normalize(expectedCity);
-
-    return candidateCities.some(city => {
-      const normCity = this.normalize(city);
-      const normCanonical = this.normalize(this.cityInfo(city).name);
-      return (
-        normCity === expectedCanonical ||
-        normCanonical === expectedCanonical ||
-        normCity === expectedRaw ||
-        expectedRaw.includes(normCity) ||
-        normCity.includes(expectedRaw)
-      );
+        normalizedExpected.includes(normalizedCandidate));
     });
   }
 
   private static addressContainsCity(address: string, expectedCity: string): boolean {
     if (!expectedCity.trim()) return true;
-    const canonical = this.cityInfo(expectedCity).name;
-    const variants = Object.entries(CITY_ALIASES)
-      .filter(([, info]) => info.name === canonical)
+    const canonicalCity = this.cityInfo(expectedCity).name;
+    const aliases = Object.entries(CITY_ALIASES)
+      .filter(([, info]) => info.name === canonicalCity)
       .map(([alias]) => alias);
-    const rawParts = expectedCity.split(/[\s,]+/).map(p => this.normalize(p)).filter(p => p.length > 2);
-
+    const cityWords = expectedCity.split(/[\s,]+/).filter((word) => word.length > 2);
     const normalizedAddress = this.normalize(address);
-    const allKeywords = [canonical, expectedCity, ...variants, ...rawParts].map(k => this.normalize(k)).filter(Boolean);
-
-    return allKeywords.some(keyword => normalizedAddress.includes(keyword));
+    return [canonicalCity, expectedCity, ...aliases, ...cityWords]
+      .map((value) => this.normalize(value))
+      .filter(Boolean)
+      .some((value) => normalizedAddress.includes(value));
   }
 
-  /**
-   * Last-resort web lookup for posts without city/address evidence. Accept only
-   * a single exact POI result; a chain or duplicate name is intentionally left
-   * unresolved rather than mapped to an arbitrary branch.
-   */
-  private static async findUniquePoiByName(name: string, mapboxToken: string): Promise<GeocodeResult> {
-    if (name.trim().length < 3) return this.emptyResult();
+  private static cityMatches(expected: string, actual: string[], address: string): boolean {
+    if (!expected.trim()) return true;
+    const expectedCanonical = this.normalize(this.cityInfo(expected).name);
+    const componentMatches = actual.some((value) => {
+      const normalizedValue = this.normalize(value);
+      const canonicalValue = this.normalize(this.cityInfo(value).name);
+      return normalizedValue === expectedCanonical || canonicalValue === expectedCanonical;
+    });
+    return componentMatches || this.addressContainsCity(address, expected);
+  }
 
+  private static componentValue(components: GoogleAddressComponent[], types: string[]): string | null {
+    const component = components.find((item) => item.types?.some((type) => types.includes(type)));
+    return component?.longText || component?.shortText || null;
+  }
+
+  private static googlePlaceCity(place: GooglePlace): string | null {
+    const components = place.addressComponents || [];
+    const city = this.componentValue(components, ['locality', 'postal_town', 'administrative_area_level_3']);
+    return city ? this.cleanCityName(city) : null;
+  }
+
+  private static googlePlaceNeighborhood(place: GooglePlace): string | null {
+    // `sublocality_level_1` is often a borough (for example, Manhattan), not
+    // a neighbourhood (for example, West Village). Treating it as a precise
+    // neighbourhood rejects otherwise exact Places Text Search matches.
+    return this.componentValue(place.addressComponents || [], ['neighborhood', 'sublocality_level_2']);
+  }
+
+  private static googlePlaceCountry(place: GooglePlace): string | null {
+    const country = (place.addressComponents || []).find((item) => item.types?.includes('country'));
+    return country?.shortText?.toUpperCase() || country?.longText?.toUpperCase() || null;
+  }
+
+  private static async fetchGoogle(url: string, init?: RequestInit): Promise<Response> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15_000);
     try {
-      const params = new URLSearchParams({
-        q: name.trim(),
-        access_token: mapboxToken,
-        language: 'en',
-        limit: '10',
-        types: 'poi',
-        auto_complete: 'false',
-      });
-      console.log(`[Geocoding] Trying exact global POI fallback for: "${name}"`);
-      const response = await fetch(`https://api.mapbox.com/search/searchbox/v1/forward?${params}`);
-      if (!response.ok) throw new Error(`Mapbox returned HTTP ${response.status}`);
-      const data = await response.json();
-
-      const matches = (data.features || []).flatMap((feature: any) => {
-        const properties = feature?.properties || {};
-        const coordinates = this.coordinatesFromFeature(feature);
-        const city = this.mapboxCity(properties);
-        const address = properties.full_address ||
-          [properties.address, properties.place_formatted].filter(Boolean).join(', ') ||
-          null;
-        if (
-          properties.feature_type !== 'poi' ||
-          !coordinates ||
-          !city ||
-          !address ||
-          !this.namesExactlyMatch(name, properties.name || '')
-        ) {
-          return [];
-        }
-        return [{ coordinates, city, address, neighborhood: this.mapboxNeighborhood(properties) }];
-      });
-
-      const uniqueMatches = Array.from(new Map(
-        matches.map((match: any) => [`${match.coordinates.lat},${match.coordinates.lng}`, match])
-      ).values());
-      if (uniqueMatches.length !== 1) {
-        console.warn(`[Geocoding] Name-only fallback for "${name}" is ambiguous or unverified; skipping it.`);
-        return this.emptyResult();
-      }
-
-      const match = uniqueMatches[0] as {
-        coordinates: { lat: number; lng: number };
-        city: string;
-        address: string;
-        neighborhood: string | null;
-      };
-      console.log(`[Geocoding] Exact unique POI fallback matched: ${match.address}`);
-      return {
-        lat: match.coordinates.lat,
-        lng: match.coordinates.lng,
-        formattedAddress: match.address,
-        city: match.city,
-        neighborhood: match.neighborhood,
-      };
-    } catch (error) {
-      console.warn(`[Geocoding] Exact global POI fallback failed for "${name}":`, error);
-      return this.emptyResult();
+      return await fetch(url, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
-  static async geocodePlace(
-    name: string,
-    city: string,
-    address?: string,
-    neighborhood?: string
-  ): Promise<GeocodeResult> {
-    const mapboxToken = process.env.MAPBOX_ACCESS_TOKEN || process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
-    const googleApiKey = process.env.GOOGLE_PLACES_API_KEY;
+  private static async textSearch(query: string, apiKey: string, country?: string): Promise<GooglePlace[]> {
+    const response = await this.fetchGoogle('https://places.googleapis.com/v1/places:searchText', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': apiKey,
+        'X-Goog-FieldMask': 'places.displayName,places.formattedAddress,places.location,places.addressComponents',
+      },
+      body: JSON.stringify({
+        textQuery: query,
+        languageCode: 'en',
+        pageSize: 20,
+        ...(country ? { regionCode: country } : {}),
+      }),
+    });
+    if (!response.ok) throw new Error(`Google Places API returned HTTP ${response.status}`);
+    const data = await response.json();
+    return Array.isArray(data.places) ? data.places : [];
+  }
+
+  private static resultFromPlace(place: GooglePlace, fallbackCity = ''): GeocodeResult {
+    const lat = place.location?.latitude;
+    const lng = place.location?.longitude;
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return this.emptyResult();
+    return {
+      lat: lat as number,
+      lng: lng as number,
+      formattedAddress: place.formattedAddress || null,
+      city: this.googlePlaceCity(place) || this.cleanCityName(fallbackCity) || null,
+      neighborhood: this.googlePlaceNeighborhood(place),
+    };
+  }
+
+  private static async geocodeAddress(query: string, apiKey: string): Promise<GoogleGeocodeResult[]> {
+    const params = new URLSearchParams({ address: query, key: apiKey, language: 'en' });
+    const response = await this.fetchGoogle(`https://maps.googleapis.com/maps/api/geocode/json?${params}`);
+    if (!response.ok) throw new Error(`Google Geocoding API returned HTTP ${response.status}`);
+    const data = await response.json();
+    if (data.status !== 'OK' && data.status !== 'ZERO_RESULTS') {
+      throw new Error(`Google Geocoding API returned ${data.status || 'an unknown status'}`);
+    }
+    return data.status === 'OK' && Array.isArray(data.results) ? data.results : [];
+  }
+
+  private static geocodeResultFromAddress(result: GoogleGeocodeResult, fallbackCity: string): GeocodeResult {
+    const lat = result.geometry?.location?.lat;
+    const lng = result.geometry?.location?.lng;
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return this.emptyResult();
+    const components = result.address_components || [];
+    const read = (types: string[]) => components.find((item) => item.types?.some((type) => types.includes(type)))?.long_name || null;
+    return {
+      lat: lat as number,
+      lng: lng as number,
+      formattedAddress: result.formatted_address || null,
+      city: this.cleanCityName(read(['locality', 'postal_town', 'administrative_area_level_3']) || fallbackCity) || null,
+      neighborhood: read(['neighborhood', 'sublocality_level_2']),
+    };
+  }
+
+  static sanitizeSourceAddress(value: string | null | undefined): string {
+    const address = (value || '').trim().replace(/\s+/g, ' ');
+    if (!/^\d{1,6}\s+\S+/.test(address)) return '';
+    // List headings such as "5 cozy restaurants" are commonly mangled by OCR
+    // into a fake address like "5 cozy Street". Never use them to constrain a
+    // provider lookup or satisfy the persistence address gate.
+    if (/^\d{1,6}\s+(?:cozy|best|top|great|favorite|popular|new|nice|amazing|restaurants?|cafes?|bars?|places?|spots?)\b/i.test(address)) {
+      return '';
+    }
+    return address;
+  }
+
+  static async geocodePlace(name: string, city: string, address?: string, neighborhood?: string): Promise<GeocodeResult> {
+    const apiKey = this.apiKey();
+    if (!apiKey) {
+      console.warn('[Geocoding] GOOGLE_MAPS_API_KEY is not configured.');
+      return this.emptyResult();
+    }
+
     const cleanName = name.trim();
-    const cleanAddress = address?.trim() || '';
+    const suppliedAddress = address?.trim() || '';
+    const cleanAddress = this.sanitizeSourceAddress(suppliedAddress);
+    if (suppliedAddress && !cleanAddress) {
+      console.warn(`[Geocoding] Ignoring non-address source text for "${name}": "${suppliedAddress}".`);
+    }
     const cleanNeighborhood = neighborhood?.trim() || '';
     let cityInfo = this.cityInfo(city);
-
-    // Street numbers without a city are globally ambiguous ("140 N 2nd St" exists
-    // in many towns). Prefer detecting city from the address string itself before
-    // refusing the lookup — never accept a random out-of-context match.
-    if (!cityInfo.name && cleanAddress) {
-      const detected = this.detectCityFromText(cleanAddress);
-      if (detected) cityInfo = this.cityInfo(detected);
-    }
+    if (!cityInfo.name && cleanAddress) cityInfo = this.cityInfo(this.detectCityFromText(cleanAddress));
     if (!cityInfo.name && (cleanName || cleanNeighborhood)) {
-      const detected = this.detectCityFromText([cleanName, cleanNeighborhood].filter(Boolean).join(' '));
-      if (detected) cityInfo = this.cityInfo(detected);
+      cityInfo = this.cityInfo(this.detectCityFromText([cleanName, cleanNeighborhood].filter(Boolean).join(' ')));
     }
-
-    if (!cleanName && !cleanAddress && !cityInfo.name && !cleanNeighborhood) {
+    if (!cleanName && !cleanAddress && !cityInfo.name && !cleanNeighborhood) return this.emptyResult();
+    if (cleanAddress && !cityInfo.name) {
+      console.warn(`[Geocoding] Refusing street-address lookup without city for "${cleanAddress}".`);
       return this.emptyResult();
     }
 
-    if (!cityInfo.name && !cleanAddress) {
-      if (!mapboxToken || mapboxToken === 'your-mapbox-token') {
+    const query = [cleanName, cleanAddress, cleanNeighborhood, cityInfo.name].filter(Boolean).join(', ').slice(0, 256);
+    try {
+      // Preserve the prior city-only behavior without treating an arbitrary
+      // Places text-search result as a city centre.
+      if (!cleanName && !cleanAddress && cityInfo.name) {
+        const cityResults = await this.geocodeAddress(cityInfo.name, apiKey);
+        const cityMatch = cityResults.find((result) =>
+          this.cityMatches(cityInfo.name, [], result.formatted_address || '')
+        );
+        if (cityMatch) return this.geocodeResultFromAddress(cityMatch, cityInfo.name);
+      }
+
+      console.log(`[Geocoding] Trying Google Places text search for: "${query}"`);
+      const places = await this.textSearch(query, apiKey, cityInfo.country);
+      const matches = places.filter((place) => {
+        const resultName = place.displayName?.text || '';
+        const resultAddress = place.formattedAddress || '';
+        const coordinates = place.location;
+        const expectedCountryMatches = !cityInfo.country || !this.googlePlaceCountry(place) || this.googlePlaceCountry(place) === cityInfo.country;
+        const neighborhoodMatches = !cleanNeighborhood || !this.googlePlaceNeighborhood(place) ||
+          this.contextNamesMatch(cleanNeighborhood, [this.googlePlaceNeighborhood(place) || '']);
+        const identityMatches = cleanName
+          ? this.namesMatch(cleanName, resultName) || (!!cleanAddress && this.addressesMatch(cleanAddress, [resultAddress]))
+          : cleanAddress
+            ? this.addressesMatch(cleanAddress, [resultAddress])
+            : true;
+        return !!coordinates && Number.isFinite(coordinates.latitude) && Number.isFinite(coordinates.longitude) &&
+          expectedCountryMatches && identityMatches &&
+          neighborhoodMatches &&
+          this.addressesMatch(cleanAddress, [resultAddress, resultName]) &&
+          this.cityMatches(cityInfo.name, [this.googlePlaceCity(place) || ''], resultAddress);
+      });
+
+      if (!cityInfo.name && !cleanAddress) {
+        const exactMatches = matches.filter((place) => this.namesExactlyMatch(cleanName, place.displayName?.text || ''));
+        const unique = new Map(exactMatches.map((place) => {
+          const location = place.location!;
+          return [`${location.latitude},${location.longitude}`, place];
+        }));
+        if (unique.size === 1) return this.resultFromPlace([...unique.values()][0]);
+        console.warn(`[Geocoding] Name-only Google result for "${cleanName}" is ambiguous.`);
         return this.emptyResult();
       }
-      return this.findUniquePoiByName(cleanName, mapboxToken);
-    }
 
-    if (cleanAddress && !cityInfo.name) {
-      console.warn(
-        `[Geocoding] Refusing street-address lookup without city for "${cleanAddress}" — ` +
-        'ambiguous across many towns.'
-      );
-      return this.emptyResult();
-    }
-
-    const query = [cleanName, cleanAddress, cleanNeighborhood, cityInfo.name]
-      .filter(Boolean)
-      .join(', ')
-      .slice(0, 256);
-    const types = cleanName || cleanAddress ? 'poi,address' : 'city,place,locality';
-
-    if (mapboxToken && mapboxToken !== 'your-mapbox-token') {
-      try {
-        const params = new URLSearchParams({
-          q: query,
-          access_token: mapboxToken,
-          language: 'en',
-          limit: '5',
-          types,
-          auto_complete: 'false',
-        });
-        const near = [cleanNeighborhood, cityInfo.name].filter(Boolean).join(', ');
-        if (near) params.set('near', near);
-        if (cityInfo.country) params.set('country', cityInfo.country);
-
-        console.log(`[Geocoding] Trying Mapbox Search Box for: "${query}"`);
-        const res = await fetch(`https://api.mapbox.com/search/searchbox/v1/forward?${params}`);
-        if (!res.ok) throw new Error(`Mapbox returned HTTP ${res.status}`);
-        const data = await res.json();
-
-        const match = (data.features || []).find((feature: any) => {
-          const properties = feature.properties || {};
-          const context = properties.context || {};
-          const coordinates = this.coordinatesFromFeature(feature);
-          if (!coordinates) return false;
-
-          const candidateCities = [
-            this.mapboxCity(properties),
-            context.region?.name,
-          ].filter((value): value is string => typeof value === 'string' && value.length > 0);
-          const candidateNeighborhoods = [
-            this.mapboxNeighborhood(properties),
-            context.neighborhood?.name,
-          ].filter((value): value is string => typeof value === 'string' && value.length > 0);
-          const candidateAddresses = [
-            properties.full_address,
-            properties.address,
-            properties.place_formatted,
-            properties.name,
-          ].filter((value): value is string => typeof value === 'string' && value.length > 0);
-          const countryMatches = !cityInfo.country ||
-            !context.country?.country_code ||
-            context.country.country_code.toUpperCase() === cityInfo.country;
-
-          // Primary: structured context fields. Fallback: city name appears
-          // anywhere in the full_address or place_formatted string.
-          const cityMatches = this.cityNamesMatch(cityInfo.name, candidateCities) ||
-            candidateAddresses.some(addr => this.addressContainsCity(addr, cityInfo.name));
-
-          const neighborhoodMatches = !cleanNeighborhood ||
-            candidateNeighborhoods.length === 0 ||
-            this.contextNamesMatch(cleanNeighborhood, candidateNeighborhoods);
-          const nameMatches = cleanName
-            ? this.namesMatch(cleanName, properties.name || '')
-            : true;
-          const addressMatches = this.addressesMatch(cleanAddress, candidateAddresses);
-          const isAddressFallback = properties.feature_type === 'address' && !!cleanAddress && addressMatches;
-          const identityMatches = cleanName
-            ? nameMatches || isAddressFallback
-            : cleanAddress
-              ? addressMatches
-              : this.namesMatch(cityInfo.name, properties.name || '');
-
-          return identityMatches && addressMatches && cityMatches && neighborhoodMatches && countryMatches;
-        });
-
-        if (match) {
-          const properties = match.properties;
-          const coordinates = this.coordinatesFromFeature(match);
-          if (!coordinates) return this.emptyResult();
-          const formattedAddress = properties.full_address ||
-            [properties.address, properties.place_formatted].filter(Boolean).join(', ') ||
-            null;
-          const resolvedNeighborhood = this.mapboxNeighborhood(properties);
-          const resolvedCity = this.mapboxCity(properties);
-
-          console.log(`[Geocoding] Mapbox verified match: ${formattedAddress} (${coordinates.lat}, ${coordinates.lng})`);
-          return {
-            lat: coordinates.lat,
-            lng: coordinates.lng,
-            formattedAddress,
-            neighborhood: resolvedNeighborhood,
-            city: resolvedCity,
-          };
-        }
-
-        console.warn(`[Geocoding] Mapbox returned no "${cityInfo.name}" match for: "${query}"`);
-
-        // Fallback: retry with address + city only (no POI name) — many small
-        // businesses aren't in Mapbox's POI DB but their street address is.
-        if (cleanAddress && cityInfo.name) {
-          const addressQuery = [cleanAddress, cleanNeighborhood, cityInfo.name].filter(Boolean).join(', ');
-          try {
-            const fallbackParams = new URLSearchParams({
-              q: addressQuery,
-              access_token: mapboxToken,
-              language: 'en',
-              limit: '3',
-              types: 'address,poi',
-              auto_complete: 'false',
-            });
-            if (cityInfo.country) fallbackParams.set('country', cityInfo.country);
-            console.log(`[Geocoding] Trying Mapbox address fallback for: "${addressQuery}"`);
-            const fallbackRes = await fetch(`https://api.mapbox.com/search/searchbox/v1/forward?${fallbackParams}`);
-            if (fallbackRes.ok) {
-              const fallbackData = await fallbackRes.json();
-              const fallbackMatch = (fallbackData.features || []).find((feature: any) => {
-                const coords = this.coordinatesFromFeature(feature);
-                if (!coords) return false;
-                const props = feature.properties || {};
-                const fAddresses = [props.full_address, props.address, props.place_formatted, props.name]
-                  .filter((v): v is string => typeof v === 'string' && v.length > 0);
-                return fAddresses.some(addr => this.addressContainsCity(addr, cityInfo.name));
-              });
-              if (fallbackMatch) {
-                const fbProps = fallbackMatch.properties || {};
-                const fbCoords = this.coordinatesFromFeature(fallbackMatch)!;
-                const fbAddress = fbProps.full_address ||
-                  [fbProps.address, fbProps.place_formatted].filter(Boolean).join(', ') || null;
-                console.log(`[Geocoding] Mapbox address fallback matched: ${fbAddress} (${fbCoords.lat}, ${fbCoords.lng})`);
-                return {
-                  lat: fbCoords.lat,
-                  lng: fbCoords.lng,
-                  formattedAddress: fbAddress,
-                  neighborhood: this.mapboxNeighborhood(fbProps),
-                  city: this.mapboxCity(fbProps) || cityInfo.name,
-                };
-              }
-            }
-          } catch (fbErr) {
-            console.error('[Geocoding] Mapbox address fallback failed:', fbErr);
-          }
-        }
-      } catch (err) {
-        console.error('[Geocoding] Mapbox Search Box failed:', err);
+      if (matches.length > 0) {
+        const match = matches[0];
+        const result = this.resultFromPlace(match, cityInfo.name);
+        console.log(`[Geocoding] Google Places verified match: ${result.formattedAddress} (${result.lat}, ${result.lng})`);
+        return result;
       }
 
-      // ── Mapbox Geocoding v5 (address resolution) ──────────────────────
-      // The Search Box API above is optimised for POI autocomplete.
-      // The v5 Geocoding API is better at resolving raw street addresses
-      // like "140 N. 2nd Street, Philadelphia" to exact coordinates.
-      if (cleanAddress || cleanName) {
-        try {
-          const v5Query = [cleanAddress || cleanName, cleanNeighborhood, cityInfo.name]
-            .filter(Boolean)
-            .join(', ');
-          const v5Params = new URLSearchParams({
-            access_token: mapboxToken,
-            language: 'en',
-            limit: '3',
-            types: cleanAddress ? 'address,poi' : 'poi,place',
-          });
-          if (cityInfo.country) v5Params.set('country', cityInfo.country);
-
-          console.log(`[Geocoding] Trying Mapbox Geocoding v5 for: "${v5Query}"`);
-          const v5Res = await fetch(
-            `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(v5Query)}.json?${v5Params}`
-          );
-          if (v5Res.ok) {
-            const v5Data = await v5Res.json();
-            const v5Match = (v5Data.features || []).find((feature: any) => {
-              const coords = feature.geometry?.coordinates;
-              if (!Array.isArray(coords) || !Number.isFinite(coords[0]) || !Number.isFinite(coords[1])) return false;
-              // Verify the result is in the expected city
-              const placeName = feature.place_name || feature.text || '';
-              const contextTexts = (feature.context || []).map((c: any) => c.text || '');
-              const allTexts = [placeName, ...contextTexts];
-              return !cityInfo.name || allTexts.some(t => this.addressContainsCity(t, cityInfo.name));
-            });
-            if (v5Match) {
-              const [v5Lng, v5Lat] = v5Match.geometry.coordinates;
-              const v5Address = v5Match.place_name || null;
-              const v5Neighborhood = (v5Match.context || []).find(
-                (c: any) => c.id?.startsWith('neighborhood') || c.id?.startsWith('locality')
-              )?.text || null;
-              const v5City = (v5Match.context || []).find(
-                (c: any) => c.id?.startsWith('place') || c.id?.startsWith('district')
-              )?.text || cityInfo.name;
-              console.log(`[Geocoding] Mapbox v5 matched: ${v5Address} (${v5Lat}, ${v5Lng})`);
-              return {
-                lat: v5Lat,
-                lng: v5Lng,
-                formattedAddress: v5Address,
-                neighborhood: v5Neighborhood,
-                city: v5City,
-              };
-            }
-            console.warn(`[Geocoding] Mapbox v5 returned no "${cityInfo.name}" match for: "${v5Query}"`);
-          }
-        } catch (v5Err) {
-          console.error('[Geocoding] Mapbox Geocoding v5 failed:', v5Err);
+      // Google Geocoding resolves source-provided street addresses even when a
+      // small venue is absent from the Places database.
+      if (cleanAddress && cityInfo.name) {
+        const addressQuery = [cleanAddress, cleanNeighborhood, cityInfo.name].filter(Boolean).join(', ');
+        const addressResults = await this.geocodeAddress(addressQuery, apiKey);
+        const addressMatch = addressResults.find((result) =>
+          this.cityMatches(cityInfo.name, [], result.formatted_address || '') &&
+          this.addressesMatch(cleanAddress, [result.formatted_address || ''])
+        );
+        if (addressMatch) {
+          const result = this.geocodeResultFromAddress(addressMatch, cityInfo.name);
+          console.log(`[Geocoding] Google address verified match: ${result.formattedAddress} (${result.lat}, ${result.lng})`);
+          return result;
         }
       }
+    } catch (error) {
+      console.error('[Geocoding] Google Maps lookup failed:', error);
     }
 
-    // ── Google Places (last resort) ──────────────────────────────────────
-    if (googleApiKey && googleApiKey !== 'your-google-places-api-key') {
-      try {
-        const params = new URLSearchParams({ query, key: googleApiKey });
-        console.log(`[Geocoding] Trying Google Places text search for: "${query}"`);
-        const res = await fetch(`https://maps.googleapis.com/maps/api/place/textsearch/json?${params}`);
-        if (!res.ok) throw new Error(`Google returned HTTP ${res.status}`);
-        const data = await res.json();
-
-        const match = (data.results || []).find((result: any) => {
-          const resultAddress = result.formatted_address || '';
-          const nameMatches = cleanName
-            ? this.namesMatch(cleanName, result.name || '')
-            : cleanAddress
-              ? true
-              : this.namesMatch(cityInfo.name, result.name || '');
-          return nameMatches &&
-            this.addressesMatch(cleanAddress, [resultAddress, result.name || '']) &&
-            this.addressContainsCity(resultAddress, cityInfo.name);
-        });
-
-        if (match) {
-          const { lat, lng } = match.geometry.location;
-          if (!Number.isFinite(lat) || !Number.isFinite(lng)) return this.emptyResult();
-          const neighborhood = await this.getNeighborhood(lat, lng);
-          console.log(`[Geocoding] Google verified match: ${match.formatted_address} (${lat}, ${lng})`);
-          return {
-            lat,
-            lng,
-            formattedAddress: match.formatted_address || null,
-            neighborhood: neighborhood || null,
-            city: cityInfo.name || null,
-          };
-        }
-
-        console.warn(`[Geocoding] Google returned no "${cityInfo.name}" match for: "${query}"`);
-      } catch (err) {
-        console.error('[Geocoding] Google Places search failed:', err);
-      }
-    }
-
-    console.warn(`[Geocoding] No verified result for "${query}"; refusing a conflicting location.`);
+    console.warn(`[Geocoding] No verified Google result for "${query}".`);
     return this.emptyResult();
   }
 
   static async getNeighborhood(lat: number, lng: number): Promise<string> {
-    const mapboxToken = process.env.MAPBOX_ACCESS_TOKEN || process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
-    const googleApiKey = process.env.GOOGLE_PLACES_API_KEY;
-
-    if (mapboxToken && mapboxToken !== 'your-mapbox-token') {
-      try {
-        const params = new URLSearchParams({
-          access_token: mapboxToken,
-          types: 'neighborhood,locality',
-        });
-        const res = await fetch(
-          `https://api.mapbox.com/geocoding/v5/mapbox.places/${lng},${lat}.json?${params}`
-        );
-        if (!res.ok) throw new Error(`Mapbox returned HTTP ${res.status}`);
-        const data = await res.json();
-        const neighborhood = (data.features || []).find(
-          (feature: any) => feature.place_type?.includes('neighborhood')
-        );
-        return neighborhood?.text || data.features?.[0]?.text || '';
-      } catch (err) {
-        console.error('[Reverse Geocoding] Mapbox failed:', err);
-      }
-    }
-
-    if (googleApiKey && googleApiKey !== 'your-google-places-api-key') {
-      try {
-        const params = new URLSearchParams({
-          latlng: `${lat},${lng}`,
-          key: googleApiKey,
-        });
-        const res = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?${params}`);
-        if (!res.ok) throw new Error(`Google returned HTTP ${res.status}`);
-        const data = await res.json();
-
-        for (const result of data.results || []) {
-          for (const component of result.address_components || []) {
-            if (component.types.includes('neighborhood') || component.types.includes('sublocality')) {
-              return component.long_name;
-            }
+    const apiKey = this.apiKey();
+    if (!apiKey) return '';
+    try {
+      const params = new URLSearchParams({ latlng: `${lat},${lng}`, key: apiKey, language: 'en' });
+      const response = await this.fetchGoogle(`https://maps.googleapis.com/maps/api/geocode/json?${params}`);
+      if (!response.ok) throw new Error(`Google Geocoding API returned HTTP ${response.status}`);
+      const data = await response.json();
+      for (const result of data.results || []) {
+        for (const component of result.address_components || []) {
+          if (component.types?.includes('neighborhood') || component.types?.includes('sublocality_level_2')) {
+            return component.long_name || '';
           }
         }
-      } catch (err) {
-        console.error('[Reverse Geocoding] Google failed:', err);
       }
+    } catch (error) {
+      console.error('[Reverse Geocoding] Google failed:', error);
     }
-
     return '';
   }
 }

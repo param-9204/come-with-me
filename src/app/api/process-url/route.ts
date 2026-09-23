@@ -468,23 +468,57 @@ export async function POST(request: Request) {
         mentions: cachedContent.mentions,
       };
 
-      return NextResponse.json({
-        success: true,
-        partial: Boolean(partialError),
-        error: partialError ? partialResultMessage(places.length) : null,
-        socialPostId: existingPost.id,
-        data: responseData,
-        rawApifyData: existingPost.raw_apify_data || null,
-        places,
-        place: firstPlace,
-        place_id: firstPlace?.id || firstPlace?.place_id || null,
-        placeIds: responsePlaceIds(places),
-        aiAnalysis: existingPost.ai_analysis || null,
-        transcript: existingPost.whisper_transcript || null,
-        scrapedData: cachedContent,
-        ocrComparison: ocrComparisonFromStoredPost(existingPost),
-        audioUpload: null,
-      });
+      // Re-run only legacy video records that completed before GPT Vision
+      // evidence was stored and still contain an unresolved saved place. This
+      // repairs historical partial results once without reprocessing healthy
+      // cached posts on every request.
+      const hasNoStoredVisionFrames = !Array.isArray(existingPost.ocr_frames_gpt) || existingPost.ocr_frames_gpt.length === 0;
+      const hasUnresolvedSavedPlace = savedPlaces.length === 0 || savedPlaces.some((place: any) =>
+        place.latitude === null || place.longitude === null || !String(place.address || '').trim()
+      );
+      const storedOcrTexts = Array.isArray(existingPost.ocr_frames_apify)
+        ? existingPost.ocr_frames_apify.flatMap((frame: any) => Array.isArray(frame?.texts) ? frame.texts : [])
+        : [];
+      const sourceAddressCount = AiEnrichmentService.countDistinctSourceAddresses(storedOcrTexts);
+      const hasIncompleteAddressBackedList = sourceAddressCount >= 2 && savedPlaces.length < sourceAddressCount;
+      const needsLegacyVideoRecovery =
+        (cachedContent.contentType === 'video' && hasNoStoredVisionFrames && hasUnresolvedSavedPlace) ||
+        hasIncompleteAddressBackedList;
+
+      if (needsLegacyVideoRecovery) {
+        console.warn(
+          `[process-url] Reprocessing incomplete cached post ${existingPost.id} ` +
+          `(saved=${savedPlaces.length}, source-addresses=${sourceAddressCount}).`
+        );
+        const { error: retryError } = await supabaseAdmin
+          .from('social_posts')
+          .update({ status: 'pending', error_message: null })
+          .eq('id', existingPost.id);
+        if (retryError) {
+          console.warn('[process-url] Unable to mark legacy post for recovery:', retryError.message);
+        } else {
+          // Fall through to the normal pipeline using the existing post ID.
+          // The cache returns normally on every later request once recovery succeeds.
+        }
+      } else {
+        return NextResponse.json({
+          success: true,
+          partial: Boolean(partialError),
+          error: partialError ? partialResultMessage(places.length) : null,
+          socialPostId: existingPost.id,
+          data: responseData,
+          rawApifyData: existingPost.raw_apify_data || null,
+          places,
+          place: firstPlace,
+          place_id: firstPlace?.id || firstPlace?.place_id || null,
+          placeIds: responsePlaceIds(places),
+          aiAnalysis: existingPost.ai_analysis || null,
+          transcript: existingPost.whisper_transcript || null,
+          scrapedData: cachedContent,
+          ocrComparison: ocrComparisonFromStoredPost(existingPost),
+          audioUpload: null,
+        });
+      }
     }
 
     // Setup temporary placeholder
