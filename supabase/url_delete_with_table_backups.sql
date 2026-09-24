@@ -14,6 +14,7 @@
 --   https://www.instagram.com/p/DdTxlgtuF4j/
 --   https://www.tiktok.com/t/ZTUKd6ATb/
 
+
 CREATE TABLE IF NOT EXISTS public.url_deletion_backups (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   data jsonb,
