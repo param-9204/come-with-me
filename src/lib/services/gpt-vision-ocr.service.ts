@@ -1,6 +1,7 @@
 import fs from 'fs';
-import { executeAICall } from './ai-client';
+import { executeAICall, gptVisionModel } from './ai-client';
 import { plog } from './pipeline-log';
+import { chatUsage } from './usage-cost';
 import type { GptVisionFrameResult, VideoFrame } from '../types/social';
 
 const FRAME_SYSTEM_PROMPT = `Read every visible text string in this TikTok video frame. Focus on venue names, addresses, neighborhood/city text, list numbering, handles, and labels. Do not infer text that is not visible. Return JSON with: {"texts":string[],"brands":string[],"locations":string[],"prices":string[],"cta":string[],"description":string,"confidence":number}.`;
@@ -26,7 +27,7 @@ export class GptVisionOcrService {
   static async analyzeFrame(frame: VideoFrame): Promise<GptVisionFrameResult> {
     try {
       const image = fs.readFileSync(frame.colorFilePath || frame.filePath).toString('base64');
-      return await executeAICall('vision', async ({ client, model }) => {
+      return await executeAICall('vision', async ({ client, model, reportUsage }) => {
         const response = await client.chat.completions.create({
           model,
           messages: [
@@ -45,6 +46,7 @@ export class GptVisionOcrService {
           response_format: { type: 'json_object' },
           max_tokens: 700,
         });
+        reportUsage?.(chatUsage(response));
         const result = JSON.parse(response.choices[0]?.message?.content || '{}');
         return {
           frameIndex: frame.frameIndex,
@@ -58,7 +60,7 @@ export class GptVisionOcrService {
           confidence: typeof result.confidence === 'number' ? result.confidence : 0,
           method: 'gpt-4o-vision',
         };
-      });
+      }, { operation: 'vision_ocr', images: 1 });
     } catch (error: any) {
       plog('vision', `GPT vision frame ${frame.frameIndex} failed`, { error: error.message || String(error) }, 'warn');
       return this.emptyResult(frame);
@@ -66,6 +68,7 @@ export class GptVisionOcrService {
   }
 
   static async extractTextFromFrames(frames: VideoFrame[]): Promise<GptVisionFrameResult[]> {
+    if (!gptVisionModel()) return [];
     const results: GptVisionFrameResult[] = [];
     for (const frame of frames) {
       results.push(await this.analyzeFrame(frame));
@@ -75,7 +78,7 @@ export class GptVisionOcrService {
 
   /** One request for up to 4 images. Returns null texts when the answer was cut off or unreadable. */
   private static async readBatch(batch: VideoFrame[], tokensPerImage: number): Promise<{ texts: string[][] | null; truncated: boolean }> {
-    return executeAICall('vision', async ({ client, model }) => {
+    return executeAICall('vision', async ({ client, model, reportUsage }) => {
       const response = await client.chat.completions.create({
         model,
         messages: [
@@ -99,6 +102,7 @@ export class GptVisionOcrService {
         max_completion_tokens: tokensPerImage * batch.length,
       });
       const choice = response.choices[0];
+      reportUsage?.(chatUsage(response));
       const truncated = choice?.finish_reason === 'length';
       plog('vision', 'GPT vision batch', {
         model,
@@ -117,7 +121,7 @@ export class GptVisionOcrService {
         (Array.isArray(parsed.images) ? parsed.images : []).map((item: any) => [Number(item?.index), item])
       );
       return { texts: batch.map((_, index) => cleanStrings(byIndex.get(index)?.texts)), truncated };
-    });
+    }, { operation: 'vision_ocr', images: batch.length });
   }
 
   /**
@@ -126,6 +130,10 @@ export class GptVisionOcrService {
    * is re-read one image at a time with a larger budget rather than lost.
    */
   static async extractTextFromFramesBatched(frames: VideoFrame[], perRequest = 4): Promise<GptVisionFrameResult[]> {
+    if (!gptVisionModel()) {
+      plog('vision', 'GPT vision skipped (USE_GPT_VISION_MODEL not set)', { frames: frames.length });
+      return [];
+    }
     const results: GptVisionFrameResult[] = [];
     const toResult = (frame: VideoFrame, texts: string[]) => ({ ...this.emptyResult(frame), texts });
     for (let offset = 0; offset < frames.length; offset += perRequest) {

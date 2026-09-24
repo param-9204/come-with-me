@@ -8,9 +8,12 @@ import { VideoFrameService } from './video-frame.service';
 import { ApifyOcrService } from './apify-ocr.service';
 import { GoogleVisionOcrService, GoogleVisionUnavailableError } from './google-vision-ocr.service';
 import { GptVisionOcrService } from './gpt-vision-ocr.service';
+import { GlmOcrService, GlmOcrUnavailableError } from './glm-ocr.service';
+import { PaddleOcrService } from './paddle-ocr.service';
+import { gptVisionModel } from './ai-client';
 import { WhisperService } from './whisper.service';
 import { S3Service } from './s3.service';
-import { errorMessage, plog } from './pipeline-log';
+import { errorMessage, patchRun, plog, startStage, stageStatus } from './pipeline-log';
 import { hasLocationMarker } from './place-evidence.service';
 import type {
   ApifyOcrFrameResult, GptVisionFrameResult, PipelineStep, SocialContent,
@@ -34,7 +37,25 @@ export interface MediaEvidenceResult {
   steps: PipelineStep[];
 }
 
-type FallbackProvider = 'google' | 'openai' | 'off';
+/**
+ * OCR steps, in the order set by OCR_ORDER in .env (default: glm, paddle,
+ * google, gpt, tesseract). A step runs only when it is listed and configured:
+ * - glm: Z.ai OCR, needs ZAI_API_KEY
+ * - paddle: local PaddleOCR, free
+ * - tesseract: local, always available; last resort by default
+ * - google: Cloud Vision, needs a Google key with the API and billing enabled
+ * - gpt: GPT vision, needs USE_GPT_VISION_MODEL and OPENAI_API_KEY
+ */
+export type OcrStep = 'glm' | 'paddle' | 'tesseract' | 'google' | 'gpt';
+const DEFAULT_OCR_ORDER: OcrStep[] = ['glm', 'paddle', 'google', 'gpt', 'tesseract'];
+const LOCAL_STEPS: OcrStep[] = ['paddle', 'tesseract'];
+const OCR_STEP_ALIASES: Record<string, OcrStep> = {
+  glm: 'glm', 'glm-ocr': 'glm', zai: 'glm',
+  paddle: 'paddle', paddleocr: 'paddle',
+  tesseract: 'tesseract', local: 'tesseract',
+  google: 'google', 'google-vision': 'google', 'cloud-vision': 'google',
+  gpt: 'gpt', 'gpt-vision': 'gpt', openai: 'gpt',
+};
 
 // No page / frame caps by default: every carousel slide, every carousel video
 // and every qualifying frame is processed (a 12-slide post listed all 24 of its
@@ -131,16 +152,34 @@ export function selectFramesForPlaceIntent(content: SocialContent, ocrFrames: Ap
   return ocrFrames.map((frame) => frame.frameIndex).sort((a, b) => a - b);
 }
 
-export function resolveFallbackProvider(): FallbackProvider {
-  const configured = (process.env.OCR_FALLBACK_PROVIDER || '').trim().toLowerCase();
-  if (configured === 'off' || configured === 'none') return 'off';
-  const hasOpenAi = !!process.env.OPENAI_API_KEY?.trim();
-  if (configured === 'openai') return hasOpenAi ? 'openai' : 'off';
-  if (configured === 'google' || !configured) {
-    if (GoogleVisionOcrService.isConfigured()) return 'google';
-    return hasOpenAi ? 'openai' : 'off';
-  }
-  return 'off';
+/** GPT vision runs only when USE_GPT_VISION_MODEL names a model and an OpenAI key exists. */
+function gptVisionAllowed(): boolean {
+  return !!gptVisionModel() && !!process.env.OPENAI_API_KEY?.trim();
+}
+
+export function ocrOrder(): OcrStep[] {
+  const configured = process.env.OCR_ORDER?.trim();
+  if (!configured) return [...DEFAULT_OCR_ORDER];
+  const steps = configured.toLowerCase().split(/[\s,>]+/).map((name) => OCR_STEP_ALIASES[name]).filter(Boolean);
+  return [...new Set(steps)];
+}
+
+export function ocrStepAvailable(step: OcrStep): boolean {
+  if (step === 'glm') return GlmOcrService.isConfigured();
+  if (step === 'google') return GoogleVisionOcrService.isConfigured();
+  if (step === 'gpt') return gptVisionAllowed();
+  return true;
+}
+
+/** Vision steps listed after the first local step: they only see frames local OCR could not settle. */
+function stepsAfterLocalOcr(order: OcrStep[] = ocrOrder()): OcrStep[] {
+  const index = order.findIndex((step) => LOCAL_STEPS.includes(step));
+  return index < 0 ? [] : order.slice(index + 1).filter((step) => !LOCAL_STEPS.includes(step));
+}
+
+/** Which local engine read a frame (Paddle results are tagged in rawResult). */
+function localEngine(frame: ApifyOcrFrameResult): 'paddle' | 'tesseract' {
+  return (frame.rawResult as { engine?: string } | null)?.engine === 'paddle' ? 'paddle' : 'tesseract';
 }
 
 export function pickSubtitleTrack(tracks: SubtitleTrack[] | undefined, captionLanguage?: string | null): SubtitleTrack | null {
@@ -286,18 +325,27 @@ export class MediaEvidenceService {
       // Videos: download once, then frames + audio + subtitles in parallel.
       const videoItems = items.filter((item) => item.kind === 'video');
       for (const item of videoItems) {
+        const endDownload = startStage('media_download', 'video');
         const videoPath = await MediaService.downloadVideo(item.url).catch((error: unknown) => {
           plog('media', 'Video download failed (non-fatal)', { error: errorMessage(error) }, 'warn');
+          endDownload('failed', { itemsIn: 1, itemsOut: 0, error: errorMessage(error) });
           return null;
         });
         if (!videoPath) continue;
+        endDownload('success', { itemsIn: 1, itemsOut: 1 });
         cleanupFiles.push(videoPath);
 
         const subtitlesPromise = singleVideo ? fetchSubtitleTranscript(content) : Promise.resolve(null);
+        const endFrames = startStage('frames', 'ffmpeg');
         const [videoFrames, audioPath, subtitles] = await Promise.all([
           VideoFrameService.extractKeyFrames(videoPath)
+            .then((extracted) => {
+              endFrames(extracted.length ? 'success' : 'failed', { itemsIn: 1, itemsOut: extracted.length });
+              return extracted;
+            })
             .catch((error: unknown) => {
               plog('frames', 'Frame extraction failed (non-fatal)', { error: errorMessage(error) }, 'warn');
+              endFrames('failed', { itemsIn: 1, itemsOut: 0, error: errorMessage(error) });
               return [] as VideoFrame[];
             }),
           MediaService.extractAudio(videoPath).catch(() => ''),
@@ -311,10 +359,23 @@ export class MediaEvidenceService {
 
         let transcript = subtitles;
         if (!transcript && audioPath) {
+          const endWhisper = startStage('transcript', 'whisper');
           transcript = await WhisperService.transcribe(audioPath).catch((error: unknown) => {
             plog('transcript', 'Whisper failed (non-fatal)', { error: errorMessage(error) }, 'warn');
+            endWhisper('failed', { itemsIn: 1, itemsOut: 0, error: errorMessage(error) });
             return null;
           });
+          if (transcript) {
+            endWhisper(transcript.text ? 'success' : 'partial', {
+              itemsIn: 1,
+              itemsOut: transcript.segments.length,
+              details: { language: transcript.language, dropped: transcript.droppedSegments },
+            });
+          }
+        } else if (transcript) {
+          startStage('transcript', 'platform-subtitles')('success', { itemsIn: 1, itemsOut: transcript.segments.length, details: { language: transcript.language } });
+        } else if (!audioPath) {
+          startStage('transcript', null)('skipped', { itemsIn: 0, itemsOut: 0, details: { reason: 'no audio track extracted' } });
         }
         if (transcript) transcripts.push(transcript);
         if (persistAudio && audioPath && !audioUpload) audioUpload = await persistAudioUpload(audioPath);
@@ -323,6 +384,7 @@ export class MediaEvidenceService {
 
       // Images (carousel slides / single post).
       const imageItems = items.filter((item) => item.kind === 'image');
+      const endImages = imageItems.length ? startStage('media_download', 'image') : null;
       const imageFrames = await Promise.all(imageItems.map(async (item) => {
         try {
           const filePath = await MediaService.downloadImage(item.url);
@@ -334,6 +396,8 @@ export class MediaEvidenceService {
           return null;
         }
       }));
+      const downloadedImages = imageFrames.filter(Boolean).length;
+      endImages?.(stageStatus(imageItems.length, downloadedImages), { itemsIn: imageItems.length, itemsOut: downloadedImages });
       const imageFrameIndexes: number[] = [];
       for (const frame of imageFrames) {
         if (!frame) continue;
@@ -342,20 +406,8 @@ export class MediaEvidenceService {
       }
       if (!frameNote) frameNote = `${frames.length} image/frame(s)`;
 
-      // Local OCR on everything; paid OCR only on frames it could not read.
       if (frames.length > 0) {
-        ocrFrames = await ApifyOcrService.extractTextFromFrames(frames, false, frames.length).catch((error: unknown) => {
-          plog('ocr', 'Local OCR failed (non-fatal)', { error: errorMessage(error) }, 'warn');
-          return [] as ApifyOcrFrameResult[];
-        });
-        plog('ocr', 'Local OCR results', {
-          frames: ocrFrames.map((frame) => ({
-            t: Math.round(frame.timestamp * 10) / 10,
-            lines: (frame.lines || []).map((line) => `${line.text} (${line.confidence})`),
-            words: frame.wordStats,
-          })),
-        });
-        visionFrames = await this.runVisionFallback(frames, ocrFrames, content, imageFrameIndexes);
+        ({ ocrFrames, visionFrames } = await this.runOcrChain(frames, content, imageFrameIndexes));
       }
     } finally {
       for (const set of cleanupFrameSets) VideoFrameService.cleanupFrames(set);
@@ -363,7 +415,9 @@ export class MediaEvidenceService {
     }
 
     const transcript = mergeTranscripts(transcripts);
-    const hardFrames = visionFrames.length;
+    const readers = [
+      ...new Set([...ocrFrames.map(localEngine), ...visionFrames.map((frame) => frame.method)]),
+    ];
     plog('transcript', transcript ? 'Transcript' : 'No transcript', transcript ? {
       source: transcript.source,
       language: transcript.language,
@@ -371,7 +425,14 @@ export class MediaEvidenceService {
       dropped: transcript.droppedSegments,
       text: transcript.text.slice(0, 500),
     } : undefined);
-    plog('media', 'Media done', { frames: frames.length, ocrFrames: ocrFrames.length, visionFrames: visionFrames.length, audioUploaded: !!audioUpload });
+    plog('media', 'Media done', { frames: frames.length, ocrFrames: ocrFrames.length, visionFrames: visionFrames.length, readers, audioUploaded: !!audioUpload });
+    patchRun({
+      media_items: items.length,
+      ocr_frames: ocrFrames.length,
+      vision_frames: visionFrames.length,
+      transcript_source: transcript?.source || 'none',
+      transcript_language: transcript?.language || null,
+    });
     const steps: PipelineStep[] = [
       {
         step: 2,
@@ -389,7 +450,7 @@ export class MediaEvidenceService {
         status: frames.length ? 'success' : 'skipped',
         durationMs: Date.now() - ocrStart - transcriptMs,
         details: frames.length
-          ? `${frameNote} · local OCR` + (hardFrames ? ` · ${hardFrames} hard frame(s) → ${visionFrames[0]?.method}` : '')
+          ? `${frameNote} · ${readers.join(' → ') || 'no OCR'}`
           : 'No media to OCR',
       },
     ];
@@ -405,19 +466,125 @@ export class MediaEvidenceService {
   }
 
   /**
-   * Vision OCR selection:
-   * - video frames Tesseract could not read, and list posts with no names in the text;
-   * - every image slide (carousels / photo posts). Slides are the content of a
-   *   guide post (Instagram allows up to 20); measured on a real 10-slide NYC
-   *   guide, Tesseract read none of the small 📍 list text on most slides.
+   * Run the OCR steps in OCR_ORDER, one frame set at a time:
+   * - every step reads the frames no earlier step could read (errors,
+   *   overload, no balance, not configured);
+   * - after the first local step (paddle/tesseract), vision steps also get the
+   *   frames the escalation rules pick from its text: carousel slides, frames
+   *   it could not read confidently, and list posts whose places the text does
+   *   not name;
+   * - a local step listed after the vision steps (default: tesseract) is the
+   *   last resort for frames nothing else read.
    */
-  static async runVisionFallback(
+  static async runOcrChain(
+    frames: VideoFrame[],
+    content: SocialContent,
+    imageFrameIndexes: number[]
+  ): Promise<{ ocrFrames: ApifyOcrFrameResult[]; visionFrames: GptVisionFrameResult[] }> {
+    const order = ocrOrder();
+    plog('ocr', 'OCR order', {
+      order,
+      available: Object.fromEntries(order.map((step) => [step, ocrStepAvailable(step)])),
+    });
+    const ocrFrames: ApifyOcrFrameResult[] = [];
+    const visionFrames: GptVisionFrameResult[] = [];
+    let unread = frames;
+    // Frames local OCR read that should still get a vision read.
+    let escalated: VideoFrame[] = [];
+    let localDone = false;
+
+    for (let i = 0; i < order.length; i++) {
+      const step = order[i];
+      if (LOCAL_STEPS.includes(step)) {
+        if (unread.length === 0) continue;
+        const read = await this.readLocal(step, unread);
+        ocrFrames.push(...read.results);
+        const readIndexes = new Set(read.results.map((frame) => frame.frameIndex));
+        const readFrames = unread.filter((frame) => readIndexes.has(frame.frameIndex));
+        unread = read.failed;
+        if (!localDone && read.results.length > 0) {
+          localDone = true;
+          const laterVision = order.slice(i + 1).filter((later) => !LOCAL_STEPS.includes(later) && ocrStepAvailable(later));
+          escalated = this.selectForVision(readFrames, read.results, content, imageFrameIndexes.filter((index) => readIndexes.has(index)), laterVision);
+        }
+        continue;
+      }
+      const targets = [...unread, ...escalated].sort((a, b) => a.frameIndex - b.frameIndex);
+      if (targets.length === 0) continue;
+      const read = await this.readWith(step, targets);
+      visionFrames.push(...read.results);
+      const done = new Set(read.results.map((frame) => frame.frameIndex));
+      unread = unread.filter((frame) => !done.has(frame.frameIndex));
+      escalated = escalated.filter((frame) => !done.has(frame.frameIndex));
+    }
+
+    if (unread.length) plog('ocr', 'No OCR step could read some frames', { frames: unread.length, at: unread.map((frame) => frame.timestamp) }, 'warn');
+    if (escalated.length) plog('vision', 'No vision OCR step read some selected frames; they keep local OCR text only', { frames: escalated.length }, 'warn');
+    ocrFrames.sort((a, b) => a.frameIndex - b.frameIndex);
+    visionFrames.sort((a, b) => a.frameIndex - b.frameIndex);
+    if (ocrFrames.length) {
+      plog('ocr', 'Local OCR results', {
+        frames: ocrFrames.map((frame) => ({
+          t: Math.round(frame.timestamp * 10) / 10,
+          engine: localEngine(frame),
+          lines: (frame.lines || []).map((line) => `${line.text} (${line.confidence})`),
+          words: frame.wordStats,
+        })),
+      });
+    }
+    if (visionFrames.length) {
+      plog('vision', 'Vision OCR results', {
+        methods: [...new Set(visionFrames.map((frame) => frame.method))],
+        frames: visionFrames.map((frame) => ({ t: Math.round(frame.timestamp * 10) / 10, method: frame.method, texts: frame.texts })),
+      });
+    }
+    return { ocrFrames, visionFrames };
+  }
+
+  /** One local engine; frames it could not read come back in `failed` (all of them if Paddle cannot load). */
+  static async readLocal(step: OcrStep, frames: VideoFrame[]): Promise<{ results: ApifyOcrFrameResult[]; failed: VideoFrame[] }> {
+    const endStage = startStage('ocr', step);
+    const read = await this.readLocalUntimed(step, frames);
+    endStage(stageStatus(frames.length, read.results.length), {
+      itemsIn: frames.length,
+      itemsOut: read.results.length,
+      details: { linesRead: read.results.reduce((sum, result) => sum + (result.lines?.length || 0), 0) },
+    });
+    return read;
+  }
+
+  private static async readLocalUntimed(step: OcrStep, frames: VideoFrame[]): Promise<{ results: ApifyOcrFrameResult[]; failed: VideoFrame[] }> {
+    if (step === 'paddle') {
+      try {
+        return await PaddleOcrService.extractTextFromFrames(frames);
+      } catch (error) {
+        plog('ocr', 'PaddleOCR could not load; frames go to the next OCR step', { error: errorMessage(error) }, 'warn');
+        return { results: [], failed: frames };
+      }
+    }
+    const results = await ApifyOcrService.extractTextFromFrames(frames, false, frames.length).catch((error: unknown) => {
+      plog('ocr', 'Tesseract failed (non-fatal)', { error: errorMessage(error) }, 'warn');
+      return [] as ApifyOcrFrameResult[];
+    });
+    const read = new Set(results.map((frame) => frame.frameIndex));
+    return { results, failed: frames.filter((frame) => !read.has(frame.frameIndex)) };
+  }
+
+  /**
+   * Frames that should get a vision read after local OCR:
+   * - frames local OCR could not read confidently;
+   * - list posts with no place names in the caption/tags (every frame);
+   * - every image slide (carousels / photo posts). Measured on a stylised
+   *   10-slide NYC guide: Tesseract read almost none of the 📍 list text and
+   *   PaddleOCR garbled several names ("7 STRER" for 7th Street Burger).
+   */
+  static selectForVision(
     frames: VideoFrame[],
     ocrFrames: ApifyOcrFrameResult[],
-    content?: SocialContent,
-    imageFrameIndexes: number[] = []
-  ): Promise<GptVisionFrameResult[]> {
-    const provider = resolveFallbackProvider();
+    content: SocialContent | undefined,
+    imageFrameIndexes: number[],
+    steps: OcrStep[]
+  ): VideoFrame[] {
     const max = optionalCap(process.env.OCR_FALLBACK_MAX_FRAMES);
     const hard = selectFramesForVisionFallback(ocrFrames, max);
     const forIntent = content ? selectFramesForPlaceIntent(content, ocrFrames) : [];
@@ -427,28 +594,67 @@ export class MediaEvidenceService {
       Math.max(max, forIntent.length, imageFrameIndexes.length)
     );
     const at = (indices: number[]) => indices.map((index) => Math.round((frames.find((f) => f.frameIndex === index)?.timestamp ?? 0) * 10) / 10);
-    plog('vision', selected.length ? `Vision OCR on ${selected.length} frame(s)` : 'Vision OCR not needed', {
-      provider,
+    plog('vision', selected.length ? `Vision OCR wanted on ${selected.length} frame(s) local OCR read` : 'Vision OCR not needed for frames local OCR read', {
+      steps,
       unreadableFramesAt: at(hard),
       placeListFramesAt: at(forIntent),
       imageSlides: imageFrameIndexes.length,
       placeIntent: content ? describePlaceIntent(content, ocrFrames) : null,
     });
-    if (provider === 'off' || selected.length === 0) return [];
+    return steps.length ? selected : [];
+  }
 
-    let results: GptVisionFrameResult[] | null = null;
-    if (provider === 'google') {
-      try {
-        results = await GoogleVisionOcrService.extractTextFromFrames(selected);
-      } catch (error) {
-        const reason = error instanceof GoogleVisionUnavailableError ? 'unavailable' : 'failed';
-        plog('vision', `Cloud Vision ${reason}; falling back to OpenAI vision`, { error: errorMessage(error) }, 'warn');
-        if (!process.env.OPENAI_API_KEY?.trim()) return [];
-      }
+  /** One OCR step on a set of frames; frames it could not read come back in `failed`. */
+  static async readWith(step: OcrStep, frames: VideoFrame[]): Promise<{ results: GptVisionFrameResult[]; failed: VideoFrame[] }> {
+    const endStage = startStage('vision_ocr', step);
+    if (!ocrStepAvailable(step)) {
+      plog('vision', `OCR step "${step}" skipped (not configured or unavailable)`, { frames: frames.length });
+      endStage('skipped', { itemsIn: frames.length, itemsOut: 0, details: { reason: 'not configured or unavailable' } });
+      return { results: [], failed: frames };
     }
-    results = results ?? await GptVisionOcrService.extractTextFromFramesBatched(selected);
+    try {
+      let read: { results: GptVisionFrameResult[]; failed: VideoFrame[] } | null = null;
+      if (step === 'glm') read = await GlmOcrService.extractTextFromFrames(frames);
+      if (step === 'google') read = { results: await GoogleVisionOcrService.extractTextFromFrames(frames), failed: [] };
+      if (step === 'gpt') read = { results: await GptVisionOcrService.extractTextFromFramesBatched(frames), failed: [] };
+      if (read) {
+        const withText = read.results.filter((result) => result.texts.length).length;
+        endStage(stageStatus(frames.length, read.results.length), { itemsIn: frames.length, itemsOut: read.results.length, details: { withText } });
+        return read;
+      }
+    } catch (error) {
+      const unavailable = error instanceof GoogleVisionUnavailableError || error instanceof GlmOcrUnavailableError;
+      plog('vision', `OCR step "${step}" ${unavailable ? 'unavailable' : 'failed'}; frames go to the next step`, { error: errorMessage(error) }, 'warn');
+      endStage('failed', { itemsIn: frames.length, itemsOut: 0, error: errorMessage(error), details: { unavailable } });
+      return { results: [], failed: frames };
+    }
+    endStage('skipped', { itemsIn: frames.length, itemsOut: 0 });
+    return { results: [], failed: frames };
+  }
+
+  /** Vision steps on the frames selectForVision picks (used for frames local OCR already read). */
+  static async runVisionFallback(
+    frames: VideoFrame[],
+    ocrFrames: ApifyOcrFrameResult[],
+    content?: SocialContent,
+    imageFrameIndexes: number[] = [],
+    steps: OcrStep[] = stepsAfterLocalOcr()
+  ): Promise<GptVisionFrameResult[]> {
+    const usable = steps.filter((step) => ocrStepAvailable(step));
+    const selected = this.selectForVision(frames, ocrFrames, content, imageFrameIndexes, usable);
+    if (usable.length === 0 || selected.length === 0) return [];
+
+    const results: GptVisionFrameResult[] = [];
+    let pending = selected;
+    for (const step of usable) {
+      if (pending.length === 0) break;
+      const read = await this.readWith(step, pending);
+      results.push(...read.results);
+      pending = read.failed;
+    }
+    if (pending.length) plog('vision', 'No vision OCR step could read some frames; they keep local OCR text only', { frames: pending.length }, 'warn');
     plog('vision', 'Vision OCR results', {
-      method: results[0]?.method,
+      methods: [...new Set(results.map((frame) => frame.method))],
       frames: results.map((frame) => ({ t: Math.round(frame.timestamp * 10) / 10, texts: frame.texts })),
     });
     return results;

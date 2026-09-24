@@ -1,6 +1,6 @@
 import fs from 'fs';
 import type { GptVisionFrameResult, VideoFrame } from '../types/social';
-import { plog } from './pipeline-log';
+import { logCall, plog } from './pipeline-log';
 
 const ENDPOINT = 'https://vision.googleapis.com/v1/images:annotate';
 const IMAGES_PER_REQUEST = 8;
@@ -82,6 +82,8 @@ export class GoogleVisionOcrService {
 
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+      const started = Date.now();
+      const meter = { stage: 'vision' as const, operation: 'cloud_vision', provider: 'google', model: 'TEXT_DETECTION', images: batch.length };
       let response: Response;
       try {
         response = await fetch(`${ENDPOINT}?key=${encodeURIComponent(key)}`, {
@@ -90,9 +92,13 @@ export class GoogleVisionOcrService {
           body: JSON.stringify({ requests }),
           signal: controller.signal,
         });
+      } catch (error) {
+        logCall({ ...meter, status: 'error', latencyMs: Date.now() - started, error: (error as Error)?.message || String(error) });
+        throw error;
       } finally {
         clearTimeout(timeout);
       }
+      logCall({ ...meter, status: response.ok ? 'success' : 'error', httpStatus: response.status, latencyMs: Date.now() - started });
 
       const body = await response.json().catch(() => ({})) as { responses?: AnnotateResponse[]; error?: { message?: string; status?: string } };
       if (response.status === 403 || response.status === 401 || body.error?.status === 'PERMISSION_DENIED') {

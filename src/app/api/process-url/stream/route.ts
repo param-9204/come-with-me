@@ -4,6 +4,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { after } from 'next/server';
 import { ScraperService } from '@/lib/services/scraper.service';
 import { DbService } from '@/lib/services/db.service';
+import { ExtractionLogStore, finishedColumns } from '@/lib/services/extraction-log.store';
 
 // The background pipeline runs in `after()` within this invocation.
 export const maxDuration = 300;
@@ -14,18 +15,39 @@ async function runBackgroundPipeline(
   socialPostId: string,
   userId: string | null,
   contentData: any,
-  rawApifyDataObj: any
+  rawApifyDataObj: any,
+  extractionRunId: string | null,
+  runStartedAt: number
 ) {
   console.log(`[Background Pipeline] Starting for: ${cleanUrl} (ID: ${socialPostId})`);
+  const { PipelineLog, withPipelineLog } = await import('@/lib/services/pipeline-log');
+  const log = new PipelineLog(String(contentData?.contentId || socialPostId), { route: 'stream', socialPostId, url: cleanUrl });
+  log.extractionRunId = extractionRunId;
+  log.part = 'pipeline';
+  try {
+    await withPipelineLog(log, () => runBackgroundStages(origin, cleanUrl, socialPostId, userId, contentData, rawApifyDataObj, extractionRunId, runStartedAt, log));
+  } finally {
+    await log.flush();
+  }
+}
+
+async function runBackgroundStages(
+  origin: string,
+  cleanUrl: string,
+  socialPostId: string,
+  userId: string | null,
+  contentData: any,
+  rawApifyDataObj: any,
+  extractionRunId: string | null,
+  runStartedAt: number,
+  log: import('@/lib/services/pipeline-log').PipelineLog
+) {
   let currentStage = 'media';
   try {
     // One shared media pipeline (key frames → local OCR → vision fallback on
     // hard frames; platform subtitles or Whisper). Every stage is non-fatal.
     const { MediaEvidenceService } = await import('@/lib/services/media-evidence.service');
-    const { PipelineLog, withPipelineLog } = await import('@/lib/services/pipeline-log');
-    const mediaLog = new PipelineLog(String(contentData?.contentId || socialPostId), { route: 'stream', socialPostId, url: cleanUrl });
-    const media = await withPipelineLog(mediaLog, () => MediaEvidenceService.collect(contentData, rawApifyDataObj));
-    mediaLog.flush();
+    const media = await MediaEvidenceService.collect(contentData, rawApifyDataObj);
     const ocrResultsList = media.ocrFrames;
     const gptVisionResultsList = media.visionFrames;
     const whisperTranscript = media.transcriptText;
@@ -57,6 +79,7 @@ async function runBackgroundPipeline(
         audioUploadId: audioUploadObj?.id,
         userId,
         socialPostId,
+        extractionRunId,
       }),
     });
 
@@ -65,6 +88,7 @@ async function runBackgroundPipeline(
       throw new Error(analyzeData.error || 'Analysis failed');
     }
 
+    log.patch(finishedColumns(runStartedAt, analyzeData.partial ? 'partial' : 'completed'));
     console.log(`[Background Pipeline] Finished successfully for: ${cleanUrl}`);
   } catch (err: any) {
     console.error(`[Background Pipeline] Critical failure for URL: ${cleanUrl}`, err.message);
@@ -74,6 +98,11 @@ async function runBackgroundPipeline(
       retryable: true,
       error_message: err.message || 'Unknown processing error'
     };
+    log.patch(finishedColumns(runStartedAt, 'failed', {
+      failed_stage: errorPayload.failed_stage,
+      error_code: errorPayload.error_code,
+      error_message: errorPayload.error_message,
+    }));
     try {
       await supabaseAdmin
         .from('social_posts')
@@ -135,6 +164,8 @@ export async function POST(request: Request) {
       };
 
       let socialPostId: string | undefined;
+      let extractionRunId: string | null = null;
+      const runStartedAt = Date.now();
 
       try {
         // ── 0. Check for cached completed post ──────────────────────────────
@@ -163,6 +194,14 @@ export async function POST(request: Request) {
 
         if (existingPost && existingPost.status === 'completed') {
           let places = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
+          const cacheHit = ExtractionLogStore.recordCacheHit({
+            socialPostId: existingPost.id,
+            userId: resolvedUserId,
+            platform: existingPost.platform,
+            inputUrl: cleanUrl,
+            route: 'stream',
+          });
+          try { after(() => cacheHit); } catch { /* outside a request scope */ }
 
 
 
@@ -211,6 +250,15 @@ export async function POST(request: Request) {
           socialPostId = socialPost.id;
         }
 
+        extractionRunId = await ExtractionLogStore.startRun({
+          socialPostId,
+          userId: resolvedUserId,
+          platform,
+          inputUrl: cleanUrl,
+          route: 'stream',
+          trigger: existingPost ? 'retry' : 'new',
+        });
+
         // ── 2. Notify client: scraping started ──────────────────────────────
         send('scraping', { socialPostId, status: 'scraping' });
 
@@ -228,7 +276,7 @@ export async function POST(request: Request) {
         }
         console.log(`[SSE Stream] Initiating scrape with webhookUrl: ${webhookUrl}`);
 
-        await ScraperService.initiateScrape(cleanUrl, webhookUrl, socialPostId);
+        await ScraperService.initiateScrape(cleanUrl, webhookUrl, socialPostId, extractionRunId);
 
         // ── 4. Poll database status and stream pipeline progression ─────────
         let contentData: any = null;
@@ -295,7 +343,9 @@ export async function POST(request: Request) {
                 socialPostId!,
                 userId || null,
                 contentData,
-                rawApifyDataObj
+                rawApifyDataObj,
+                extractionRunId,
+                runStartedAt
               );
               try {
                 after(() => bgPromise);
@@ -347,6 +397,10 @@ export async function POST(request: Request) {
               break;
             }
             else if (currentStatus === 'failed') {
+              // Scrape failures are reported by the webhook, which does not know when the run started.
+              if (extractionRunId) {
+                await ExtractionLogStore.patchRun(extractionRunId, { finished_at: new Date().toISOString(), duration_ms: Date.now() - runStartedAt });
+              }
               let errorMsg = dbPost.error_message || 'Processing failed';
               try {
                 // Parse structured JSON error
@@ -368,6 +422,11 @@ export async function POST(request: Request) {
 
       } catch (err: any) {
         console.error('[SSE Stream] Pipeline error:', err.message);
+        await ExtractionLogStore.patchRun(extractionRunId, finishedColumns(runStartedAt, 'failed', {
+          failed_stage: 'stream',
+          error_code: 'STREAM_FAILURE',
+          error_message: err.message || 'Processing failed',
+        }));
 
         if (socialPostId) {
           try {

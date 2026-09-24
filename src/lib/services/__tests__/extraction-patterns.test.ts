@@ -210,6 +210,29 @@ describe('place found by combining sources', () => {
     expect(rejected).toContainEqual({ name: 'La Dolce Vita', reason: 'un-pinned screen text in a pin-labelled post' });
   });
 
+  it('keeps a pinned place that only local OCR read (vision failed on its frames), still drops the poster', async () => {
+    // Real run: Z.ai was overloaded on the two Buvette frames; PaddleOCR read
+    // them but turns the 📍 icon into a letter.
+    const content = makeContent({ platform: 'tiktok', caption: '5 restaurants in the West Village perfect for fall #westvillage', hashtags: ['westvillage'] });
+    const title = '5 cozy restaurants in the west village for fall';
+    const media = {
+      ocrFrames: [ocrFrame(3, 3, [['e Buvette', 0.93]]), ocrFrame(4, 4, [['Buvette', 0.95]])],
+      visionFrames: [
+        visionFrame(1, 1, [title, 'LA DOLCE VITA']),
+        visionFrame(2, 2, [title, '📍 Fellini Cucina']),
+        visionFrame(6, 6, [title, '📍 Bar Pisellino']),
+        visionFrame(8, 8, [title, '📍 Canto West Village']),
+        visionFrame(10, 10, [title, '📍 Morandi']),
+      ],
+    };
+    const names = ['La Dolce Vita', 'Fellini Cucina', 'Buvette', 'Bar Pisellino', 'Canto West Village', 'Morandi'];
+    const { places, rejected } = await extract(content, media, names.map((name) =>
+      candidate({ name, city: 'New York', neighborhood: 'West Village', location_evidence: ['C1'] })
+    ));
+    expect(places.map((p) => p.name)).toEqual(names.slice(1));
+    expect(rejected).toContainEqual({ name: 'La Dolce Vita', reason: 'un-pinned screen text in a pin-labelled post' });
+  });
+
   it('pins in different styles, each carrying the address on the sticker', async () => {
     const content = makeContent({ platform: 'tiktok', caption: 'date night spots 🍷 #westvillage #nyc', hashtags: ['westvillage', 'nyc'] });
     const media = {

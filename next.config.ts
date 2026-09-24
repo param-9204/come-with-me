@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  serverExternalPackages: ['@ffmpeg-installer/ffmpeg', 'fluent-ffmpeg', 'tesseract.js', 'tesseract.js-core'],
+  serverExternalPackages: ['@ffmpeg-installer/ffmpeg', 'fluent-ffmpeg', 'tesseract.js', 'tesseract.js-core', 'ppu-paddle-ocr', 'onnxruntime-node'],
   outputFileTracingIncludes: {
     '/api/**/*': [
       './node_modules/tesseract.js/**/*',

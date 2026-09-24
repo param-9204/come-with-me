@@ -386,7 +386,8 @@ export class ScraperService {
   static async initiateScrape(
     url: string,
     webhookUrl?: string,
-    socialPostId?: string
+    socialPostId?: string,
+    extractionRunId?: string | null
   ): Promise<{ runId: string; actorId: string }> {
     const client = this.getClient();
     const startOptions: any = {};
@@ -401,7 +402,8 @@ export class ScraperService {
             "runId": "{{resource.id}}",
             "status": "{{resource.status}}",
             "defaultDatasetId": "{{resource.defaultDatasetId}}",
-            "socialPostId": "${socialPostId}"
+            "socialPostId": "${socialPostId}"${extractionRunId ? `,
+            "extractionRunId": "${extractionRunId}"` : ''}
           }`
         }
       ];
@@ -431,13 +433,25 @@ export class ScraperService {
     }
   }
 
-  static async getScrapeStatus(runId: string): Promise<{ status: string; defaultDatasetId: string | null }> {
+  static async getScrapeStatus(runId: string): Promise<{
+    status: string;
+    defaultDatasetId: string | null;
+    /** Usage cost Apify reports for the run (may not include pay-per-result actor charges). */
+    usageTotalUsd: number | null;
+    durationMs: number | null;
+    startedAt: string | null;
+    actId: string | null;
+  }> {
     const client = this.getClient();
     const run = await client.run(runId).get();
     if (!run) throw new Error(`Apify run not found: ${runId}`);
     return {
       status: run.status,
       defaultDatasetId: run.defaultDatasetId || null,
+      usageTotalUsd: typeof run.usageTotalUsd === 'number' ? run.usageTotalUsd : null,
+      durationMs: typeof run.stats?.durationMillis === 'number' ? run.stats.durationMillis : null,
+      startedAt: run.startedAt ? new Date(run.startedAt).toISOString() : null,
+      actId: run.actId || null,
     };
   }
 

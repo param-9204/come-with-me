@@ -89,14 +89,20 @@ export class WhisperService {
    * and translating proper nouns tends to corrupt venue names.
    */
   static async transcribe(audioPath: string): Promise<TranscriptResult> {
-    const response = await executeAICall('audio', async ({ client, model }) => {
+    const response = await executeAICall('audio', async ({ client, model, reportUsage }) => {
       const audioStream = fs.createReadStream(audioPath);
-      return await client.audio.transcriptions.create({
+      const result = await client.audio.transcriptions.create({
         file: audioStream,
         model,
         response_format: 'verbose_json',
-      }) as unknown as { text: string; language?: string; segments?: VerboseSegment[] };
-    });
+      }) as unknown as { text: string; language?: string; duration?: number; segments?: VerboseSegment[] };
+      // Speech-to-text is billed by audio length; verbose_json reports it as `duration`.
+      const lastSegmentEnd = Array.isArray(result.segments) && result.segments.length
+        ? Number(result.segments[result.segments.length - 1]?.end) || null
+        : null;
+      reportUsage?.({ audioSeconds: typeof result.duration === 'number' ? result.duration : lastSegmentEnd });
+      return result;
+    }, { operation: 'transcription' });
 
     const language = (response.language || '').toLowerCase() || null;
     const rawSegments: VerboseSegment[] = Array.isArray(response.segments) && response.segments.length > 0

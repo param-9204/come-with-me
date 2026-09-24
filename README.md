@@ -43,12 +43,27 @@ post:
 1. Every carousel slide and every video in the post (no page limit).
 2. Video frames: one frame per second for the full length of the video
    (a 45 s video gives 45 frames). No duplicate removal, no frame limit.
-3. Local OCR (Tesseract) on every frame and slide, using up to 4 workers
-   (`OCR_WORKERS`).
-4. Vision OCR on every carousel slide, on video frames local OCR could not
-   read (stylised overlays, shop signs), and on every frame of a list post
-   whose places are not named in the text.
-5. Speech: TikTok's own subtitles when available (free), otherwise Whisper.
+3. OCR, in the order set by `OCR_ORDER` (default
+   `glm,paddle,google,gpt,tesseract`). Each step reads the frames no earlier
+   step could read (error, overload, no balance, not configured), and runs
+   only if it is listed and configured:
+   - **glm**: Z.ai OCR (`ZAI_API_KEY`; model from `GLM_OCR_MODEL`, default the
+     free `glm-4.6v-flash`). Frames it cannot read, or not within
+     `GLM_OCR_TIME_BUDGET_SEC`, go to the next step.
+   - **paddle**: local PaddleOCR (PP-OCRv6 via ONNX Runtime, free). Model size
+     from `PADDLE_OCR_MODEL` (tiny | small | medium, default small); models
+     download once to `PADDLE_OCR_CACHE_DIR` (default the OS temp dir).
+   - **google**: Cloud Vision. Needs the API and billing enabled on the key's
+     project.
+   - **gpt**: GPT vision. Opt-in: set `USE_GPT_VISION_MODEL`.
+   - **tesseract**: local, last resort for frames nothing else read
+     (`OCR_WORKERS` workers).
+
+   Frames read by local OCR also go to the vision steps listed after it when
+   they need a better read: every carousel slide, frames read with low
+   confidence, and every frame of a list post whose places the caption does
+   not name. Frames Z.ai read are final.
+4. Speech: TikTok's own subtitles when available (free), otherwise Whisper.
 
 There are no page, frame or line caps by default. Processing time grows with
 video length (local OCR measured at about 0.6 s per frame per worker on a
@@ -59,11 +74,22 @@ time or cost needs bounding.
 Optional settings:
 
 ```env
-# Vision OCR fallback: google (default when a Google key exists) | openai | off
-OCR_FALLBACK_PROVIDER=google
+# OCR steps and their order. Remove a step to never use it, e.g.
+# OCR_ORDER=paddle,tesseract   (names: glm, paddle, tesseract, google, gpt)
+OCR_ORDER=glm,paddle,google,gpt,tesseract
+PADDLE_OCR_MODEL=small       # tiny (~0.3 s/frame) | small (~0.65 s) | medium (~1.9 s)
+PADDLE_OCR_CONCURRENCY=2
+# Z.ai OCR (the "glm" step).
+ZAI_API_KEY=
+GLM_OCR_MODEL=glm-4.6v-flash # free vision model (default); glm-ocr = paid OCR model, needs balance
+GLM_OCR_CONCURRENCY=2        # parallel Z.ai requests
+GLM_OCR_RETRIES=3            # retries per frame when Z.ai answers "overloaded"
+GLM_OCR_TIME_BUDGET_SEC=90   # frames not read in this time go to the next OCR step
+# GPT vision is opt-in. Set a model name (e.g. gpt-4o) to allow it; leave
+# empty to never call GPT vision.
+USE_GPT_VISION_MODEL=
 # Separate key for Cloud Vision (defaults to GOOGLE_MAPS_API_KEY). The key's
-# project must have the Cloud Vision API enabled and the key must be allowed
-# to call it; otherwise the pipeline falls back to OpenAI vision.
+# project must have the Cloud Vision API and billing enabled.
 GOOGLE_VISION_API_KEY=
 OCR_FALLBACK_MAX_FRAMES=     # optional cap on vision OCR for unreadable video frames (default: none)
 OCR_MAX_KEY_FRAMES=          # optional cap on frames per video, spread evenly (default: none)

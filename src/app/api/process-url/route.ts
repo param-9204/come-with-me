@@ -1,10 +1,11 @@
-import { NextResponse } from 'next/server';
+import { NextResponse, after } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
 import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { DbService } from '@/lib/services/db.service';
 import { AiEnrichmentService } from '@/lib/services/ai-enrichment.service';
 import { MediaEvidenceService } from '@/lib/services/media-evidence.service';
-import { PipelineLog, withPipelineLog } from '@/lib/services/pipeline-log';
+import { PipelineLog, logCall, withPipelineLog } from '@/lib/services/pipeline-log';
+import { ExtractionLogStore, finishedColumns, type RunTrigger } from '@/lib/services/extraction-log.store';
 import { ScraperService } from '@/lib/services/scraper.service';
 import type { SocialContent } from '@/lib/types/social';
 import { v4 as uuidv4 } from 'uuid';
@@ -135,8 +136,63 @@ function contentFromStoredPost(post: any): SocialContent {
   };
 }
 
-async function runSynchronousPipeline(origin: string, url: string, socialPostId: string, userId?: string): Promise<{ finalPostId: string; analyzeData: any }> {
+async function runSynchronousPipeline(
+  origin: string,
+  url: string,
+  socialPostId: string,
+  userId?: string,
+  extractionRunId: string | null = null,
+  runStartedAt = Date.now()
+): Promise<{ finalPostId: string; analyzeData: any }> {
+  const log = new PipelineLog(socialPostId, { route: 'process-url', socialPostId, url });
+  log.extractionRunId = extractionRunId;
+  log.part = 'pipeline';
+  try {
+    return await withPipelineLog(log, () => runSynchronousStages(origin, url, socialPostId, userId, extractionRunId, runStartedAt, log));
+  } finally {
+    await log.flush();
+  }
+}
+
+/** Scrape stage + Apify-reported usage on the current run. */
+interface ScrapeUsage { usageTotalUsd?: number | null; durationMs?: number | null; startedAt?: string | null }
+
+function recordScrape(log: PipelineLog, actorId: string, startedMs: number, usage: ScrapeUsage | null | undefined, ok: boolean, error: string | null): void {
+  const durationMs = typeof usage?.durationMs === 'number' ? usage.durationMs : Date.now() - startedMs;
+  log.addStage({
+    stage: 'scrape',
+    provider: 'apify',
+    status: ok ? 'success' : 'failed',
+    startedAt: usage?.startedAt || new Date(startedMs).toISOString(),
+    durationMs,
+    itemsIn: 1,
+    itemsOut: ok ? 1 : 0,
+    error,
+  });
+  logCall({
+    stage: 'scrape',
+    operation: 'scrape',
+    provider: 'apify',
+    model: actorId,
+    status: ok ? 'success' : 'error',
+    latencyMs: durationMs,
+    error,
+    costUsd: typeof usage?.usageTotalUsd === 'number' ? usage.usageTotalUsd : null,
+    costSource: typeof usage?.usageTotalUsd === 'number' ? 'provider_reported' : null,
+  }, log);
+}
+
+async function runSynchronousStages(
+  origin: string,
+  url: string,
+  socialPostId: string,
+  userId: string | undefined,
+  extractionRunId: string | null,
+  runStartedAt: number,
+  log: PipelineLog
+): Promise<{ finalPostId: string; analyzeData: any }> {
   console.log(`[Synchronous Pipeline] Starting process-url for: ${url} (origin: ${origin})`);
+  let currentStage = 'scraping';
   try {
     // Update status to scraping
     await supabaseAdmin
@@ -155,6 +211,7 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
       throw new Error(initData.error || 'Failed to initiate scrape');
     }
     const { runId, actorId } = initData;
+    const scrapeStarted = Date.now();
 
     // Poll status
     let contentData: any = null;
@@ -174,10 +231,12 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
       if (statusData.status === 'SUCCEEDED') {
         contentData = statusData.data;
         rawApifyDataObj = statusData.raw;
+        recordScrape(log, actorId, scrapeStarted, statusData.usage, true, null);
         break;
       } else if (
         ['FAILED', 'ABORTED', 'TIMED-OUT'].includes(statusData.status)
       ) {
+        recordScrape(log, actorId, scrapeStarted, statusData.usage, false, `Apify run ${statusData.status}`);
         throw new Error(`Scraper failed with status: ${statusData.status}`);
       }
     }
@@ -194,15 +253,16 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
 
     // 2. Media evidence in-process: one download, key frames, local OCR,
     // vision fallback only for hard frames, platform subtitles or Whisper.
-    const mediaLog = new PipelineLog(String(contentData?.contentId || socialPostId), { route: 'process-url', socialPostId, url });
-    const media = await withPipelineLog(mediaLog, () => MediaEvidenceService.collect(contentData, rawApifyDataObj));
-    mediaLog.flush();
+    currentStage = 'media';
+    log.runId = String(contentData?.contentId || socialPostId);
+    const media = await MediaEvidenceService.collect(contentData, rawApifyDataObj);
     const whisperTranscript = media.transcriptText;
     const audioUploadObj = media.audioUpload;
     const ocrResultsList = media.ocrFrames;
     const gptVisionResultsList = media.visionFrames;
 
     // 4. Final synthesis and analysis
+    currentStage = 'analysis';
     const analyzeRes = await fetch(`${origin}/api/process-url/analyze`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -218,7 +278,8 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
         url,
         audioUploadId: audioUploadObj?.id,
         userId: userId || null,
-        socialPostId: socialPostId
+        socialPostId: socialPostId,
+        extractionRunId,
       }),
     });
 
@@ -227,6 +288,7 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
       throw new Error(analyzeData.error || 'Failed to complete analysis');
     }
 
+    log.patch(finishedColumns(runStartedAt, analyzeData.partial ? 'partial' : 'completed'));
     console.log(`[Synchronous Pipeline] Finished processing successfully for: ${url}`);
     return {
       finalPostId: analyzeData.socialPostId || socialPostId,
@@ -234,6 +296,11 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
     };
   } catch (err: any) {
     console.error(`[Synchronous Pipeline] Error processing: ${url}`, err.message);
+    log.patch(finishedColumns(runStartedAt, 'failed', {
+      failed_stage: currentStage,
+      error_code: `${currentStage.toUpperCase()}_FAILURE`,
+      error_message: err.message || 'Unknown processing error',
+    }));
     try {
       await supabaseAdmin
         .from('social_posts')
@@ -297,6 +364,7 @@ export async function POST(request: Request) {
     const foundCompletedPost = existingPosts?.find(p => p.status === 'completed');
     const existingPost = foundCompletedPost || (existingPosts && existingPosts.length > 0 ? existingPosts[0] : null);
 
+    let trigger: RunTrigger = existingPost ? 'retry' : 'new';
     if (existingPost && existingPost.status === 'completed') {
       let savedPlaces = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
       const partialError = restrictedAccessMessage(existingPost.raw_apify_data);
@@ -321,37 +389,62 @@ export async function POST(request: Request) {
         }
       }
 
-      if (partialError && savedPlaces.length === 0 && (existingPost.caption || existingPost.raw_apify_data?.description)) {
-        try {
-          responseOnlyPlaces = await AiEnrichmentService.extractPlace(
-            cachedContent,
-            existingPost.whisper_transcript || '',
-            []
-          );
-          const savedIds = await Promise.all(responseOnlyPlaces.map((place) =>
-            DbService.savePlace(
-              place,
-              existingPost.post_url,
-              cachedContent.platform,
+      // Loop guard: re-running the model on the same cached text returns the same
+      // unsaveable result, so each post gets one completed recovery attempt.
+      const restrictedRecoveryDone = partialError && savedPlaces.length === 0
+        ? await ExtractionLogStore.hasRun(existingPost.id, 'cached_restricted_recovery', ['completed', 'partial'])
+        : false;
+      if (partialError && savedPlaces.length === 0 && !restrictedRecoveryDone && (existingPost.caption || existingPost.raw_apify_data?.description)) {
+        const recoveryStarted = Date.now();
+        const recoveryLog = new PipelineLog(String(cachedContent.contentId || existingPost.id), { route: 'process-url', socialPostId: existingPost.id, url: existingPost.post_url });
+        recoveryLog.part = 'analysis';
+        recoveryLog.extractionRunId = await ExtractionLogStore.startRun({
+          socialPostId: existingPost.id,
+          userId: finalUserId,
+          platform: cachedContent.platform,
+          inputUrl: cleanUrl,
+          route: 'process-url',
+          trigger: 'cached_restricted_recovery',
+        });
+        await withPipelineLog(recoveryLog, async () => {
+          try {
+            responseOnlyPlaces = await AiEnrichmentService.extractPlace(
+              cachedContent,
               existingPost.whisper_transcript || '',
-              undefined,
-              existingPost.id,
-              cachedContent.authorUsername
-            )
-          ));
-          if (savedIds.some(Boolean)) {
-            savedPlaces = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
-            const savedPlaceKeys = new Set(savedPlaces.map((place: any) =>
-              `${String(place.name || '').trim().toLowerCase()}|${String(place.city || '').trim().toLowerCase()}`
-            ));
-            responseOnlyPlaces = responseOnlyPlaces.filter((place) =>
-              !savedPlaceKeys.has(`${String(place.name || '').trim().toLowerCase()}|${String(place.city || '').trim().toLowerCase()}`)
+              []
             );
+            const savedIds = await Promise.all(responseOnlyPlaces.map((place) =>
+              DbService.savePlace(
+                place,
+                existingPost.post_url,
+                cachedContent.platform,
+                existingPost.whisper_transcript || '',
+                undefined,
+                existingPost.id,
+                cachedContent.authorUsername
+              )
+            ));
+            if (savedIds.some(Boolean)) {
+              savedPlaces = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
+              const savedPlaceKeys = new Set(savedPlaces.map((place: any) =>
+                `${String(place.name || '').trim().toLowerCase()}|${String(place.city || '').trim().toLowerCase()}`
+              ));
+              responseOnlyPlaces = responseOnlyPlaces.filter((place) =>
+                !savedPlaceKeys.has(`${String(place.name || '').trim().toLowerCase()}|${String(place.city || '').trim().toLowerCase()}`)
+              );
+            }
+            console.log(`[process-url] Recovered ${responseOnlyPlaces.length} place(s) from cached restricted post ${existingPost.id}.`);
+            recoveryLog.patch(finishedColumns(recoveryStarted, 'partial', {
+              is_restricted: true,
+              saved_count: savedPlaces.length,
+              unsaved_count: responseOnlyPlaces.length,
+            }));
+          } catch (placeError: any) {
+            console.warn('[process-url] Cached restricted-place recovery failed:', placeError.message);
+            recoveryLog.patch(finishedColumns(recoveryStarted, 'failed', { failed_stage: 'analysis', error_code: 'RESTRICTED_RECOVERY_FAILURE', error_message: placeError.message }));
           }
-          console.log(`[process-url] Recovered ${responseOnlyPlaces.length} place(s) from cached restricted post ${existingPost.id}.`);
-        } catch (placeError: any) {
-          console.warn('[process-url] Cached restricted-place recovery failed:', placeError.message);
-        }
+        });
+        await recoveryLog.flush();
       }
 
       const places = formatResponsePlaces([...savedPlaces, ...responseOnlyPlaces], {
@@ -381,11 +474,23 @@ export async function POST(request: Request) {
         : [];
       const sourceAddressCount = AiEnrichmentService.countDistinctSourceAddresses(storedOcrTexts);
       const hasIncompleteAddressBackedList = sourceAddressCount >= 2 && savedPlaces.length < sourceAddressCount;
-      const needsLegacyVideoRecovery =
+      const wantsLegacyVideoRecovery =
         (cachedContent.contentType === 'video' && hasNoStoredVisionFrames && hasUnresolvedSavedPlace) ||
         hasIncompleteAddressBackedList;
+      // Loop guard: when a completed recovery run could not fix the post (e.g. no
+      // vision OCR configured, or an address row that never resolves), the same
+      // conditions hold on every later request and the full paid pipeline would
+      // re-run each time. One completed recovery per post.
+      const legacyRecoveryDone = wantsLegacyVideoRecovery
+        ? await ExtractionLogStore.hasRun(existingPost.id, 'legacy_recovery', ['completed', 'partial'])
+        : false;
+      if (wantsLegacyVideoRecovery && legacyRecoveryDone) {
+        console.log(`[process-url] Skipping legacy recovery for ${existingPost.id}: already attempted once.`);
+      }
+      const needsLegacyVideoRecovery = wantsLegacyVideoRecovery && !legacyRecoveryDone;
 
       if (needsLegacyVideoRecovery) {
+        trigger = 'legacy_recovery';
         console.warn(
           `[process-url] Reprocessing incomplete cached post ${existingPost.id} ` +
           `(saved=${savedPlaces.length}, source-addresses=${sourceAddressCount}).`
@@ -401,6 +506,14 @@ export async function POST(request: Request) {
           // The cache returns normally on every later request once recovery succeeds.
         }
       } else {
+        const cacheHit = ExtractionLogStore.recordCacheHit({
+          socialPostId: existingPost.id,
+          userId: finalUserId,
+          platform: cachedContent.platform,
+          inputUrl: cleanUrl,
+          route: 'process-url',
+        });
+        try { after(() => cacheHit); } catch { /* outside a request scope */ }
         return NextResponse.json({
           success: true,
           partial: Boolean(partialError),
@@ -447,7 +560,16 @@ export async function POST(request: Request) {
     }
 
     // Execute the pipeline synchronously and await completion
-    const { finalPostId, analyzeData } = await runSynchronousPipeline(origin, cleanUrl, socialPostId, finalUserId || undefined);
+    const runStartedAt = Date.now();
+    const extractionRunId = await ExtractionLogStore.startRun({
+      socialPostId,
+      userId: finalUserId,
+      platform,
+      inputUrl: cleanUrl,
+      route: 'process-url',
+      trigger,
+    });
+    const { finalPostId, analyzeData } = await runSynchronousPipeline(origin, cleanUrl, socialPostId, finalUserId || undefined, extractionRunId, runStartedAt);
 
 
     // Fetch and return the completed social post record

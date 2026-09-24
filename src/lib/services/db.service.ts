@@ -5,7 +5,7 @@ import { LocationService, type GeocodeResult } from './location.service';
 import { AiEnrichmentService } from './ai-enrichment.service';
 import { ScraperService } from './scraper.service';
 import { googleTypeConflict, reconcileCategoryWithGoogle } from './place-evidence.service';
-import { plog } from './pipeline-log';
+import { noteSaveOutcome, plog } from './pipeline-log';
 import { googleMapsUrl } from '../maps-url';
 
 export type PlaceInput = Omit<PlaceExtraction, 'category'> & { category: PlaceCategory | string };
@@ -133,6 +133,7 @@ export class DbService {
   ): Promise<string | null> {
     if (!placeData.name) {
       plog('db', 'Place has no name; not saved', undefined, 'warn');
+      noteSaveOutcome(placeData, { decision: 'unsaved', reason: 'no name' });
       return null;
     }
 
@@ -205,6 +206,7 @@ export class DbService {
         }
       }
       await link(existing.id, { verified, ambiguous, provider });
+      noteSaveOutcome(placeData, { decision: 'linked_existing', reason: 'same name and city', placeId: existing.id, provider, verified, ambiguous });
       return existing.id;
     }
 
@@ -214,6 +216,7 @@ export class DbService {
     let address = LocationService.sanitizeSourceAddress(placeData.address);
     let city = LocationService.cleanCityName(placeData.city);
     let geocode: GeocodeResult | null = null;
+    let typeConflict = false;
 
     try {
       let coords = await LocationService.geocodePlace(
@@ -235,6 +238,7 @@ export class DbService {
           extractedAs: placeData.base_category || placeData.category,
           googleCategory: conflict,
         }, 'warn');
+        typeConflict = true;
         coords = { lat: null, lng: null, formattedAddress: null, neighborhood: null, city: null };
       }
       geocode = coords;
@@ -271,12 +275,18 @@ export class DbService {
     if (existingByGoogleId) {
       plog('db', `"${placeData.name}" already in database (same Google place)`, { placeId: existingByGoogleId, googlePlaceId: geocode?.placeId });
       await link(existingByGoogleId, { verified, ambiguous, provider: geocode?.provider });
+      noteSaveOutcome(placeData, { decision: 'linked_existing', reason: 'same google place', placeId: existingByGoogleId, provider: geocode?.provider, verified, ambiguous, googlePlaceId: geocode?.placeId });
       return existingByGoogleId;
     }
 
     // GATE: Do not save places with no resolved address
     if (!address || !address.trim()) {
       plog('db', `Not saved: "${placeData.name}" has no verified location`, { reason: 'no Google match and no address in the evidence' }, 'warn');
+      noteSaveOutcome(placeData, {
+        decision: 'unsaved',
+        reason: typeConflict ? 'google match is a different kind of venue' : 'no verified location',
+        verified: false,
+      });
       return null;
     }
 
@@ -294,6 +304,7 @@ export class DbService {
       if (existingWithResolvedCity) {
         plog('db', `"${placeData.name}" already in database (Google-resolved city)`, { placeId: existingWithResolvedCity.id, city });
         await link(existingWithResolvedCity.id, { verified, ambiguous, provider: geocode?.provider });
+        noteSaveOutcome(placeData, { decision: 'linked_existing', reason: 'same name and resolved city', placeId: existingWithResolvedCity.id, provider: geocode?.provider, verified, ambiguous, googlePlaceId: geocode?.placeId });
         return existingWithResolvedCity.id;
       }
     }
@@ -318,6 +329,7 @@ export class DbService {
       if (samePlaceAtCoordinates) {
         plog('db', `"${placeData.name}" already in database (same coordinates)`, { placeId: samePlaceAtCoordinates.id, lat, lng });
         await link(samePlaceAtCoordinates.id, { verified, ambiguous, provider: geocode?.provider });
+        noteSaveOutcome(placeData, { decision: 'linked_existing', reason: 'same name and coordinates', placeId: samePlaceAtCoordinates.id, provider: geocode?.provider, verified, ambiguous, googlePlaceId: geocode?.placeId });
         return samePlaceAtCoordinates.id;
       }
     }
@@ -402,15 +414,26 @@ export class DbService {
         const winner = await DbService.findPlaceByGoogleId(geocode.placeId);
         if (winner) {
           await link(winner, { verified, ambiguous, provider: geocode?.provider });
+          noteSaveOutcome(placeData, { decision: 'linked_existing', reason: 'same google place (parallel insert)', placeId: winner, provider: geocode?.provider, verified, ambiguous, googlePlaceId: geocode?.placeId });
           return winner;
         }
       }
       plog('db', `Insert failed for "${placeData.name}"`, { error: error.message, code: error.code }, 'error');
+      noteSaveOutcome(placeData, { decision: 'save_error', reason: `insert failed: ${error.code || error.message}` });
       throw new Error(`Failed to save place: ${error.message}`);
     }
 
     plog('db', `Saved new place "${displayName}"`, { placeId: newPlace.id, lat, lng, address, category, googlePlaceId: geocode?.placeId || null, verified });
     await link(newPlace.id, { verified, ambiguous, provider: geocode?.provider });
+    noteSaveOutcome(placeData, {
+      decision: 'saved',
+      placeId: newPlace.id,
+      provider: geocode?.provider,
+      verified,
+      ambiguous,
+      googlePlaceId: geocode?.placeId,
+      savedCategory: category,
+    });
     return newPlace.id;
   }
   // ──────────────────────────────────────────────────────────────────

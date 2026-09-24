@@ -7,7 +7,8 @@ import { ApifyOcrService } from '@/lib/services/apify-ocr.service';
 import { GptVisionOcrService } from '@/lib/services/gpt-vision-ocr.service';
 import { WhisperService } from '@/lib/services/whisper.service';
 import { mergeSameEntities } from '@/lib/services/place-evidence.service';
-import { PipelineLog, plog, withPipelineLog } from '@/lib/services/pipeline-log';
+import { PipelineLog, candidateKey, plog, reasonCode, startStage, withPipelineLog } from '@/lib/services/pipeline-log';
+import { ExtractionLogStore, finishedColumns, signalColumns } from '@/lib/services/extraction-log.store';
 import { googleMapsUrl } from '@/lib/maps-url';
 import type { PlaceExtraction, TranscriptResult, TranscriptSegment } from '@/lib/types/social';
 
@@ -68,16 +69,54 @@ function isSamePlace(a: PlaceExtraction, b: PlaceExtraction): boolean {
 
 export async function POST(request: Request) {
   const log = new PipelineLog(`analyze-${Date.now()}`, { route: 'analyze' });
+  log.part = 'analysis';
   return withPipelineLog(log, async () => {
     try {
       return await handleAnalyze(request, log);
     } finally {
-      log.flush();
+      await log.flush();
     }
   });
 }
 
+/** Final outcome of each accepted place for extraction_candidates: saved, linked, unsaved (and why), or failed. */
+function recordSaveOutcomes(log: PipelineLog, results: Array<{ place: PlaceExtraction; id: string | null; error?: string }>): void {
+  for (const { place, id, error } of results) {
+    const outcome = log.saveOutcomes.get(place);
+    const decision = error ? 'save_error' : outcome?.decision ?? (id ? 'saved' : 'unsaved');
+    const reason = error ? `save threw: ${error}` : outcome?.reason ?? null;
+    log.addCandidate({
+      pass: log.acceptedPass.get(candidateKey(place.name)) ?? 'primary',
+      decision,
+      reasonCode: decision === 'saved' || decision === 'linked_existing' ? null : reasonCode(reason),
+      reason,
+      name: place.name,
+      searchQuery: place.search_query || null,
+      mentionType: place.mention_type ?? null,
+      modelRole: place.role ?? null,
+      baseCategory: place.base_category ?? null,
+      category: place.category,
+      savedCategory: outcome?.savedCategory ?? null,
+      city: place.city,
+      neighborhood: place.neighborhood,
+      address: place.address,
+      confidence: place.confidence,
+      evidenceIds: place.evidence_ids ?? [],
+      locationEvidenceIds: place.location_evidence_ids ?? [],
+      evidenceSources: place.evidence_sources ?? [],
+      evidenceSnippets: place.evidence_snippets ?? [],
+      placeId: id,
+      geocodeProvider: outcome?.provider ?? null,
+      geocodeVerified: outcome?.verified ?? null,
+      geocodeAmbiguous: outcome?.ambiguous ?? null,
+      googlePlaceId: outcome?.googlePlaceId ?? null,
+    });
+  }
+}
+
 async function handleAnalyze(request: Request, log: PipelineLog) {
+  // True when this request created the run (called directly, not from the pipeline routes).
+  let ownsRun = false;
   try {
     const user = await getAuthUser(request);
     const resolvedUserId = user?.id || null;
@@ -95,6 +134,7 @@ async function handleAnalyze(request: Request, log: PipelineLog) {
       userId,
       audioUploadId,
       socialPostId: inputSocialPostId,
+      extractionRunId,
     } = body;
     const transcriptResult = transcriptFromBody(transcript || '', transcriptSegments, transcriptSource, transcriptLanguage);
 
@@ -107,6 +147,19 @@ async function handleAnalyze(request: Request, log: PipelineLog) {
 
     log.runId = String(content.contentId || url);
     Object.assign(log.context, { url, platform: content.platform, socialPostId: inputSocialPostId || null });
+    if (typeof extractionRunId === 'string' && extractionRunId) {
+      log.extractionRunId = extractionRunId;
+    } else {
+      log.extractionRunId = await ExtractionLogStore.startRun({
+        socialPostId: inputSocialPostId || null,
+        userId: finalUserId || null,
+        platform: content.platform,
+        inputUrl: url,
+        route: 'analyze',
+      });
+      ownsRun = !!log.extractionRunId;
+    }
+    log.patch(signalColumns(content, rawApifyData));
     plog('run', 'Analysis started', {
       url,
       platform: content.platform,
@@ -154,21 +207,31 @@ async function handleAnalyze(request: Request, log: PipelineLog) {
     // 4. Save places to DB (bounded concurrency: Google lookups + inserts)
     let placeIds: string[] = [];
     let unresolvedPlaces: PlaceExtraction[] = [];
+    log.patch({ accepted_count: 0, saved_count: 0, unsaved_count: 0 });
     if (placeAnalysis && placeAnalysis.length > 0) {
       const bundle = AiEnrichmentService.buildEvidence(content, media);
       const uniquePlaces = mergeSameEntities(placeAnalysis.filter((place) => !!place.name), bundle);
 
-      const saveResults = await mapWithConcurrency(uniquePlaces, SAVE_CONCURRENCY, async (place) => {
+      const endSave = startStage('save_places', null);
+      const saveResults = await mapWithConcurrency(uniquePlaces, SAVE_CONCURRENCY, async (place): Promise<{ place: PlaceExtraction; id: string | null; error?: string }> => {
         try {
           const id = await DbService.savePlace(place, url, content.platform, transcript || '', finalUserId, inputSocialPostId, content.authorUsername);
           return { place, id };
         } catch (placeErr: any) {
           plog('db', `Error saving "${place.name}"`, { error: placeErr.message }, 'error');
-          return { place, id: null };
+          return { place, id: null, error: placeErr.message || String(placeErr) };
         }
       });
       placeIds = [...new Set(saveResults.map((result) => result.id).filter(Boolean) as string[])];
       unresolvedPlaces = saveResults.filter((result) => !result.id).map((result) => result.place);
+      const savedCount = saveResults.filter((result) => result.id).length;
+      endSave(uniquePlaces.length === savedCount ? 'success' : savedCount ? 'partial' : 'failed', {
+        itemsIn: uniquePlaces.length,
+        itemsOut: savedCount,
+        details: { uniquePlaceIds: placeIds.length, errors: saveResults.filter((result) => result.error).length },
+      });
+      recordSaveOutcomes(log, saveResults);
+      log.patch({ accepted_count: uniquePlaces.length, saved_count: savedCount, unsaved_count: unresolvedPlaces.length });
       if (unresolvedPlaces.length > 0) {
         plog('run', `${unresolvedPlaces.length} place(s) not saved (no verified location); returned without coordinates`, {
           places: unresolvedPlaces.map((place) => place.name),
@@ -178,6 +241,7 @@ async function handleAnalyze(request: Request, log: PipelineLog) {
 
     // 5. Save full social post record to DB
     let socialPostId: string | null = null;
+    const endPersist = startStage('persist_post', null);
     try {
       socialPostId = await DbService.saveSocialPost(
         content,
@@ -191,7 +255,9 @@ async function handleAnalyze(request: Request, log: PipelineLog) {
         finalUserId,
         inputSocialPostId
       );
+      endPersist('success', { itemsIn: 1, itemsOut: 1 });
     } catch (dbErr: any) {
+      endPersist('failed', { itemsIn: 1, itemsOut: 0, error: dbErr.message });
       plog('db', 'Error saving the social post', { error: dbErr.message }, 'error');
       // We throw this error because saving the social post is critical
       throw dbErr;
@@ -287,6 +353,7 @@ async function handleAnalyze(request: Request, log: PipelineLog) {
     const partialResultMessage = finalPlaces.length > 0
       ? 'This post contains Restricted content. Place were found.'
       : 'This post contains Restricted content. No places were found.';
+    if (ownsRun) log.patch(finishedColumns(log.started, restrictedPageMessage ? 'partial' : 'completed', { social_post_id: socialPostId }));
 
     return NextResponse.json({
       success: true,
@@ -309,6 +376,9 @@ async function handleAnalyze(request: Request, log: PipelineLog) {
 
   } catch (error: any) {
     plog('run', 'Analysis failed', { error: error.message || String(error) }, 'error');
+    if (ownsRun) {
+      log.patch(finishedColumns(log.started, 'failed', { failed_stage: 'analysis', error_code: 'ANALYSIS_FAILURE', error_message: error.message || String(error) }));
+    }
     return NextResponse.json({
       success: false,
       error: error.message || 'Analysis processing failed',

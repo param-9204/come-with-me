@@ -1,6 +1,8 @@
+import crypto from 'crypto';
 import { executeAICall, supportsTemperature } from './ai-client';
 import { LocationService } from './location.service';
-import { plog } from './pipeline-log';
+import { candidateKey, currentPipelineLog, plog, reasonCode, startStage, type CandidatePass } from './pipeline-log';
+import { chatUsage } from './usage-cost';
 import {
   BASE_CATEGORIES, buildEvidence, formatEvidenceForPrompt, mergeSameEntities, resolveHiddenGem,
   sanitizeCandidateLocation, scoreAndFilterCandidates,
@@ -78,6 +80,11 @@ Return one JSON object: {"places":[...],"analysis":{...}}. No markdown.`;
 const PLACES_ONLY_SYSTEM_PROMPT = `${PLACE_RULES}
 
 Return one JSON object: {"places":[...]}. No markdown.`;
+
+/** Short prompt hashes, logged per model call so accuracy and cost can be compared across prompt versions. */
+const promptHash = (prompt: string) => crypto.createHash('sha256').update(prompt).digest('hex').slice(0, 12);
+const COMBINED_PROMPT_HASH = promptHash(COMBINED_SYSTEM_PROMPT);
+const PLACES_ONLY_PROMPT_HASH = promptHash(PLACES_ONLY_SYSTEM_PROMPT);
 
 const PLACE_ITEM_SCHEMA = {
   type: 'object',
@@ -576,8 +583,9 @@ export async function finalizeCandidates(
   candidates: RawPlaceCandidate[],
   bundle: EvidenceBundle,
   authorUsername: string,
-  options: { resolveIndirect?: boolean } = {}
+  options: { resolveIndirect?: boolean; pass?: CandidatePass } = {}
 ): Promise<PlaceExtractionOutcome> {
+  const pass = options.pass ?? 'primary';
   const asPlaces: PlaceExtraction[] = candidates.map((candidate) => {
     const located = sanitizeCandidateLocation({
       city: LocationService.cleanCityName(candidate.city),
@@ -647,6 +655,8 @@ export async function finalizeCandidates(
     merged = mergeSameEntities(resolved, bundle);
   }
 
+  recordCandidateOutcomes(pass, candidates, refined, rejected, merged);
+
   for (const place of merged) {
     plog('candidates', `Accepted "${place.name}"`, {
       score: place.confidence,
@@ -661,14 +671,65 @@ export async function finalizeCandidates(
   return { places: merged, rejected };
 }
 
+/**
+ * Candidate outcomes for the extraction_candidates log: every rejected
+ * candidate with its reason and model fields, and the pass that first
+ * accepted each kept place (saved/unsaved outcomes are added after the DB step).
+ */
+function recordCandidateOutcomes(
+  pass: CandidatePass,
+  candidates: RawPlaceCandidate[],
+  refined: Array<PlaceExtraction & { candidateRole?: string }>,
+  rejected: PlaceExtractionOutcome['rejected'],
+  accepted: PlaceExtraction[]
+): void {
+  const log = currentPipelineLog();
+  if (!log) return;
+  log.increment('candidates_count', candidates.length);
+  log.increment('rejected_count', rejected.length);
+  const byLabel = new Map<string, { place: PlaceExtraction & { candidateRole?: string }; raw: RawPlaceCandidate | undefined }>();
+  refined.forEach((place, index) => {
+    for (const label of [(place.name || '').trim(), place.search_query || '']) {
+      if (label && !byLabel.has(label)) byLabel.set(label, { place, raw: candidates[index] });
+    }
+  });
+  for (const item of rejected) {
+    const match = byLabel.get(item.name);
+    log.addCandidate({
+      pass,
+      decision: 'rejected',
+      reasonCode: reasonCode(item.reason),
+      reason: item.reason,
+      name: item.name,
+      searchQuery: match?.place.search_query || null,
+      mentionType: match?.raw?.mention_type ?? null,
+      modelRole: match?.raw?.role ?? null,
+      baseCategory: match?.raw?.base_category ?? null,
+      category: match?.raw?.category ?? null,
+      city: match?.place.city || null,
+      neighborhood: match?.place.neighborhood || null,
+      address: match?.place.address || null,
+      evidenceIds: match?.raw?.name_evidence ?? [],
+      locationEvidenceIds: match?.raw?.location_evidence ?? [],
+    });
+  }
+  for (const place of accepted) {
+    const key = candidateKey(place.name);
+    if (key && !log.acceptedPass.has(key)) log.acceptedPass.set(key, pass);
+  }
+}
+
+type ExtractionOperation = 'place_extraction' | 'place_recovery' | 'place_extraction_places_only';
+
 async function callExtractionModel(
   bundle: EvidenceBundle,
   includeAnalysis: boolean,
   maxTokens: number,
-  note?: string
+  note?: string,
+  operation: ExtractionOperation = includeAnalysis ? 'place_extraction' : 'place_extraction_places_only'
 ): Promise<{ raw: string; truncated: boolean }> {
   const userMessage = note ? `${note}\n\n${formatEvidenceForPrompt(bundle)}` : formatEvidenceForPrompt(bundle);
-  return executeAICall('chat', async ({ client, model, isGroq }) => {
+  return executeAICall('chat', async ({ client, model, isGroq, reportUsage }) => {
     const response = await client.chat.completions.create({
       model,
       ...(supportsTemperature(model) ? { temperature: 0 } : {}),
@@ -680,15 +741,29 @@ async function callExtractionModel(
       response_format: isGroq ? { type: 'json_object' } : responseFormat(includeAnalysis),
     });
     const choice = response.choices[0];
+    reportUsage?.(chatUsage(response));
     plog('model', includeAnalysis ? 'Extraction + analysis call' : 'Places-only call', {
       provider: isGroq ? 'groq' : 'openai',
       model,
       promptChars: userMessage.length,
       promptTokens: response.usage?.prompt_tokens,
       completionTokens: response.usage?.completion_tokens,
+      cachedTokens: response.usage?.prompt_tokens_details?.cached_tokens,
       finishReason: choice?.finish_reason,
     }, choice?.finish_reason === 'length' ? 'warn' : 'info');
     return { raw: choice?.message?.content || '{}', truncated: choice?.finish_reason === 'length' };
+  }, { operation, promptHash: includeAnalysis ? COMBINED_PROMPT_HASH : PLACES_ONLY_PROMPT_HASH });
+}
+
+/** Evidence counts and snapshot on the current run. */
+function recordEvidence(bundle: EvidenceBundle): void {
+  const log = currentPipelineLog();
+  if (!log) return;
+  log.setEvidence(bundle.items);
+  log.patch({
+    evidence_items: bundle.items.length,
+    evidence_by_source: bundle.items.reduce<Record<string, number>>((counts, item) => ({ ...counts, [item.source]: (counts[item.source] || 0) + 1 }), {}),
+    evidence_availability: bundle.availability,
   });
 }
 
@@ -704,10 +779,14 @@ export class AiEnrichmentService {
   /** Places only (restricted posts, cached re-extraction). */
   static async extractPlaces(content: SocialContent, media: MediaEvidenceInput): Promise<PlaceExtractionOutcome> {
     const bundle = buildEvidence(content, media);
+    recordEvidence(bundle);
     if (bundle.items.length === 0) return { places: [], rejected: [] };
+    const endStage = startStage('extraction', 'places_only');
     const { raw, truncated } = await callExtractionModel(bundle, false, RECOVERY_OUTPUT_TOKENS);
     if (truncated) plog('model', 'Places-only response hit the output budget', undefined, 'warn');
-    return finalizeCandidates(parseCandidates(raw), bundle, content.authorUsername);
+    const outcome = await finalizeCandidates(parseCandidates(raw), bundle, content.authorUsername, { pass: 'restricted_recovery' });
+    endStage('success', { itemsIn: bundle.items.length, itemsOut: outcome.places.length, details: { truncated, rejected: outcome.rejected.length } });
+    return outcome;
   }
 
   /** Legacy signature: plain transcript text and OCR strings. */
@@ -736,11 +815,13 @@ export class AiEnrichmentService {
       bySource: bundle.items.reduce<Record<string, number>>((counts, item) => ({ ...counts, [item.source]: (counts[item.source] || 0) + 1 }), {}),
       items: bundle.items.map((item) => `${item.id} ${item.source}: ${item.text.slice(0, 120)}`),
     });
+    recordEvidence(bundle);
 
     let parsed: any = {};
     let outcome: PlaceExtractionOutcome = { places: [], rejected: [] };
 
     if (bundle.items.length > 0) {
+      const endExtraction = startStage('extraction', 'combined');
       const { raw, truncated } = await callExtractionModel(bundle, true, MAX_OUTPUT_TOKENS);
       let parsedJson: unknown;
       try {
@@ -756,7 +837,12 @@ export class AiEnrichmentService {
       } catch (placeError) {
         plog('model', 'Combined response had no usable places', { error: String(placeError) }, 'warn');
       }
-      outcome = await finalizeCandidates(candidates, bundle, content.authorUsername);
+      outcome = await finalizeCandidates(candidates, bundle, content.authorUsername, { pass: 'primary' });
+      endExtraction('success', {
+        itemsIn: bundle.items.length,
+        itemsOut: outcome.places.length,
+        details: { candidates: candidates.length, rejected: outcome.rejected.length, truncated },
+      });
 
       // Recovery: the list was cut off, or the evidence has more distinct
       // street-address rows than places returned. A places-only pass is merged
@@ -772,17 +858,29 @@ export class AiEnrichmentService {
           markedLocations,
           placesSoFar: outcome.places.length,
         }, 'warn');
+        const endRecovery = startStage('recovery', 'places_only');
+        const placesBefore = outcome.places.length;
         try {
           const found = outcome.places.map((place) => place.name).filter(Boolean).join(', ');
           const note = `CHECK: the evidence marks ${markedLocations} location(s) with 📍 and ${sourceAddressCount} street address(es), ` +
             `but only ${outcome.places.length} place(s) were returned${found ? ` (${found})` : ''}. Return EVERY place, including those already found.`;
-          const recovery = await callExtractionModel(bundle, false, RECOVERY_OUTPUT_TOKENS, note);
-          const recovered = await finalizeCandidates(parseCandidates(recovery.raw), bundle, content.authorUsername);
+          const recovery = await callExtractionModel(bundle, false, RECOVERY_OUTPUT_TOKENS, note, 'place_recovery');
+          const recovered = await finalizeCandidates(parseCandidates(recovery.raw), bundle, content.authorUsername, { pass: 'recovery' });
           outcome = {
             places: mergeSameEntities([...outcome.places, ...recovered.places], bundle),
             rejected: [...outcome.rejected, ...recovered.rejected],
           };
+          // Whether the recovery pass pays for itself: places it added after merging.
+          const added = outcome.places.length - placesBefore;
+          currentPipelineLog()?.patch({ recovery_pass: true, recovery_places_added: added });
+          endRecovery('success', {
+            itemsIn: expected,
+            itemsOut: added,
+            details: { truncated, sourceAddresses: sourceAddressCount, markedLocations, placesBefore, recovered: recovered.places.length },
+          });
         } catch (recoveryError: any) {
+          currentPipelineLog()?.patch({ recovery_pass: true, recovery_places_added: 0 });
+          endRecovery('failed', { itemsIn: expected, itemsOut: 0, error: recoveryError.message || String(recoveryError) });
           plog('model', 'Recovery pass failed', { error: recoveryError.message || String(recoveryError) }, 'warn');
         }
       }

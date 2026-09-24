@@ -1,5 +1,5 @@
 import * as stringSimilarity from 'string-similarity';
-import { plog } from './pipeline-log';
+import { logCall, plog } from './pipeline-log';
 import { MapboxService, type MapboxFeature } from './mapbox.service';
 
 export type GeocodeResult = {
@@ -325,11 +325,28 @@ export class LocationService {
     return 2 * 6_371_000 * Math.asin(Math.sqrt(h));
   }
 
+  /** Every Google Maps request goes through here, so each one is metered on the current run (the URL, which holds the key, is never logged). */
   private static async fetchGoogle(url: string, init?: RequestInit): Promise<Response> {
+    const operation = url.includes('places:searchText')
+      ? 'places_text_search'
+      : url.includes('latlng=') ? 'reverse_geocode' : 'geocode';
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15_000);
+    const started = Date.now();
     try {
-      return await fetch(url, { ...init, signal: controller.signal });
+      const response = await fetch(url, { ...init, signal: controller.signal });
+      logCall({
+        stage: 'geocode',
+        operation,
+        provider: 'google',
+        status: response.ok ? 'success' : 'error',
+        httpStatus: response.status,
+        latencyMs: Date.now() - started,
+      });
+      return response;
+    } catch (error) {
+      logCall({ stage: 'geocode', operation, provider: 'google', status: 'error', latencyMs: Date.now() - started, error: (error as Error)?.message || String(error) });
+      throw error;
     } finally {
       clearTimeout(timeout);
     }

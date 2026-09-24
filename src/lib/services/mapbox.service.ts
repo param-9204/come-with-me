@@ -1,4 +1,4 @@
-import { plog } from './pipeline-log';
+import { logCall, plog } from './pipeline-log';
 
 /** A Mapbox result normalised from the Search Box API (POIs) or Geocoding v6 (places, addresses). */
 export interface MapboxFeature {
@@ -75,15 +75,21 @@ export class MapboxService {
     const token = this.token();
     if (!token || !this.isConfigured()) return [];
     const url = `${baseUrl}?${new URLSearchParams({ ...params, access_token: token })}`;
+    const operation = baseUrl === SEARCH_BOX_URL ? 'mapbox_search' : 'mapbox_geocode';
     for (let attempt = 0; ; attempt++) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+      const started = Date.now();
       let response: Response;
       try {
         response = await fetch(url, { signal: controller.signal });
+      } catch (error) {
+        logCall({ stage: 'geocode', operation, provider: 'mapbox', status: 'error', attempt: attempt + 1, latencyMs: Date.now() - started, error: (error as Error)?.message || String(error) });
+        throw error;
       } finally {
         clearTimeout(timeout);
       }
+      logCall({ stage: 'geocode', operation, provider: 'mapbox', status: response.ok ? 'success' : 'error', attempt: attempt + 1, httpStatus: response.status, latencyMs: Date.now() - started });
       if (response.status === 401 || response.status === 403) {
         this.unavailableUntil = Date.now() + this.UNAVAILABLE_BACKOFF_MS;
         const body = await response.json().catch(() => ({}));

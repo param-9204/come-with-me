@@ -231,7 +231,7 @@ export interface GptVisionFrameResult {
   cta: string[];
   description: string;
   confidence: number;
-  method: 'gpt-4o-vision' | 'google-vision';
+  method: 'gpt-4o-vision' | 'google-vision' | 'glm-ocr';
 }
 
 // ──────────────────────────────────────────────────────────────────────

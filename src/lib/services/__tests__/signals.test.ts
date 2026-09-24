@@ -273,3 +273,4 @@ describe('googleTypeConflict', () => {
     expect(googleTypeConflict('RESTAURANTS', 'point_of_interest', [])).toBeNull();
   });
 });
+

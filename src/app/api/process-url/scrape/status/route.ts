@@ -11,7 +11,8 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: 'Missing required query parameters: runId and actorId' }, { status: 400 });
     }
 
-    const { status, defaultDatasetId } = await ScraperService.getScrapeStatus(runId);
+    const { status, defaultDatasetId, usageTotalUsd, durationMs, startedAt } = await ScraperService.getScrapeStatus(runId);
+    const usage = { usageTotalUsd, durationMs, startedAt };
 
     if (status === 'SUCCEEDED' && defaultDatasetId) {
       const { normalized, raw } = await ScraperService.fetchAndNormalize(defaultDatasetId, actorId);
@@ -25,6 +26,7 @@ export async function GET(request: Request) {
         data: normalized,
         raw,
         partial: isRestricted,
+        usage,
         warning: isRestricted
           ? (raw?.errorDescription || 'Restricted access, only partial data available')
           : null,
@@ -36,6 +38,7 @@ export async function GET(request: Request) {
       status,
       data: null,
       raw: null,
+      usage,
     });
   } catch (error: any) {
     console.error('[API Scrape Status] Error:', error);

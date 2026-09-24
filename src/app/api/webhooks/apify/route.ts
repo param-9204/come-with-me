@@ -1,13 +1,62 @@
 import { NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
 import { ScraperService } from '@/lib/services/scraper.service';
+import { ExtractionLogStore } from '@/lib/services/extraction-log.store';
+
+/**
+ * Scrape stage + Apify usage for the extraction run (when the run id was put
+ * in the webhook payload). Logging never fails the webhook.
+ */
+async function logScrape(
+  extractionRunId: unknown,
+  apifyRunId: unknown,
+  actorId: string | null,
+  ok: boolean,
+  error: string | null,
+  patch?: Record<string, unknown>
+): Promise<void> {
+  if (typeof extractionRunId !== 'string' || !extractionRunId) return;
+  try {
+    const usage = typeof apifyRunId === 'string' && apifyRunId
+      ? await ScraperService.getScrapeStatus(apifyRunId).catch(() => null)
+      : null;
+    await ExtractionLogStore.persistDetached(extractionRunId, {
+      stages: [{
+        stage: 'scrape',
+        provider: 'apify',
+        status: ok ? 'success' : 'failed',
+        startedAt: usage?.startedAt || new Date().toISOString(),
+        durationMs: usage?.durationMs ?? 0,
+        itemsIn: 1,
+        itemsOut: ok ? 1 : 0,
+        error,
+      }],
+      calls: [{
+        stage: 'scrape',
+        operation: 'scrape',
+        provider: 'apify',
+        model: actorId || usage?.actId || null,
+        status: ok ? 'success' : 'error',
+        latencyMs: usage?.durationMs ?? null,
+        error,
+        costUsd: usage?.usageTotalUsd ?? null,
+        costSource: usage?.usageTotalUsd != null ? 'provider_reported' : null,
+      }],
+      patch,
+    });
+  } catch (logError) {
+    console.warn('[Apify Webhook] Could not log the scrape stage:', logError instanceof Error ? logError.message : logError);
+  }
+}
 
 export async function POST(request: Request) {
+  let webhookRunIds: { extractionRunId?: unknown; runId?: unknown } = {};
   try {
     const payload = await request.json();
     console.log('[Apify Webhook] Received payload:', payload);
 
-    const { runId, status, defaultDatasetId, socialPostId } = payload;
+    const { runId, status, defaultDatasetId, socialPostId, extractionRunId } = payload;
+    webhookRunIds = { extractionRunId, runId };
 
     if (!socialPostId) {
       return NextResponse.json({ success: false, error: 'Missing socialPostId' }, { status: 400 });
@@ -28,6 +77,13 @@ export async function POST(request: Request) {
           error_message: JSON.stringify(errorPayload),
         })
         .eq('id', socialPostId);
+      await logScrape(extractionRunId, runId, null, false, errorPayload.error_message, {
+        status: 'failed',
+        failed_stage: 'scraping',
+        error_code: errorPayload.error_code,
+        error_message: errorPayload.error_message,
+        finished_at: new Date().toISOString(),
+      });
       return NextResponse.json({ success: true, status: 'failed_logged' });
     }
 
@@ -73,10 +129,20 @@ export async function POST(request: Request) {
       throw new Error(`Failed to update post status in DB: ${updateError.message}`);
     }
 
+    await logScrape(extractionRunId, runId, actorId, true, null, {
+      content_id: normalized.contentId && !String(normalized.contentId).startsWith('pending_') ? String(normalized.contentId) : null,
+      content_type: normalized.contentType || null,
+    });
     console.log(`[Apify Webhook] Ingestion completed for post: ${socialPostId}`);
     return NextResponse.json({ success: true });
   } catch (err: any) {
     console.error('[Apify Webhook] Fatal error:', err.message);
+    await logScrape(webhookRunIds.extractionRunId, webhookRunIds.runId, null, false, err.message || 'Webhook ingestion failed', {
+      status: 'failed',
+      failed_stage: 'scrape_ingest',
+      error_code: 'WEBHOOK_INGEST_FAILURE',
+      error_message: err.message || 'Webhook ingestion failed',
+    });
     return NextResponse.json({ success: false, error: err.message }, { status: 500 });
   }
 }

@@ -8,6 +8,7 @@ export const maxDuration = 300;
 
 export async function POST(request: Request) {
   const log = new PipelineLog(`media-${Date.now()}`, { route: 'media' });
+  log.part = 'media';
   return withPipelineLog(log, async () => {
     try {
       const body = await request.json();
@@ -18,6 +19,8 @@ export async function POST(request: Request) {
       // Same run id as the analysis step, so both halves of a post share one id in the logs.
       log.runId = String(content.contentId || log.runId);
       Object.assign(log.context, { platform: content.platform, contentId: content.contentId });
+      // Joins the caller's extraction run when it passes one; standalone calls are not persisted.
+      if (typeof body.extractionRunId === 'string' && body.extractionRunId) log.extractionRunId = body.extractionRunId;
 
       const result = await MediaEvidenceService.collect(content, body.rawApifyData || content.rawApifyData || null, {
         persistAudio: body.persistAudio !== false,
@@ -39,7 +42,7 @@ export async function POST(request: Request) {
       plog('media', 'Media processing failed', { error: error.message || String(error) }, 'error');
       return NextResponse.json({ success: false, error: error.message || 'Media processing failed', log: log.events }, { status: 500 });
     } finally {
-      log.flush();
+      await log.flush();
     }
   });
 }

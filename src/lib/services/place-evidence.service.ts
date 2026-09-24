@@ -819,6 +819,14 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
     ? places.filter((place) => !!place.name && findNameSupport(place.name, bundle).some(isPinned)).length
     : 0;
   const pinLabelled = pinnedCandidates >= 2;
+  // Local OCR cannot see the 📍 icon (PaddleOCR reads it as a letter, Tesseract
+  // drops it). A line it read on frames no vision reader saw has unknown pin
+  // status, so it must not count as "un-pinned". Measured on a real reel:
+  // Z.ai failed on the two Buvette frames, Paddle read "e Buvette", and the
+  // rule dropped a real place.
+  const visionReadFrames = new Set(bundle.items.filter((item) => item.source === 'vision_ocr').flatMap((item) => item.frames || []));
+  const isPinBlind = (item: EvidenceItem) =>
+    item.source === 'ocr' && !!item.frames?.length && item.frames.every((frame) => !visionReadFrames.has(frame));
 
   for (const place of places) {
     const name = (place.name || '').trim();
@@ -870,7 +878,7 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
       // A list line ("• Mei Lah Wah", "1. Kasama") is part of the guide even when
       // other places carry pins; only stray text (a poster, a plate) is dropped.
       const isListItem = (item: EvidenceItem) => isScreenText(item) && LIST_ITEM_RE.test(item.text);
-      if (pinLabelled && support.every(isScreenText) && !support.some(isPinned) && !support.some(isListItem)) {
+      if (pinLabelled && support.every(isScreenText) && !support.some(isPinned) && !support.some(isListItem) && !support.some(isPinBlind)) {
         reject('un-pinned screen text in a pin-labelled post'); continue;
       }
     }
