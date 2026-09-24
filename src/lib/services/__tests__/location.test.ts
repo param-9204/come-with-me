@@ -139,3 +139,74 @@ describe('Places quota handling', () => {
     expect(result).toMatchObject({ matchedName: 'Buvette', placeId: 'place-1', neighborhood: 'West Village' });
   });
 });
+
+describe('Google first, Mapbox only as a fallback', () => {
+  const mapboxCity = {
+    properties: {
+      name: 'New York', full_address: 'New York, New York, United States', feature_type: 'place',
+      coordinates: { latitude: 40.7127, longitude: -74.006 }, context: { place: { name: 'New York' } },
+    },
+  };
+  const mapboxPoi = (name: string, address: string, neighborhood: string) => ({
+    properties: {
+      name, full_address: address, feature_type: 'poi', mapbox_id: `mb-${name}`, poi_category: ['food', 'restaurant'],
+      coordinates: { latitude: 40.7599, longitude: -73.9848 },
+      context: { place: { name: 'New York City' }, neighborhood: { name: neighborhood }, country: { country_code: 'us' } },
+    },
+  });
+
+  beforeEach(() => {
+    process.env.NEXT_PUBLIC_MAPBOX_TOKEN = 'pk.test';
+    (LocationService as unknown as { mapboxCityCentres: Map<string, unknown> }).mapboxCityCentres.clear();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    delete process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
+    vi.restoreAllMocks();
+  });
+
+  it('never calls Mapbox when Google verifies the place', async () => {
+    const calls = mockFetch(() => ({ body: { places: [place({})] } }));
+    const result = await LocationService.geocodePlace('Buvette', 'New York');
+    expect(result).toMatchObject({ provider: 'google', matchedName: 'Buvette' });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain('places.googleapis.com');
+  });
+
+  it('re-checks the Google results without the neighbourhood before spending a request or calling Mapbox', async () => {
+    // The post's context said Dumbo; Google lists Buvette in the West Village.
+    const calls = mockFetch(() => ({ body: { places: [place({})] } }));
+    const result = await LocationService.geocodePlace('Buvette', 'New York', '', 'Dumbo');
+    expect(result).toMatchObject({ provider: 'google', neighborhood: 'West Village' });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('calls Mapbox only after every Google attempt misses, and sends each Mapbox search once (real case)', async () => {
+    const calls = mockFetch((url) => {
+      if (url.includes('places.googleapis.com')) return { body: { places: [] } };
+      if (url.includes('/geocode/v6/')) return { body: { features: [mapboxCity] } };
+      return { body: { features: [mapboxPoi("Lillie's Victorian", '249 W 49th St, New York, New York 10019, United States', 'Theater District')] } };
+    });
+    const result = await LocationService.geocodePlace("Lillie's Victorian", 'New York', '', 'Midtown Manhattan');
+
+    expect(result).toMatchObject({ provider: 'mapbox', formattedAddress: '249 W 49th St, New York, New York 10019, United States' });
+    const google = calls.map((url, index) => (url.includes('places.googleapis.com') ? index : -1)).filter((index) => index >= 0);
+    const mapbox = calls.map((url, index) => (url.includes('api.mapbox.com') ? index : -1)).filter((index) => index >= 0);
+    expect(google).toHaveLength(2); // with and without the neighbourhood
+    expect(Math.min(...mapbox)).toBeGreaterThan(Math.max(...google));
+    const poiQueries = calls.filter((url) => url.includes('searchbox')).map((url) => new URL(url).searchParams.get('q'));
+    expect(poiQueries).toEqual(["Lillie's Victorian", "Lillie's Victorian Midtown Manhattan"]);
+  });
+
+  it('goes straight to Mapbox while the Google daily quota is used up', async () => {
+    (LocationService as unknown as Record<string, number>).placesQuotaBlockedUntil = Date.now() + 60_000;
+    const calls = mockFetch((url) => (url.includes('/geocode/v6/')
+      ? { body: { features: [mapboxCity] } }
+      : { body: { features: [mapboxPoi('Buvette', '42 Grove St, New York, New York 10014, United States', 'West Village')] } }));
+    const result = await LocationService.geocodePlace('Buvette', 'New York');
+    expect(result).toMatchObject({ provider: 'mapbox' });
+    expect(calls.some((url) => url.includes('places.googleapis.com'))).toBe(false);
+  });
+});

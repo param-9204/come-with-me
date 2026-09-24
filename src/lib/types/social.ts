@@ -234,6 +234,13 @@ export interface GptVisionFrameResult {
   /** The actual OCR backend; older stored rows may retain the previous mini label. */
   method: 'gpt-4o-mini-vision' | 'gpt-4o-vision' | 'google-vision';
   /**
+   * Strings from `texts` that are physically part of the filmed scene (shop or
+   * street signs, menus, packaging, billboards) rather than text added in
+   * editing (titles, stickers, list overlays, pins). Absent when the OCR
+   * backend cannot tell them apart (Google Vision, older stored rows).
+   */
+  sceneTexts?: string[];
+  /**
    * Present only on one representative empty frame when Vision could not be
    * used. Keeping it on a frame preserves the existing stored OCR schema
    * without duplicating the same failure payload for every video frame.
@@ -291,6 +298,12 @@ export interface EvidenceItem {
   timestamps?: number[];
   /** OCR only: frame indexes the line was read in (lets multi-line signs be matched per frame). */
   frames?: number[];
+  /**
+   * OCR only: true when Vision reported this line as text physically in the
+   * scene (a street sign, a logo on a cup) every time it was read, rather than
+   * an overlay the creator added. Undefined when unknown.
+   */
+  scene?: boolean;
   /** For account items. */
   username?: string;
   displayName?: string;

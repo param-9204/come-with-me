@@ -3,11 +3,12 @@ import { executeAICall } from './ai-client';
 import { plog } from './pipeline-log';
 import type { GptVisionFrameResult, VideoFrame } from '../types/social';
 
-const FRAME_SYSTEM_PROMPT = `Read every visible text string in this TikTok video frame. Focus on venue names, addresses, neighborhood/city text, list numbering, handles, and labels. Do not infer text that is not visible. Return JSON with: {"texts":string[],"brands":string[],"locations":string[],"prices":string[],"cta":string[],"description":string,"confidence":number}.`;
+const FRAME_SYSTEM_PROMPT = `Read every visible text string in this TikTok video frame. Focus on venue names, addresses, neighborhood/city text, list numbering, handles, and labels. Do not infer text that is not visible. List in "scene" the strings from "texts" that are physically part of the filmed scene (shop and street signs, menus, packaging, cups, posters, billboards, screens), not text added in editing (titles, captions, stickers, list overlays, location pins, watermarks). Return JSON with: {"texts":string[],"scene":string[],"brands":string[],"locations":string[],"prices":string[],"cta":string[],"description":string,"confidence":number}.`;
 
 const BATCH_SYSTEM_PROMPT = `You are an OCR engine for social-video frames. For each numbered image, transcribe every visible text string exactly as written, one string per line of text: overlays, captions, location stickers, shop signs, menus, street signs, handles. Small text matters as much as large titles.
 Location markers come in many styles: 📍 or 📌 emoji, map-pin or location icons, Instagram/TikTok location stickers, and labels such as "Location:", "Address:" or "Where:". Write each marked item as "📍 " followed by everything written on it — venue name, address, neighbourhood, city — joining the lines of one sticker with " · " (e.g. "📍 Buvette · 42 Grove St · West Village"). These usually identify the place shown. Keep original spelling and language. Do not describe the image and do not infer text that is not visible.
-Return JSON: {"images":[{"index":0,"texts":[]}]}. Include every image index and every line of text — dense lists (20+ entries with addresses) are normal; never shorten or summarise.`;
+Then sort the strings by where they are: "scene" lists the strings from "texts" that are physically part of the filmed scene (shop and street signs, menus, packaging, cups, posters, billboards, screens, clothing, vehicles). Text added on top of the picture in editing (titles, captions, subtitles, stickers, list overlays, location pins, watermarks) is not scene. Copy each scene string exactly as it appears in "texts".
+Return JSON: {"images":[{"index":0,"texts":[],"scene":[]}]}. Include every image index and every line of text — dense lists (20+ entries with addresses) are normal; never shorten or summarise.`;
 
 function cleanStrings(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
@@ -15,6 +16,16 @@ function cleanStrings(value: unknown): string[] {
     .filter((item): item is string => typeof item === 'string')
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+/**
+ * Scene strings the model also transcribed. Anything not in `texts` is
+ * dropped, so a mislabelled or invented string never becomes evidence.
+ */
+function sceneSubset(texts: string[], scene: unknown): string[] {
+  const key = (value: string) => value.toLowerCase().replace(/\s+/g, ' ').trim();
+  const sceneKeys = new Set(cleanStrings(scene).map(key));
+  return texts.filter((text) => sceneKeys.has(key(text)));
 }
 
 /**
@@ -70,10 +81,12 @@ export class GptVisionOcrService {
           resultSummary: { finishReason: response.choices[0]?.finish_reason || null },
         });
         const result = JSON.parse(response.choices[0]?.message?.content || '{}');
+        const texts = cleanStrings(result.texts);
         return {
           frameIndex: frame.frameIndex,
           timestamp: frame.timestamp,
-          texts: cleanStrings(result.texts),
+          texts,
+          sceneTexts: sceneSubset(texts, result.scene),
           brands: cleanStrings(result.brands),
           locations: cleanStrings(result.locations),
           prices: cleanStrings(result.prices),
@@ -98,7 +111,10 @@ export class GptVisionOcrService {
   }
 
   /** One request for up to 4 images. Returns null texts when the answer was cut off or unreadable. */
-  private static async readBatch(batch: VideoFrame[], tokensPerImage: number): Promise<{ texts: string[][] | null; truncated: boolean }> {
+  private static async readBatch(
+    batch: VideoFrame[],
+    tokensPerImage: number
+  ): Promise<{ texts: string[][] | null; scene: string[][]; truncated: boolean }> {
     return executeAICall('vision', async ({ client, model }, reportUsage) => {
       const response = await client.chat.completions.create({
         model,
@@ -142,12 +158,14 @@ export class GptVisionOcrService {
       try {
         parsed = JSON.parse(choice?.message?.content || '{}');
       } catch {
-        return { texts: null, truncated };
+        return { texts: null, scene: [], truncated };
       }
       const byIndex = new Map<number, any>(
         (Array.isArray(parsed.images) ? parsed.images : []).map((item: any) => [Number(item?.index), item])
       );
-      return { texts: batch.map((_, index) => cleanStrings(byIndex.get(index)?.texts)), truncated };
+      const texts = batch.map((_, index) => cleanStrings(byIndex.get(index)?.texts));
+      const scene = texts.map((frameTexts, index) => sceneSubset(frameTexts, byIndex.get(index)?.scene));
+      return { texts, scene, truncated };
     });
   }
 
@@ -158,7 +176,7 @@ export class GptVisionOcrService {
    */
   static async extractTextFromFramesBatched(frames: VideoFrame[], perRequest = 4): Promise<GptVisionFrameResult[]> {
     const results: GptVisionFrameResult[] = [];
-    const toResult = (frame: VideoFrame, texts: string[]) => ({ ...this.emptyResult(frame), texts });
+    const toResult = (frame: VideoFrame, texts: string[], sceneTexts: string[] = []) => ({ ...this.emptyResult(frame), texts, sceneTexts });
     let limitReached: GptVisionFrameResult['warning'] | undefined;
     for (let offset = 0; offset < frames.length; offset += perRequest) {
       const batch = frames.slice(offset, offset + perRequest);
@@ -172,7 +190,7 @@ export class GptVisionOcrService {
       try {
         const first = await this.readBatch(batch, 1_500);
         if (first.texts && !first.truncated) {
-          batch.forEach((frame, index) => results.push(toResult(frame, first.texts![index])));
+          batch.forEach((frame, index) => results.push(toResult(frame, first.texts![index], first.scene[index])));
           continue;
         }
         plog('vision', 'GPT vision answer was cut off; re-reading images one at a time', { frames: batch.length }, 'warn');
@@ -183,7 +201,7 @@ export class GptVisionOcrService {
             if (!single.texts || single.truncated) {
               plog('vision', `GPT vision could not read all text on frame ${frame.frameIndex}`, { truncated: single.truncated }, 'error');
             }
-            results.push(toResult(frame, single.texts?.[0] || []));
+            results.push(toResult(frame, single.texts?.[0] || [], single.scene[0] || []));
           } catch (error: any) {
             const warning = this.limitWarning(error);
             if (warning) {

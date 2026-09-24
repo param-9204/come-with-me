@@ -242,7 +242,9 @@ export function findNameSupport(name: string, bundle: EvidenceBundle): EvidenceI
     if (!isScreenText(item)) continue;
     for (const frame of item.frames || []) byFrame.set(frame, [...(byFrame.get(frame) || []), item]);
   }
-  const nameTokens = withoutArticle(normalizeForMatch(name)).split(' ').filter((token) => token.length >= 2);
+  const nameNorm = withoutArticle(normalizeForMatch(name));
+  const nameTokens = nameNorm.split(' ').filter((token) => token.length >= 2);
+  const nameCompact = nameNorm.replace(/\s+/g, '');
   const fromFrames = new Set<EvidenceItem>();
   for (const items of byFrame.values()) {
     if (items.length < 2) continue;
@@ -250,7 +252,12 @@ export function findNameSupport(name: string, bundle: EvidenceBundle): EvidenceI
     if (!itemSupportsName(name, joined)) continue;
     for (const item of items) {
       const text = normalizeForMatch(item.text);
-      if (nameTokens.some((token) => containsPhrase(text, token))) fromFrames.add(item);
+      const fragment = text.replace(/\s+/g, '');
+      // Whole name words ("MUSIC" in "Radio City Music Hall"), or pieces of a
+      // single word split across lines ("Ridge" + "Wood" = "Ridgewood").
+      if (nameTokens.some((token) => containsPhrase(text, token)) || (fragment.length >= 3 && nameCompact.includes(fragment))) {
+        fromFrames.add(item);
+      }
     }
   }
   return [...direct, ...[...fromFrames].filter((item) => !direct.includes(item))];
@@ -371,8 +378,12 @@ function splitLongLine(line: string, max = 320): string[] {
   return chunks.flatMap((chunk) => chunk.length > max * 1.5 ? chunk.match(new RegExp(`.{1,${max}}(\\s|$)`, 'g')) || [chunk] : [chunk]);
 }
 
-type OcrEntry = { text: string; confidence: number; timestamp?: number; frame?: number };
-type OcrGroup = { text: string; key: string; confidence: number; timestamps: number[]; frames: number; frameIndexes: number[] };
+type OcrEntry = { text: string; confidence: number; timestamp?: number; frame?: number; scene?: boolean };
+type OcrGroup = {
+  text: string; key: string; confidence: number; timestamps: number[]; frames: number; frameIndexes: number[];
+  /** Sightings Vision labelled as scene text / as overlay text; unknown sightings count in neither. */
+  sceneVotes: number; overlayVotes: number;
+};
 
 /** On-screen lines longer than this are prose (book pages, menus, articles), never a place name. */
 const MAX_OCR_LINE_WORDS = 14;
@@ -415,8 +426,12 @@ function groupOcrLines(entries: OcrEntry[]): OcrGroup[] {
     const key = normalizeForMatch(entry.text);
     if (!key) continue;
     const existing = groups.find((group) => isOcrVariant(group.key, key));
+    const sceneVote = entry.scene === true ? 1 : 0;
+    const overlayVote = entry.scene === false ? 1 : 0;
     if (existing) {
       existing.frames++;
+      existing.sceneVotes += sceneVote;
+      existing.overlayVotes += overlayVote;
       if (entry.timestamp !== undefined && !existing.timestamps.includes(entry.timestamp)) existing.timestamps.push(entry.timestamp);
       if (entry.frame !== undefined && !existing.frameIndexes.includes(entry.frame)) existing.frameIndexes.push(entry.frame);
       if (entry.confidence > existing.confidence) {
@@ -431,10 +446,17 @@ function groupOcrLines(entries: OcrEntry[]): OcrGroup[] {
         timestamps: entry.timestamp !== undefined ? [entry.timestamp] : [],
         frames: 1,
         frameIndexes: entry.frame !== undefined ? [entry.frame] : [],
+        sceneVotes: sceneVote,
+        overlayVotes: overlayVote,
       });
     }
   }
   return groups;
+}
+
+/** A line is scene text only when every labelled sighting of it was scene text. */
+function isSceneGroup(group: OcrGroup): boolean {
+  return group.sceneVotes > 0 && group.overlayVotes === 0;
 }
 
 export function buildEvidence(content: SocialContent, media: MediaEvidenceInput = {}): EvidenceBundle {
@@ -492,11 +514,22 @@ export function buildEvidence(content: SocialContent, media: MediaEvidenceInput 
 
   const visionEntries: OcrEntry[] = [];
   for (const frame of media.visionFrames || []) {
+    // Vision labels text that is physically in the scene (street signs, cup
+    // logos) when it can; frames without the label stay "unknown".
+    const sceneKeys = Array.isArray(frame.sceneTexts) ? new Set(frame.sceneTexts.map(normalizeForMatch)) : null;
+    const texts = new Set(frame.texts || []);
     // `locations` is structured Vision output and may contain a name that is
     // absent from the plain transcription. Preserve it as normal visual
     // evidence, but do not duplicate text returned in both fields.
     for (const textLine of new Set([...(frame.texts || []), ...(frame.locations || [])])) {
-      visionEntries.push({ text: normalizeLocationMarker(textLine), confidence: 0.9, timestamp: isSingleVideo ? frame.timestamp : undefined, frame: frame.frameIndex });
+      const scene = sceneKeys && texts.has(textLine) ? sceneKeys.has(normalizeForMatch(textLine)) : undefined;
+      visionEntries.push({
+        text: normalizeLocationMarker(textLine),
+        confidence: 0.9,
+        timestamp: isSingleVideo ? frame.timestamp : undefined,
+        frame: frame.frameIndex,
+        scene,
+      });
     }
   }
 
@@ -532,6 +565,7 @@ export function buildEvidence(content: SocialContent, media: MediaEvidenceInput 
       weight: SOURCE_WEIGHTS.vision_ocr,
       timestamps: group.timestamps.length ? group.timestamps.sort((a, b) => a - b) : undefined,
       frames: group.frameIndexes.length ? group.frameIndexes : undefined,
+      ...(isSceneGroup(group) ? { scene: true } : {}),
     });
   }
 
@@ -649,7 +683,13 @@ export function formatEvidenceForPrompt(bundle: EvidenceBundle): string {
     const meta = [
       item.source === 'account' ? item.relation : '',
       formatTimestamps(item),
+      // Carousel slides / separate images have no timeline: the image number
+      // tells the model which lines were written on the same slide.
+      isScreenText(item) && !item.timestamps?.length && item.frames?.length
+        ? `img=${[...item.frames].sort((a, b) => a - b).slice(0, 6).map((frame) => frame + 1).join(',')}`
+        : '',
       item.source === 'ocr' ? `ocr_conf=${item.weight.toFixed(2)}` : '',
+      item.scene ? 'scene' : '',
     ].filter(Boolean).join(' ');
     return `${item.id} ${PROMPT_SOURCE_LABELS[item.source]}${meta ? `(${meta})` : ''}: ${item.text}`;
   });
@@ -980,11 +1020,34 @@ function preferredName(a: PlaceExtraction, b: PlaceExtraction): string {
   return ((a.name || '').length >= (b.name || '').length ? a.name : b.name) || '';
 }
 
+/**
+ * A partial reading of an on-screen card ("The Neem") and the full card
+ * ("Under the Neem Trees"): both cite the same screen line and the shorter
+ * name is a phrase inside the longer one. Needs at least two words so a bare
+ * "Joe's" is never folded into "Joe's Pizza" on a dense list slide.
+ */
+function sameScreenCard(a: PlaceExtraction, b: PlaceExtraction, bundle: EvidenceBundle): boolean {
+  const aName = normalizeForMatch(a.name);
+  const bName = normalizeForMatch(b.name);
+  if (!aName || !bName || aName === bName) return false;
+  const [shorter, longer] = aName.length <= bName.length ? [aName, bName] : [bName, aName];
+  if (shorter.split(' ').length < 2 || !containsPhrase(longer, shorter)) return false;
+  const aCity = normalizeForMatch(LocationService.cleanCityName(a.city));
+  const bCity = normalizeForMatch(LocationService.cleanCityName(b.city));
+  if (aCity && bCity && aCity !== bCity) return false;
+  const screenIds = (place: PlaceExtraction) => new Set((place.evidence_ids || []).filter((id) => {
+    const item = bundle.byId.get(id);
+    return !!item && isScreenText(item);
+  }));
+  const bIds = screenIds(b);
+  return [...screenIds(a)].some((id) => bIds.has(id));
+}
+
 /** Merge candidates that refer to the same place; evidence is unioned and the score recomputed. */
 export function mergeSameEntities(places: PlaceExtraction[], bundle: EvidenceBundle): PlaceExtraction[] {
   const merged: PlaceExtraction[] = [];
   for (const place of places) {
-    const index = merged.findIndex((existing) => sameEntity(existing, place));
+    const index = merged.findIndex((existing) => sameEntity(existing, place) || sameScreenCard(existing, place, bundle));
     if (index < 0) {
       merged.push(place);
       continue;

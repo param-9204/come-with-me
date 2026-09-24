@@ -4,7 +4,7 @@ import { plog, recordPipelineOperation } from './pipeline-log';
 
 const ENDPOINT = 'https://vision.googleapis.com/v1/images:annotate';
 const IMAGES_PER_REQUEST = 8;
-const REQUEST_TIMEOUT_MS = 20_000;
+const REQUEST_TIMEOUT_MS = 16_000;
 
 /** Thrown when the key is missing, the API is disabled, or the key is not allowed to call it. */
 export class GoogleVisionUnavailableError extends Error {}

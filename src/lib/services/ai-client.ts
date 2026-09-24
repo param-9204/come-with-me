@@ -1,7 +1,12 @@
 import OpenAI from 'openai';
 import { plog, recordPipelineOperation, type PipelineStage } from './pipeline-log';
 
-export type AITaskType = 'chat' | 'vision' | 'audio' | 'audio-translation';
+/**
+ * 'chat-recovery' is the places-only second look that runs when the first
+ * extraction returned fewer places than the evidence shows. It uses
+ * OPENAI_RECOVERY_MODEL when set, otherwise the normal chat model.
+ */
+export type AITaskType = 'chat' | 'chat-recovery' | 'vision' | 'audio' | 'audio-translation';
 
 export interface AIClientConfig {
   client: OpenAI;
@@ -35,7 +40,9 @@ function openAiConfig(task: AITaskType, apiKey: string): AIClientConfig {
     ? envModel('OPENAI_AUDIO_MODEL', 'whisper-1')
     : task === 'vision'
       ? envModel('OPENAI_VISION_MODEL', 'gpt-4o')
-      : envModel('OPENAI_CHAT_MODEL', 'gpt-4o-mini');
+      : task === 'chat-recovery'
+        ? envModel('OPENAI_RECOVERY_MODEL', envModel('OPENAI_CHAT_MODEL', 'gpt-4o-mini'))
+        : envModel('OPENAI_CHAT_MODEL', 'gpt-4o-mini');
   return { client: new OpenAI({ apiKey }), model, provider: 'openai', isGroq: false };
 }
 
