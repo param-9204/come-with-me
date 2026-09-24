@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   bestCasing, buildEvidence, hasLocationMarker, normalizeLocationMarker, combineSupport, formatEvidenceForPrompt, itemSupportsName, reconcileCategoryWithGoogle,
-  sameEntity, categoryFromGoogleType,
+  sameEntity, categoryFromGoogleType, scoreAndFilterCandidates,
 } from '../place-evidence.service';
 import type { EvidenceItem, PlaceExtraction } from '../../types/social';
 import { makeContent, ocrFrame, speech, visionFrame } from './fixtures';
@@ -79,6 +79,39 @@ describe('name support', () => {
     const tagged = item('account', 'x', { weight: 0.75 });
     expect(combineSupport([ocrA, ocrB])).toBeCloseTo(0.65, 5);
     expect(combineSupport([ocrB, tagged])).toBeCloseTo(1 - 0.35 * 0.25, 5);
+  });
+});
+
+describe('visual guide candidates', () => {
+  it('keeps split same-frame map labels that the model incorrectly calls background', () => {
+    const bundle = buildEvidence(makeContent({ caption: 'Five neighbourhoods to explore in NYC' }), {
+      visionFrames: [
+        visionFrame(4, 4, ['Ridge', 'Wood']),
+        visionFrame(5, 5, ['Woodside']),
+        visionFrame(6, 6, ['Park Slope']),
+        visionFrame(7, 7, ['Crown Heights']),
+      ],
+    });
+    const candidates: any[] = ['Ridgewood', 'Woodside', 'Park Slope', 'Crown Heights'].map((name) => ({
+      ...place({ name, city: 'New York', category: 'CITY', base_category: 'CITY', role: undefined }),
+      candidateRole: 'background',
+    }));
+
+    const result = scoreAndFilterCandidates(candidates, bundle);
+    expect(result.places.map((entry) => entry.name)).toEqual(['Ridgewood', 'Woodside', 'Park Slope', 'Crown Heights']);
+    expect(result.rejected).toEqual([]);
+  });
+
+  it('does not promote an isolated background city label', () => {
+    const bundle = buildEvidence(makeContent({ caption: 'Dinner at a hidden restaurant' }), {
+      visionFrames: [visionFrame(4, 4, ['Ridge', 'Wood'])],
+    });
+    const result = scoreAndFilterCandidates([{
+      ...place({ name: 'Ridgewood', city: 'New York', category: 'CITY', base_category: 'CITY', role: undefined }),
+      candidateRole: 'background',
+    } as any], bundle);
+    expect(result.places).toEqual([]);
+    expect(result.rejected[0]).toMatchObject({ name: 'Ridgewood', reason: 'role:background' });
   });
 });
 

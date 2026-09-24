@@ -5,7 +5,7 @@ import { candidate, makeContent, modelResponse, visionFrame } from './fixtures';
 const model = vi.hoisted(() => ({ responses: [] as string[], calls: [] as Array<{ user: string }> }));
 vi.mock('../ai-client', () => ({
   supportsTemperature: () => true,
-  executeAICall: async (_task: string, fn: (config: unknown) => Promise<unknown>) => fn({
+  executeAICall: async (_task: string, fn: (config: unknown, reportUsage?: () => void) => Promise<unknown>) => fn({
     model: 'test-model', provider: 'openai', isGroq: false,
     client: {
       chat: {
@@ -18,7 +18,7 @@ vi.mock('../ai-client', () => ({
         },
       },
     },
-  }),
+  }, () => {}),
 }));
 
 import { AiEnrichmentService } from '../ai-enrichment.service';

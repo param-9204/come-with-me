@@ -5,12 +5,13 @@ import { candidate, makeContent, modelResponse, ocrFrame, speech, visionFrame } 
 // inspect the evidence prompt it was sent.
 const model = vi.hoisted(() => ({
   responses: [] as string[],
+  errors: [] as Error[],
   calls: [] as Array<{ system: string; user: string }>,
 }));
 
 vi.mock('../ai-client', () => ({
   supportsTemperature: () => true,
-  executeAICall: async (_task: string, fn: (config: unknown) => Promise<unknown>) => fn({
+  executeAICall: async (_task: string, fn: (config: unknown, reportUsage?: () => void) => Promise<unknown>) => fn({
     model: 'test-model',
     provider: 'openai',
     isGroq: false,
@@ -19,13 +20,15 @@ vi.mock('../ai-client', () => ({
         completions: {
           create: async (request: { messages: Array<{ content: string }> }) => {
             model.calls.push({ system: request.messages[0].content, user: request.messages[1].content });
+            const error = model.errors.shift();
+            if (error) throw error;
             const content = model.responses.shift() ?? modelResponse([]);
             return { choices: [{ message: { content }, finish_reason: 'stop' }] };
           },
         },
       },
     },
-  }),
+  }, () => {}),
 }));
 
 import { AiEnrichmentService } from '../ai-enrichment.service';
@@ -39,6 +42,7 @@ async function extract(content: ReturnType<typeof makeContent>, media: Parameter
 
 beforeEach(() => {
   model.responses.length = 0;
+  model.errors.length = 0;
   model.calls.length = 0;
   vi.restoreAllMocks();
 });
@@ -52,6 +56,22 @@ describe('place found in a single source', () => {
     expect(places).toHaveLength(1);
     expect(places[0]).toMatchObject({ name: 'Taqueria El Sol', city: 'Austin', evidence_sources: ['caption'] });
     expect(places[0].explanation).toBe('Name found in the caption; location from the hashtags.');
+  });
+
+  it('keeps an explicitly stated city but rejects a founding year mistaken for an address', async () => {
+    const content = makeContent({
+      caption: 'Casa Carmen Winery is in West Grove, PA. Founded in 2017 by two brothers.',
+      contentType: 'post',
+      videoUrl: '',
+    });
+    const { places } = await extract(content, {}, [
+      candidate({
+        name: 'Casa Carmen Winery', city: 'West Grove', address: '2017 by Street',
+        name_evidence: ['C1'], location_evidence: ['C1'],
+      }),
+    ]);
+    expect(places).toHaveLength(1);
+    expect(places[0]).toMatchObject({ name: 'Casa Carmen Winery', city: 'West Grove', address: '' });
   });
 
   it('on-screen text only (caption says nothing), with the city from the location tag', async () => {
@@ -417,6 +437,44 @@ describe('false positives are rejected', () => {
 });
 
 describe('resilience', () => {
+  it('recovers every venue card from Vision and drops a repeated guide watermark', async () => {
+    const content = makeContent({ caption: 'Most popular dining spots in Ahmedabad' });
+    const media = {
+      visionFrames: [
+        visionFrame(0, 0, ['SWAGATAM AMDAVAD', 'MOST POPULAR', 'DINING SPOTS', 'IN AHMEDABAD']),
+        visionFrame(1, 1, ['SWAGATAM AMDAVAD', 'MAUVE', 'Sindhu Bhavan']),
+        visionFrame(2, 2, ['SWAGATAM AMDAVAD', 'RUNGG PREMIUM DINING', 'NehruNagar']),
+        visionFrame(3, 3, ['SWAGATAM AMDAVAD', 'PEP HOUSE', 'Thaltej']),
+        visionFrame(4, 4, ['SWAGATAM AMDAVAD', 'THE PRIMO BY', 'MANN & SALWA', 'Ambli']),
+        visionFrame(5, 5, ['SWAGATAM AMDAVAD', 'PATANG', 'Ellisbridge']),
+        visionFrame(6, 6, ['SWAGATAM AMDAVAD', '@MANGO', 'Thaltej']),
+        visionFrame(7, 7, ['SWAGATAM AMDAVAD', 'UNDER THE NEEM', 'TREES', 'Bodakdev']),
+        visionFrame(8, 8, ['SWAGATAM AMDAVAD', 'LAUREL', 'Ambli']),
+      ],
+    };
+    const result = await extract(content, media, [
+      candidate({ name: 'Swagatam Amdavad', city: 'Ahmedabad', name_evidence: ['V1'] }),
+      candidate({ name: 'Rungg Premium Dining', city: 'Ahmedabad', name_evidence: ['V7'] }),
+      candidate({ name: 'PEP House', city: 'Ahmedabad', name_evidence: ['V9'] }),
+      candidate({ name: 'THE Primo BY Mann & Salwa', city: 'Ahmedabad', name_evidence: ['V11', 'V12'] }),
+      candidate({ name: 'Patang', city: 'Ahmedabad', name_evidence: ['V14'] }),
+      candidate({ name: 'THE Neem', city: 'Ahmedabad', name_evidence: ['V17'] }),
+    ]);
+    expect(result.places.map((place) => place.name.toLowerCase())).toEqual([
+      'rungg premium dining', 'pep house', 'the primo by mann & salwa', 'patang',
+      'under the neem trees', 'mauve', '@mango', 'laurel',
+    ]);
+    expect(result.places.map((place) => place.name)).not.toContain('Swagatam Amdavad');
+  });
+
+  it('returns verified source data when all AI providers are rate-limited', async () => {
+    model.errors.push(Object.assign(new Error('429 Rate Limit reached on tokens per min'), { status: 429 }));
+    const result = await AiEnrichmentService.analyzeContent(makeContent({ caption: 'Kasama, Chicago' }), {}, {});
+    expect(result?.places).toEqual([]);
+    expect(result?.warning).toContain('rate-limited');
+    expect(result?.analysis.caption_analysis.original_caption).toBe('Kasama, Chicago');
+  });
+
   it('skips the model call when there is no evidence at all', async () => {
     const result = await AiEnrichmentService.analyzeContent(makeContent({ caption: '', videoUrl: '' }), {}, {});
     expect(result?.places).toEqual([]);

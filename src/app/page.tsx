@@ -160,7 +160,7 @@ function OcrComparisonDemo({ ocr }: { ocr: OcrComparisonResult }) {
                   : "text-zinc-500 border-transparent hover:text-zinc-300"
               }`}
             >
-              {id === "gpt" ? "GPT-4o Vision" : "Apify OCR (Tesseract)"}
+              {id === "gpt" ? "GPT-4o mini Vision" : "Apify OCR (Tesseract)"}
             </button>
           ))}
         </div>
@@ -181,7 +181,7 @@ function OcrComparisonDemo({ ocr }: { ocr: OcrComparisonResult }) {
         >
           <div className="flex items-center gap-2 mb-3">
             <div className="w-1.5 h-1.5 rounded-full bg-indigo-400 shrink-0" />
-            <span className="text-xs font-semibold text-zinc-300">GPT-4o Vision</span>
+            <span className="text-xs font-semibold text-zinc-300">GPT-4o mini Vision</span>
           </div>
           <div className="grid grid-cols-2 gap-2">
             {[
@@ -578,6 +578,8 @@ export default function Page() {
     let gptVisionResultsList: any[] = [];
     let audioUploadObj: any = null;
     let isDescriptionOnlyPartial = false;
+    const pipelineRunId = crypto.randomUUID();
+    const pipelineStartedAt = new Date().toISOString();
 
     try {
       // ── STEP 1: Initiate Apify Scrape ──
@@ -586,7 +588,7 @@ export default function Page() {
       const initRes = await fetch("/api/process-url/scrape/initiate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ url, pipelineRunId, pipelineStartedAt }),
       });
       const initData = await initRes.json();
       if (!initRes.ok || !initData.success) {
@@ -601,7 +603,7 @@ export default function Page() {
         pollCount++;
         await new Promise(resolve => setTimeout(resolve, 2000));
         
-        const statusRes = await fetch(`/api/process-url/scrape/status?runId=${runId}&actorId=${actorId}`);
+        const statusRes = await fetch(`/api/process-url/scrape/status?runId=${encodeURIComponent(runId)}&actorId=${encodeURIComponent(actorId)}&pipelineRunId=${encodeURIComponent(pipelineRunId)}&pipelineStartedAt=${encodeURIComponent(pipelineStartedAt)}&url=${encodeURIComponent(url)}`);
         const statusData = await statusRes.json();
         
         if (!statusRes.ok || !statusData.success) {
@@ -647,6 +649,7 @@ export default function Page() {
       let transcriptSegments: any[] = [];
       let transcriptSource = 'none';
       let transcriptLanguage: string | null = null;
+      let processingWarnings: string[] = [];
       if (isDescriptionOnlyPartial) {
         addOrUpdateStep(2, 'Transcript', 'skipped', 0, 'Restricted page — description-only extraction');
         addOrUpdateStep(3, 'Frame OCR', 'skipped', 0, 'Restricted page — description-only extraction');
@@ -658,7 +661,7 @@ export default function Page() {
           const mediaRes = await fetch("/api/process-url/media", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ content: contentData, rawApifyData: rawApifyDataObj }),
+            body: JSON.stringify({ content: contentData, rawApifyData: rawApifyDataObj, url, pipelineRunId, pipelineStartedAt }),
           });
           const mediaData = await mediaRes.json();
           if (Array.isArray(mediaData.log)) setPipelineLog((prev) => [...prev, { phase: "Media", events: mediaData.log }]);
@@ -672,6 +675,11 @@ export default function Page() {
           ocrResultsList = mediaData.ocrFrames || [];
           gptVisionResultsList = mediaData.visionFrames || [];
           audioUploadObj = mediaData.audioUpload || null;
+          const mediaWarnings = Array.isArray(mediaData.warnings)
+            ? mediaData.warnings.filter((warning: unknown): warning is string => typeof warning === 'string' && warning.trim().length > 0)
+            : [];
+          processingWarnings = mediaWarnings;
+          if (mediaWarnings.length > 0) setPartialWarning(mediaWarnings.join(' '));
           if (whisperTranscript) setTranscript(whisperTranscript);
           if (audioUploadObj) setUploadedAudio(audioUploadObj);
           for (const step of (mediaData.steps || []) as PipelineStep[]) {
@@ -686,7 +694,7 @@ export default function Page() {
 
       // ── STEP 4: AI Analysis & Save ──
       const analyzeStart = Date.now();
-      addOrUpdateStep(4, 'AI Analysis & Save', 'pending', 0, 'Running GPT-4o analysis and place extraction...');
+      addOrUpdateStep(4, 'AI Analysis & Save', 'pending', 0, 'Running GPT-4o mini analysis and place extraction...');
       
       const analyzeRes = await fetch("/api/process-url/analyze", {
         method: "POST",
@@ -700,8 +708,11 @@ export default function Page() {
           transcriptLanguage,
           apifyOcrFrames: ocrResultsList,
           gptVisionFrames: gptVisionResultsList,
+          processingWarnings,
           url,
-          audioUploadId: audioUploadObj?.id
+          audioUploadId: audioUploadObj?.id,
+          pipelineRunId,
+          pipelineStartedAt,
         }),
       });
 
@@ -839,7 +850,7 @@ export default function Page() {
             <div>
               <p className="text-sm font-medium text-amber-300">Restricted Access</p>
               <p className="text-xs text-amber-200/80 mt-0.5">{partialWarning}</p>
-              <p className="text-xs text-zinc-500 mt-1">Any places shown were extracted only from the available description.</p>
+              <p className="text-xs text-zinc-500 mt-1">Only verified scraped text, OCR, and transcript evidence is shown.</p>
             </div>
           </div>
         )}
@@ -1180,7 +1191,7 @@ export default function Page() {
               </div>
               {!collapsedSections.ocr && (
                 <Card
-                  title="Apify Tesseract vs GPT-4o Vision"
+                  title="Apify Tesseract vs GPT-4o mini Vision"
                   icon={<IconEye />}
                 >
                   {ocrComparison ? (

@@ -163,15 +163,22 @@ export class DbService {
 
     if (existing) {
       plog('db', `"${placeData.name}" already in database (name + city)`, { placeId: existing.id, hasCoordinates: existing.latitude !== null });
+      const suppliedAddress = LocationService.sanitizeSourceAddress(placeData.address);
+      const storedAddress = LocationService.sanitizeSourceAddress(existing.address);
+      const hasInvalidStoredAddress = Boolean(existing.address && !storedAddress);
       let verified = existing.latitude !== null && existing.longitude !== null;
       let ambiguous = false;
       let provider: Verification['provider'] = verified ? 'stored' : undefined;
-      if (!verified) {
+      let invalidAddressReplaced = false;
+      // Repair legacy extraction artifacts such as `2017 by Street` by first
+      // resolving the venue by its exact name and city. This preserves a real
+      // provider address when one is available instead of simply blanking it.
+      if (!verified || hasInvalidStoredAddress) {
         try {
           const coords = await LocationService.geocodePlace(
             placeData.name,
             existing.city || placeData.city || '',
-            placeData.address || existing.address || '',
+            suppliedAddress || storedAddress,
             placeData.neighborhood || existing.neighborhood || ''
           );
 
@@ -197,11 +204,23 @@ export class DbService {
               verified = true;
               ambiguous = !!coords.ambiguous;
               provider = coords.provider;
+              invalidAddressReplaced = !hasInvalidStoredAddress || Boolean(coords.formattedAddress);
               plog('db', 'Added verified coordinates to existing place', { placeId: existing.id, lat: coords.lat, lng: coords.lng, provider: coords.provider });
             }
           }
         } catch (geoErr: any) {
           plog('db', 'Failed to refresh coordinates', { placeId: existing.id, error: geoErr.message }, 'warn');
+        }
+      }
+      if (hasInvalidStoredAddress && !invalidAddressReplaced) {
+        const { error: clearAddressError } = await supabaseAdmin
+          .from('places')
+          .update({ address: '' })
+          .eq('id', existing.id);
+        if (clearAddressError) {
+          plog('db', 'Failed to clear invalid stored address', { placeId: existing.id, error: clearAddressError.message }, 'warn');
+        } else {
+          plog('db', 'Cleared invalid stored address', { placeId: existing.id, address: existing.address }, 'warn');
         }
       }
       await link(existing.id, { verified, ambiguous, provider });

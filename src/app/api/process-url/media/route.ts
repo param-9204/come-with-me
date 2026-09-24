@@ -16,8 +16,22 @@ export async function POST(request: Request) {
         return NextResponse.json({ success: false, error: 'Missing required field: content' }, { status: 400 });
       }
       // Same run id as the analysis step, so both halves of a post share one id in the logs.
+      log.adoptPipelineRun(body?.pipelineRunId, body?.pipelineStartedAt);
       log.runId = String(content.contentId || log.runId);
       Object.assign(log.context, { platform: content.platform, contentId: content.contentId });
+      log.setRunInput({
+        platform: content.platform,
+        inputUrl: body?.url || null,
+        socialPostId: body?.socialPostId || null,
+        entrypoint: 'media',
+        contentId: content.contentId,
+        contentType: content.contentType,
+        caption: content.caption,
+        hashtags: content.hashtags,
+        mentions: content.mentions,
+        taggedAccounts: content.taggedUsers,
+        metadata: { videoDuration: content.videoDuration, dimensions: content.dimensions },
+      });
 
       const result = await MediaEvidenceService.collect(content, body.rawApifyData || content.rawApifyData || null, {
         persistAudio: body.persistAudio !== false,
@@ -33,13 +47,18 @@ export async function POST(request: Request) {
         transcriptLanguage: result.transcript?.language || null,
         audioUpload: result.audioUpload,
         steps: result.steps,
+        warnings: result.warnings,
+        pipelineRunId: log.pipelineRunId,
+        pipelineStartedAt: log.pipelineStartedAt,
         log: log.events,
       });
     } catch (error: any) {
       plog('media', 'Media processing failed', { error: error.message || String(error) }, 'error');
+      log.fail(error);
       return NextResponse.json({ success: false, error: error.message || 'Media processing failed', log: log.events }, { status: 500 });
     } finally {
       log.flush();
+      await log.flushDatabase();
     }
   });
 }

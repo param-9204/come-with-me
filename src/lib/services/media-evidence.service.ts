@@ -32,9 +32,21 @@ export interface MediaEvidenceResult {
   transcriptText: string;
   audioUpload: AudioUploadRef | null;
   steps: PipelineStep[];
+  /** Non-fatal processing limitations safe to display to API clients. */
+  warnings: string[];
 }
 
 type FallbackProvider = 'google' | 'openai' | 'off';
+
+/**
+ * Accuracy-first default: the complete extracted frame set is sent to both
+ * Tesseract and batched GPT Vision. Use `selective` only for a deliberate
+ * cost-saving fallback mode.
+ */
+export function useFullFrameGptVision(): boolean {
+  const mode = (process.env.OCR_VISION_MODE || 'all-gpt').trim().toLowerCase();
+  return !['selective', 'fallback'].includes(mode);
+}
 
 // No page / frame caps by default: every carousel slide, every carousel video
 // and every qualifying frame is processed (a 12-slide post listed all 24 of its
@@ -327,8 +339,13 @@ export class MediaEvidenceService {
         try {
           const filePath = await MediaService.downloadImage(item.url);
           cleanupFiles.push(filePath);
+          const visionPath = await VideoFrameService.createVisionCopy(filePath).catch((error: unknown) => {
+            plog('media', 'Vision image resize failed; using original image', { error: errorMessage(error) }, 'warn');
+            return filePath;
+          });
+          if (visionPath !== filePath) cleanupFiles.push(visionPath);
           const hash = crypto.createHash('md5').update(fs.readFileSync(filePath)).digest('hex');
-          return { frameIndex: 0, timestamp: 0, filePath, colorFilePath: filePath, hash } as VideoFrame;
+          return { frameIndex: 0, timestamp: 0, filePath, colorFilePath: visionPath, hash } as VideoFrame;
         } catch (error) {
           plog('media', 'Image download failed (non-fatal)', { url: item.url.slice(0, 80), error: errorMessage(error) }, 'warn');
           return null;
@@ -342,12 +359,20 @@ export class MediaEvidenceService {
       }
       if (!frameNote) frameNote = `${frames.length} image/frame(s)`;
 
-      // Local OCR on everything; paid OCR only on frames it could not read.
+      // Start both engines on the exact same complete frame set. GPT Vision
+      // therefore does not wait for low-confidence Tesseract output and a
+      // venue label visible for only one second is still inspected.
       if (frames.length > 0) {
-        ocrFrames = await ApifyOcrService.extractTextFromFrames(frames, false, frames.length).catch((error: unknown) => {
+        const localOcr = ApifyOcrService.extractTextFromFrames(frames, false, frames.length).catch((error: unknown) => {
           plog('ocr', 'Local OCR failed (non-fatal)', { error: errorMessage(error) }, 'warn');
           return [] as ApifyOcrFrameResult[];
         });
+        const fullFrameVision = useFullFrameGptVision();
+        const gptVisionPromise: Promise<GptVisionFrameResult[]> | null = fullFrameVision
+          ? this.runFullFrameGptVision(frames)
+          : null;
+
+        ocrFrames = await localOcr;
         plog('ocr', 'Local OCR results', {
           frames: ocrFrames.map((frame) => ({
             t: Math.round(frame.timestamp * 10) / 10,
@@ -355,7 +380,9 @@ export class MediaEvidenceService {
             words: frame.wordStats,
           })),
         });
-        visionFrames = await this.runVisionFallback(frames, ocrFrames, content, imageFrameIndexes);
+        visionFrames = gptVisionPromise
+          ? await gptVisionPromise
+          : await this.runVisionFallback(frames, ocrFrames, content, imageFrameIndexes);
       }
     } finally {
       for (const set of cleanupFrameSets) VideoFrameService.cleanupFrames(set);
@@ -363,7 +390,11 @@ export class MediaEvidenceService {
     }
 
     const transcript = mergeTranscripts(transcripts);
-    const hardFrames = visionFrames.length;
+    const warnings = [...new Set(
+      visionFrames.flatMap((frame) => frame.warning?.message ? [frame.warning.message] : [])
+    )];
+    const visionFrameCount = visionFrames.length;
+    const dualOcr = useFullFrameGptVision();
     plog('transcript', transcript ? 'Transcript' : 'No transcript', transcript ? {
       source: transcript.source,
       language: transcript.language,
@@ -372,6 +403,9 @@ export class MediaEvidenceService {
       text: transcript.text.slice(0, 500),
     } : undefined);
     plog('media', 'Media done', { frames: frames.length, ocrFrames: ocrFrames.length, visionFrames: visionFrames.length, audioUploaded: !!audioUpload });
+    if (warnings.length > 0) {
+      plog('media', 'Media completed with non-fatal OCR warning', { warnings, tesseractFrames: ocrFrames.length }, 'warn');
+    }
     const steps: PipelineStep[] = [
       {
         step: 2,
@@ -389,7 +423,12 @@ export class MediaEvidenceService {
         status: frames.length ? 'success' : 'skipped',
         durationMs: Date.now() - ocrStart - transcriptMs,
         details: frames.length
-          ? `${frameNote} · local OCR` + (hardFrames ? ` · ${hardFrames} hard frame(s) → ${visionFrames[0]?.method}` : '')
+          ? dualOcr
+            ? `${frameNote}; Tesseract + GPT Vision on all ${frames.length} frame(s)` +
+              (warnings.length ? '; GPT Vision limit reached — continued with Tesseract OCR' :
+                visionFrameCount === frames.length ? '' : ` (${visionFrameCount} GPT result(s))`)
+            : `${frameNote}; local OCR` +
+              (visionFrameCount ? `; ${visionFrameCount} fallback frame(s) via ${visionFrames[0]?.method}` : '')
           : 'No media to OCR',
       },
     ];
@@ -401,11 +440,77 @@ export class MediaEvidenceService {
       transcriptText: WhisperService.formatTranscript(transcript),
       audioUpload,
       steps,
+      warnings,
     };
   }
 
+  /** Full-frame GPT Vision pass used by the accuracy-first dual-OCR mode. */
+  static async runFullFrameGptVision(frames: VideoFrame[]): Promise<GptVisionFrameResult[]> {
+    if (!process.env.OPENAI_API_KEY?.trim()) {
+      plog('vision', 'Full-frame GPT Vision skipped: OPENAI_API_KEY is not configured', {
+        frames: frames.length,
+      }, 'warn');
+      return [];
+    }
+
+    plog('vision', 'Full-frame dual OCR: GPT Vision started for every frame', {
+      frames: frames.length,
+      firstTimestamp: frames[0]?.timestamp ?? null,
+      lastTimestamp: frames[frames.length - 1]?.timestamp ?? null,
+      batchSize: 4,
+    });
+    const results = await GptVisionOcrService.extractTextFromFramesBatched(frames);
+    const limitResult = results.find((frame) => frame.warning?.code === 'gpt_vision_limit_exceeded');
+    const limitIndex = limitResult ? frames.findIndex((frame) => frame.frameIndex === limitResult.frameIndex) : -1;
+
+    // When GPT Vision exhausts its quota partway through a post, let Cloud
+    // Vision inspect the remaining frames rather than discard their text.
+    if (limitIndex >= 0 && GoogleVisionOcrService.isConfigured()) {
+      const pendingFrames = frames.slice(limitIndex);
+      try {
+        plog('vision', 'GPT Vision limit reached; continuing remaining frames with Cloud Vision', {
+          frames: pendingFrames.length,
+          firstTimestamp: pendingFrames[0]?.timestamp ?? null,
+        }, 'warn');
+        const googleResults = await GoogleVisionOcrService.extractTextFromFrames(pendingFrames);
+        const googleByFrame = new Map(googleResults.map((frame) => [frame.frameIndex, frame]));
+        const originalByFrame = new Map(results.map((frame) => [frame.frameIndex, frame]));
+        const fallbackWarning = {
+          code: 'gpt_vision_limit_exceeded' as const,
+          message: 'GPT Vision token or rate limit was reached. Cloud Vision OCR continued for the remaining frames.',
+        };
+        const completed = frames.map((frame, index) => {
+          const google = googleByFrame.get(frame.frameIndex);
+          if (google) return index === limitIndex ? { ...google, warning: fallbackWarning } : google;
+          return originalByFrame.get(frame.frameIndex) || {
+            frameIndex: frame.frameIndex,
+            timestamp: frame.timestamp,
+            texts: [], brands: [], locations: [], prices: [], cta: [],
+            description: '', confidence: 0, method: 'gpt-4o-vision' as const,
+          };
+        });
+        plog('vision', 'Cloud Vision completed the GPT-limited frame set', {
+          frames: googleResults.length,
+          framesWithText: googleResults.filter((frame) => frame.texts.length > 0).length,
+        });
+        return completed;
+      } catch (error) {
+        plog('vision', 'Cloud Vision fallback failed; retaining Tesseract OCR', {
+          error: errorMessage(error),
+          frames: pendingFrames.length,
+        }, 'warn');
+      }
+    }
+    plog('vision', 'Full-frame GPT Vision completed', {
+      requestedFrames: frames.length,
+      returnedFrames: results.length,
+      framesWithText: results.filter((frame) => frame.texts.length > 0).length,
+    });
+    return results;
+  }
+
   /**
-   * Vision OCR selection:
+   * Selective vision fallback mode (OCR_VISION_MODE=selective):
    * - video frames Tesseract could not read, and list posts with no names in the text;
    * - every image slide (carousels / photo posts). Slides are the content of a
    *   guide post (Instagram allows up to 20); measured on a real 10-slide NYC

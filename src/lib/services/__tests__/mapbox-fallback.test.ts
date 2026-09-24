@@ -92,6 +92,10 @@ describe('Mapbox fallback', () => {
   it('treats a leading article as the same name ("GAZ" = "le gaz")', () => {
     expect(LocationService.nameSimilarity('Gaz', 'le gaz')).toBeGreaterThanOrEqual(0.85);
   });
+
+  it('accepts a provider listing with only farm/winery descriptors added', () => {
+    expect(LocationService.nameSimilarity('Casa Carmen Winery', 'Casa Carmen Farm and Winery')).toBeGreaterThanOrEqual(0.85);
+  });
 });
 
 describe('verification notes name the provider', () => {

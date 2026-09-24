@@ -231,7 +231,17 @@ export interface GptVisionFrameResult {
   cta: string[];
   description: string;
   confidence: number;
-  method: 'gpt-4o-vision' | 'google-vision';
+  /** The actual OCR backend; older stored rows may retain the previous mini label. */
+  method: 'gpt-4o-mini-vision' | 'gpt-4o-vision' | 'google-vision';
+  /**
+   * Present only on one representative empty frame when Vision could not be
+   * used. Keeping it on a frame preserves the existing stored OCR schema
+   * without duplicating the same failure payload for every video frame.
+   */
+  warning?: {
+    code: 'gpt_vision_limit_exceeded';
+    message: string;
+  };
 }
 
 // ──────────────────────────────────────────────────────────────────────

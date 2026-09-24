@@ -1,6 +1,6 @@
 import os from 'os';
 import type { VideoFrame, ApifyOcrFrameResult, OcrLine } from '../types/social';
-import { plog } from './pipeline-log';
+import { plog, recordPipelineOperation } from './pipeline-log';
 
 const MAX_FRAMES_FOR_OCR = 120;
 /** Languages loaded into Tesseract. Each extra language slows recognition. */
@@ -149,6 +149,7 @@ export class ApifyOcrService {
     }
 
     const framesToProcess = [...frames.slice(0, maxFrames)].sort((a, b) => a.frameIndex - b.frameIndex);
+    const operationStarted = new Date();
     const workerCount = Math.max(1, Math.min(
       Number(process.env.OCR_WORKERS) || Math.min(4, os.cpus().length || 1),
       framesToProcess.length
@@ -228,6 +229,20 @@ export class ApifyOcrService {
     });
 
     plog('ocr', 'Tesseract done', { frames: results.length, linesRead: results.reduce((sum, r) => sum + (r.lines?.length || 0), 0) });
+    recordPipelineOperation({
+      stage: 'ocr',
+      operation: 'local_ocr_batch',
+      provider: 'local',
+      model: `tesseract:${OCR_LANGS}`,
+      startedAt: operationStarted,
+      finishedAt: new Date(),
+      inputUnits: framesToProcess.length,
+      resultSummary: {
+        framesProcessed: results.length,
+        framesWithText: results.filter((result) => (result.lines?.length || 0) > 0).length,
+        linesRead: results.reduce((sum, result) => sum + (result.lines?.length || 0), 0),
+      },
+    });
     return results.sort((a, b) => a.frameIndex - b.frameIndex);
   }
 

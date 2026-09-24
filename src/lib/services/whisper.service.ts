@@ -89,13 +89,18 @@ export class WhisperService {
    * and translating proper nouns tends to corrupt venue names.
    */
   static async transcribe(audioPath: string): Promise<TranscriptResult> {
-    const response = await executeAICall('audio', async ({ client, model }) => {
+    const response = await executeAICall('audio', async ({ client, model }, reportUsage) => {
       const audioStream = fs.createReadStream(audioPath);
-      return await client.audio.transcriptions.create({
+      const transcription = await client.audio.transcriptions.create({
         file: audioStream,
         model,
         response_format: 'verbose_json',
       }) as unknown as { text: string; language?: string; segments?: VerboseSegment[] };
+      // Transcription APIs generally bill by audio duration, not tokens. The
+      // provider does not return billable seconds here, so this row is kept
+      // auditable with a null token/cost estimate instead of inventing one.
+      reportUsage({ requestSummary: { responseFormat: 'verbose_json' } });
+      return transcription;
     });
 
     const language = (response.language || '').toLowerCase() || null;

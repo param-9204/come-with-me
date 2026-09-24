@@ -1,5 +1,5 @@
 import * as stringSimilarity from 'string-similarity';
-import { plog } from './pipeline-log';
+import { plog, recordPipelineOperation } from './pipeline-log';
 import { MapboxService, type MapboxFeature } from './mapbox.service';
 
 export type GeocodeResult = {
@@ -32,6 +32,9 @@ const NAME_DESCRIPTORS = new Set([
   'trattoria', 'taqueria', 'eatery', 'diner', 'shop', 'store', 'boutique', 'market', 'hotel', 'hostel', 'resort',
   'inn', 'museum', 'gallery', 'park', 'beach', 'club', 'lounge', 'rooftop', 'house', 'bbq', 'patisserie', 'tea',
   'room', 'studio', 'official', 'nyc', 'ny', 'la', 'sf', 'phl', 'philly', 'usa', 'uk', 'llc', 'inc',
+  // Venue listings frequently add these legal/brand descriptors while captions
+  // omit them: "Casa Carmen Winery" vs "Casa Carmen Farm and Winery".
+  'farm', 'vineyard', 'winery', 'estate',
   // Articles: "GAZ" is "le gaz", "Mercerie" is "La Mercerie".
   'le', 'les', 'el', 'los', 'las', 'il', 'lo', 'die', 'der', 'das',
 ]);
@@ -533,12 +536,37 @@ export class LocationService {
   static sanitizeSourceAddress(value: string | null | undefined): string {
     const address = (value || '').trim().replace(/\s+/g, ' ');
     if (!/^\d{1,6}\s+\S+/.test(address)) return '';
+    // Do not turn a founding year in prose ("Founded in 2017 by...") into a
+    // fake street address. In particular, this must run before a downstream
+    // short-address normalizer can append "Street" to `2017 by`.
+    if (/^\d{4}\s+(?:by|in|from|for|with|was|were|is|are|founded|established|opened|created|built|since|two|three|four|five|six|seven|eight|nine|ten)\b/i.test(address)) {
+      return '';
+    }
     // List headings such as "5 cozy restaurants" are commonly mangled by OCR
     // into a fake address like "5 cozy Street". Never use them to constrain a
     // provider lookup or satisfy the persistence address gate.
     if (/^\d{1,6}\s+(?:cozy|best|top|great|favorite|popular|new|nice|amazing|restaurants?|cafes?|bars?|places?|spots?)\b/i.test(address)) {
       return '';
     }
+    // Do not let a sentence fragment such as "17 courses Street" or OCR noise
+    // such as "10 we Street" constrain a good venue-name match. Source
+    // addresses must contain a real road suffix and a plausible street-name
+    // token after directions/unit labels are removed.
+    if (!/\b(?:st(?:reet)?|ave(?:nue)?|blvd|boulevard|rd|road|dr|drive|ln|lane|pl|place|ct|court|pkwy|parkway|wy|way|terrace|ter|highway|hwy)\.?\b/i.test(address)) {
+      return '';
+    }
+    const hasNumberedStreetName = /^\d{1,6}\s+(?:(?:n|s|e|w|ne|nw|se|sw|north|south|east|west)\.?\s+)?\d+(?:st|nd|rd|th)\s+(?:st(?:reet)?|ave(?:nue)?|blvd|boulevard|rd|road|dr|drive|ln|lane|pl|place|ct|court|pkwy|parkway|wy|way|terrace|ter|highway|hwy)\.?\b/i.test(address);
+    const streetPart = address
+      .replace(/^\d{1,6}\s+/i, '')
+      .replace(/\b(?:apt|apartment|suite|ste|unit|floor|fl)\.?\s*#?\s*[\w-]+\b.*$/i, '')
+      .replace(/\b(?:n|s|e|w|ne|nw|se|sw|north|south|east|west)\.?\b/gi, '')
+      .replace(/\b\d+(?:st|nd|rd|th)\b/gi, '')
+      .replace(/\b(?:st(?:reet)?|ave(?:nue)?|blvd|boulevard|rd|road|dr|drive|ln|lane|pl|place|ct|court|pkwy|parkway|wy|way|terrace|ter|highway|hwy)\.?\b/gi, '')
+      .replace(/[^a-z]/gi, ' ')
+      .trim()
+      .toLowerCase();
+    const rejectedStreetWords = /\b(?:we|courses?|eats?|ways?|things?|restaurants?|cafes?|bars?|spots?|places?|best|top|favorite|must)\b/i;
+    if ((!streetPart && !hasNumberedStreetName) || rejectedStreetWords.test(streetPart)) return '';
     return address;
   }
 
@@ -592,6 +620,12 @@ export class LocationService {
     if (!cityInfo.name && cleanAddress) cityInfo = this.cityInfo(this.detectCityFromText(cleanAddress));
     if (!cityInfo.name && (cleanName || cleanNeighborhood)) {
       cityInfo = this.cityInfo(this.detectCityFromText([cleanName, cleanNeighborhood].filter(Boolean).join(' ')));
+    }
+    if (suppliedAddress && !cleanAddress && cleanName && cityInfo.name) {
+      plog('geocode', 'Retrying with trusted venue name and city after rejecting the source address', {
+        place: cleanName,
+        city: cityInfo.name,
+      }, 'warn');
     }
     if (!cleanName && !cleanAddress && !cityInfo.name && !cleanNeighborhood) return null;
     if (cleanAddress && !cityInfo.name) {
@@ -784,16 +818,37 @@ export class LocationService {
    * Google is unavailable or finds no verified match).
    */
   static async geocodePlace(name: string, city: string, address?: string, neighborhood?: string): Promise<GeocodeResult> {
+    const startedAt = new Date();
+    const requestSummary = { name, city, hasAddress: Boolean(address?.trim()), hasNeighborhood: Boolean(neighborhood?.trim()) };
+    const finish = (result: GeocodeResult, status: 'success' | 'partial' | 'skipped' = 'success'): GeocodeResult => {
+      recordPipelineOperation({
+        stage: 'geocode',
+        operation: 'verify_place',
+        provider: result.provider || null,
+        model: result.provider === 'google' ? 'places-text-search' : result.provider === 'mapbox' ? 'search-geocoding' : null,
+        status,
+        startedAt,
+        finishedAt: new Date(),
+        requestSummary,
+        resultSummary: {
+          verified: result.lat !== null && result.lng !== null,
+          ambiguous: Boolean(result.ambiguous),
+          hasFormattedAddress: Boolean(result.formattedAddress),
+          provider: result.provider || null,
+        },
+      });
+      return result;
+    };
     const lookup = this.prepareLookup(name, city, address, neighborhood);
-    if (!lookup) return this.emptyResult();
+    if (!lookup) return finish(this.emptyResult(), 'skipped');
     const tried: string[] = [];
 
     const apiKey = this.apiKey();
     if (apiKey && !this.placesQuotaExhausted()) {
       tried.push('Google');
       const result = await this.geocodeWithGoogle(lookup, apiKey);
-      if (result?.lat !== null && result?.lat !== undefined) return result;
-      if (result && lookup.cleanName && !lookup.cityInfo.name && !lookup.cleanAddress) return result; // name-only ambiguity is final
+      if (result?.lat !== null && result?.lat !== undefined) return finish(result);
+      if (result && lookup.cleanName && !lookup.cityInfo.name && !lookup.cleanAddress) return finish(result, 'partial'); // name-only ambiguity is final
     } else if (apiKey) {
       plog('geocode', `Google skipped for "${lookup.query}" (daily quota exhausted); using Mapbox`, undefined, 'warn');
     }
@@ -801,7 +856,7 @@ export class LocationService {
     if (MapboxService.isConfigured()) {
       tried.push('Mapbox');
       const result = await this.geocodeWithMapbox(lookup);
-      if (result?.lat !== null && result?.lat !== undefined) return result;
+      if (result?.lat !== null && result?.lat !== undefined) return finish(result);
     }
 
     // The neighbourhood can come from the post's context rather than the place
@@ -809,11 +864,11 @@ export class LocationService {
     // Retry once without it; the city constraint still applies.
     if (lookup.cleanNeighborhood && lookup.cityInfo.name) {
       plog('geocode', `Retrying "${lookup.cleanName}" without the neighbourhood "${lookup.cleanNeighborhood}"`, undefined, 'warn');
-      return this.geocodePlace(name, city, address, '');
+      return finish(await this.geocodePlace(name, city, address, ''), 'partial');
     }
 
     plog('geocode', `No verified result for "${lookup.query}"`, { tried: tried.length ? tried : ['none configured'] }, 'warn');
-    return this.emptyResult();
+    return finish(this.emptyResult(), 'partial');
   }
 
   static async getNeighborhood(lat: number, lng: number): Promise<string> {

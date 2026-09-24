@@ -1,6 +1,6 @@
 import fs from 'fs';
 import type { GptVisionFrameResult, VideoFrame } from '../types/social';
-import { plog } from './pipeline-log';
+import { plog, recordPipelineOperation } from './pipeline-log';
 
 const ENDPOINT = 'https://vision.googleapis.com/v1/images:annotate';
 const IMAGES_PER_REQUEST = 8;
@@ -74,6 +74,7 @@ export class GoogleVisionOcrService {
 
     for (let offset = 0; offset < frames.length; offset += IMAGES_PER_REQUEST) {
       const batch = frames.slice(offset, offset + IMAGES_PER_REQUEST);
+      const operationStarted = new Date();
       const requests = batch.map((frame) => ({
         image: { content: fs.readFileSync(frame.colorFilePath || frame.filePath).toString('base64') },
         features: [{ type: 'TEXT_DETECTION' }],
@@ -97,20 +98,49 @@ export class GoogleVisionOcrService {
       const body = await response.json().catch(() => ({})) as { responses?: AnnotateResponse[]; error?: { message?: string; status?: string } };
       if (response.status === 403 || response.status === 401 || body.error?.status === 'PERMISSION_DENIED') {
         this.markUnavailable();
+        recordPipelineOperation({
+          stage: 'vision', operation: 'cloud_vision_ocr_batch', provider: 'google', model: 'cloud-vision-text-detection',
+          status: 'failed', startedAt: operationStarted, finishedAt: new Date(), inputUnits: batch.length,
+          error: new Error(`Cloud Vision rejected the key (HTTP ${response.status}): ${body.error?.message || 'enable the Cloud Vision API for this key'}`),
+          retryable: false, requestSummary: { frames: batch.length, feature: 'TEXT_DETECTION' },
+        });
         throw new GoogleVisionUnavailableError(
           `Cloud Vision rejected the key (HTTP ${response.status}): ${body.error?.message || 'enable the Cloud Vision API for this key'}`
         );
       }
       if (!response.ok) {
+        recordPipelineOperation({
+          stage: 'vision', operation: 'cloud_vision_ocr_batch', provider: 'google', model: 'cloud-vision-text-detection',
+          status: 'failed', startedAt: operationStarted, finishedAt: new Date(), inputUnits: batch.length,
+          error: new Error(`Cloud Vision HTTP ${response.status}: ${body.error?.message || 'unknown error'}`), retryable: response.status >= 500 || response.status === 429,
+          requestSummary: { frames: batch.length, feature: 'TEXT_DETECTION' },
+        });
         throw new Error(`Cloud Vision HTTP ${response.status}: ${body.error?.message || 'unknown error'}`);
       }
 
+      const frameErrors = (body.responses || []).filter((item) => item?.error).length;
       batch.forEach((frame, index) => {
         const item = body.responses?.[index] || {};
         if (item.error) {
           plog('vision', `Cloud Vision frame ${frame.frameIndex} error`, { error: item.error.message }, 'warn');
         }
         results.push(this.parseResponse(frame, item));
+      });
+      recordPipelineOperation({
+        stage: 'vision',
+        operation: 'cloud_vision_ocr_batch',
+        provider: 'google',
+        model: 'cloud-vision-text-detection',
+        status: frameErrors ? 'partial' : 'success',
+        startedAt: operationStarted,
+        finishedAt: new Date(),
+        inputUnits: batch.length,
+        // Cloud Vision is unit-priced. Keep this configurable because account
+        // agreements and regional pricing may differ from the public default.
+        estimatedCostUsd: batch.length * (Number(process.env.GOOGLE_VISION_TEXT_COST_PER_IMAGE_USD) || 0.0015),
+        costBasis: { pricing: 'per_image_estimate', unitCostUsd: Number(process.env.GOOGLE_VISION_TEXT_COST_PER_IMAGE_USD) || 0.0015 },
+        requestSummary: { frames: batch.length, feature: 'TEXT_DETECTION', languageHints },
+        resultSummary: { frameErrors, framesWithText: batch.filter((_, index) => this.parseResponse(batch[index], body.responses?.[index] || {}).texts.length > 0).length },
       });
     }
 

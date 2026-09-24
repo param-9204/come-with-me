@@ -10,6 +10,7 @@ import type { VideoFrame } from '@/lib/types/social';
 export async function POST(request: Request) {
   let tempMediaPath = '';
   let tempFramePath = '';
+  let tempVisionPath = '';
 
   try {
     const body = await request.json();
@@ -49,7 +50,11 @@ export async function POST(request: Request) {
       localFramePath = tempMediaPath;
     }
 
-    // 3. Create virtual VideoFrame object
+    // 3. Keep the original for Tesseract, but send a bounded colour copy to
+    // paid Vision OCR so large source images do not inflate Vision tokens.
+    tempVisionPath = await VideoFrameService.createVisionCopy(localFramePath).catch(() => '');
+
+    // 4. Create virtual VideoFrame object
     const buffer = fs.readFileSync(/*turbopackIgnore: true*/ localFramePath);
     const hash = crypto.createHash('md5').update(buffer).digest('hex');
 
@@ -57,6 +62,7 @@ export async function POST(request: Request) {
       frameIndex: idx,
       timestamp: ts,
       filePath: localFramePath,
+      colorFilePath: tempVisionPath || localFramePath,
       hash,
     };
 
@@ -70,7 +76,7 @@ export async function POST(request: Request) {
     ]);
     
     // 5. Clean up local files immediately
-    MediaService.cleanupFiles([tempMediaPath, tempFramePath].filter(Boolean));
+    MediaService.cleanupFiles([tempMediaPath, tempFramePath, tempVisionPath].filter(Boolean));
 
     const result = ocrResults.length > 0 ? ocrResults[0] : null;
 
@@ -85,7 +91,7 @@ export async function POST(request: Request) {
 
     // Attempt cleanup on error
     try {
-      MediaService.cleanupFiles([tempMediaPath, tempFramePath].filter(Boolean));
+      MediaService.cleanupFiles([tempMediaPath, tempFramePath, tempVisionPath].filter(Boolean));
     } catch (cleanupErr) {
       console.error('[API OCR-Frame] Cleanup error:', cleanupErr);
     }

@@ -19,6 +19,17 @@ export interface KeyFramePlan {
 }
 
 export class VideoFrameService {
+  /** Maximum edge for the colour copy sent to paid Vision OCR. */
+  static visionMaxDimension(): number {
+    const configured = Number(process.env.VISION_OCR_MAX_DIMENSION);
+    return Number.isFinite(configured) && configured >= 512 && configured <= 2048 ? configured : 1024;
+  }
+
+  static visionScaleFilter(): string {
+    const edge = this.visionMaxDimension();
+    return `scale=${edge}:${edge}:force_original_aspect_ratio=decrease:force_divisible_by=2`;
+  }
+
   /**
    * One frame for every second of video — a 90 s video gives 90 frames — with
    * no cap and no duplicate removal, so nothing shown on screen is skipped.
@@ -41,8 +52,9 @@ export class VideoFrameService {
 
   /**
    * One ffmpeg pass samples one frame per second and writes (a) a colour frame
-   * for vision OCR and (b) an enhanced grayscale frame for Tesseract. Frames
-   * are never upscaled; width is capped at 1280.
+   * for Vision OCR and (b) an enhanced grayscale frame for Tesseract. The
+   * paid colour copy is capped at 1024px on its longest edge by default;
+   * Tesseract retains its higher-resolution 1280px source.
    */
   static async extractKeyFrames(videoPath: string, plan?: Partial<KeyFramePlan>): Promise<VideoFrame[]> {
     const duration = await this.getVideoDuration(videoPath);
@@ -51,11 +63,12 @@ export class VideoFrameService {
     const framesDir = path.join(os.tmpdir(), `frames_${uuidv4()}`);
     fs.mkdirSync(framesDir, { recursive: true });
 
-    const scale = "scale='min(1280,iw)':-2";
+    const localOcrScale = "scale='min(1280,iw)':-2";
+    const visionScale = this.visionScaleFilter();
     const filter =
       `[0:v]fps=${1 / resolved.intervalSec},showinfo,split=2[c][o];` +
-      `[c]${scale}[cout];` +
-      `[o]${scale},format=gray,eq=contrast=1.5,unsharp=5:5:1.0[oout]`;
+      `[c]${visionScale}[cout];` +
+      `[o]${localOcrScale},format=gray,eq=contrast=1.5,unsharp=5:5:1.0[oout]`;
     const args = [
       '-hide_banner', '-nostats', '-i', videoPath,
       '-filter_complex', filter,
@@ -117,6 +130,26 @@ export class VideoFrameService {
     });
     if (frames.length === 0) fs.rmSync(framesDir, { recursive: true, force: true });
     return frames;
+  }
+
+  /**
+   * Creates the smaller colour copy used for Vision OCR on a still image.
+   * Local Tesseract continues to receive the downloaded original image.
+   */
+  static async createVisionCopy(imagePath: string): Promise<string> {
+    const outputPath = path.join(os.tmpdir(), `vision_${uuidv4()}.jpg`);
+    const args = [
+      '-hide_banner', '-loglevel', 'error', '-y', '-i', imagePath,
+      '-vf', this.visionScaleFilter(), '-frames:v', '1', '-q:v', '3', outputPath,
+    ];
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(ffmpegInstaller.path, args, { windowsHide: true });
+      let stderr = '';
+      child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+      child.on('error', reject);
+      child.on('close', (code) => code === 0 ? resolve() : reject(new Error(`Vision image resize failed (${code}): ${stderr.slice(-300)}`)));
+    });
+    return outputPath;
   }
 
   /**

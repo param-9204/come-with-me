@@ -2,7 +2,7 @@ import { executeAICall, supportsTemperature } from './ai-client';
 import { LocationService } from './location.service';
 import { plog } from './pipeline-log';
 import {
-  BASE_CATEGORIES, buildEvidence, formatEvidenceForPrompt, mergeSameEntities, resolveHiddenGem,
+  BASE_CATEGORIES, GENERIC_NAMES, buildEvidence, formatEvidenceForPrompt, mergeSameEntities, resolveHiddenGem,
   sanitizeCandidateLocation, scoreAndFilterCandidates,
   type BaseCategory, type EvidenceBundle, type MediaEvidenceInput, type RawPlaceCandidate,
 } from './place-evidence.service';
@@ -17,11 +17,21 @@ const MENTION_TYPES = ['explicit', 'handle', 'indirect'] as const;
 const ROLES = ['featured', 'recommended', 'mentioned_only', 'background'] as const;
 
 /**
- * Output budget. Only generated tokens are billed, so the model maximum
- * (16,384 for gpt-4o) costs nothing unless a long list actually needs it.
+ * Keep the requested completion below the 20k TPM tier once the evidence
+ * prompt is included. A larger reservation is rejected before the model can
+ * return any data (for example, 8k prompt + 16k completion = 24k TPM).
+ * Ten thousand tokens remains ample for a structured place list; a truncated
+ * result uses the existing grounded recovery pass.
  */
-const MAX_OUTPUT_TOKENS = 16_000;
-const RECOVERY_OUTPUT_TOKENS = 16_000;
+const MAX_OUTPUT_TOKENS = 20_000;
+const RECOVERY_OUTPUT_TOKENS = 20_000;
+
+function analysisFallbackWarning(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:\b429\b|rate[_ -]?limit|quota|tokens?\s+per\s+min|tpm)/i.test(message)
+    ? 'AI providers are rate-limited. The request was completed with verified scraped data, OCR, and transcript; no unverified AI place candidates were added.'
+    : 'AI analysis is temporarily unavailable. The request was completed with verified scraped data, OCR, and transcript; no unverified AI place candidates were added.';
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // Prompt
@@ -57,6 +67,7 @@ LOCATION
 - Same moment: on-screen text and speech within about 3 seconds of each other describe the same scene. Use this to pair a name on screen with a city or address spoken aloud, and the reverse.
 - "📍" marks a location marker. Creators use many styles (📍 📌 🗺️ pins, map-pin icons, location stickers, "Location:"/"Address:" labels); all are shown as "📍". Everything on one marker belongs to the same place: "📍 Buvette · 42 Grove St · West Village" gives name, address and neighbourhood. A marker holding only an address or area locates the venue shown or named in the same scene.
 - A short on-screen label that appears only for one scene (often a location marker, e.g. "📍 Buvette" or just "Buvette") names the place shown in that scene, while text repeated on every frame is the post's title.
+- Map and area-guide labels are destinations, not scenery: when a post shows several named neighbourhoods, towns, parks, or areas on a map/list, return each as category CITY with role featured or recommended. This applies even when OCR splits a label across adjacent lines ("Ridge" + "Wood" = "Ridgewood").
 - Text that is physically inside the scene — posters, artwork, menus, plates, product labels, film titles — is role "background", not a venue, unless it is the storefront sign of the place being visited. When the post labels its places with pin stickers or overlays, only those labels are places.
 
 EVIDENCE IDS (required)
@@ -311,6 +322,12 @@ function isPlausibleStreetAddress(value: string): boolean {
   if (normalized.length < 5 || normalized.length > 80) return false;
   // Reject pure years / prices mistaken as addresses.
   if (/^\d{4}$/.test(normalized)) return false;
+  // Caption prose such as "Founded in 2017 by two brothers" is sometimes
+  // returned by a model as `2017 by`. A four-digit building number is valid
+  // only when it is followed by a street-shaped name, not founding prose.
+  if (/^\d{4}\s+(?:by|in|from|for|with|was|were|is|are|founded|established|opened|created|built|since|two|three|four|five|six|seven|eight|nine|ten)\b/i.test(normalized)) {
+    return false;
+  }
   // Avoid converting list copy such as "5 cozy restaurants" into the
   // fabricated address "5 cozy Street".
   if (/^\d{1,6}\s+(?:cozy|best|top|great|favorite|popular|new|nice|amazing|restaurants?|cafes?|bars?|places?|spots?|stops?|things?|days?|hours?|minutes?|mins?|people|dollars?|years?)\b/i.test(normalized)) {
@@ -668,7 +685,7 @@ async function callExtractionModel(
   note?: string
 ): Promise<{ raw: string; truncated: boolean }> {
   const userMessage = note ? `${note}\n\n${formatEvidenceForPrompt(bundle)}` : formatEvidenceForPrompt(bundle);
-  return executeAICall('chat', async ({ client, model, isGroq }) => {
+  return executeAICall('chat', async ({ client, model, isGroq }, reportUsage) => {
     const response = await client.chat.completions.create({
       model,
       ...(supportsTemperature(model) ? { temperature: 0 } : {}),
@@ -680,6 +697,13 @@ async function callExtractionModel(
       response_format: isGroq ? { type: 'json_object' } : responseFormat(includeAnalysis),
     });
     const choice = response.choices[0];
+    reportUsage({
+      inputTokens: response.usage?.prompt_tokens,
+      outputTokens: response.usage?.completion_tokens,
+      totalTokens: response.usage?.total_tokens,
+      requestSummary: { includeAnalysis, maxCompletionTokens: maxTokens, promptChars: userMessage.length },
+      resultSummary: { finishReason: choice?.finish_reason || null },
+    });
     plog('model', includeAnalysis ? 'Extraction + analysis call' : 'Places-only call', {
       provider: isGroq ? 'groq' : 'openai',
       model,
@@ -690,6 +714,217 @@ async function callExtractionModel(
     }, choice?.finish_reason === 'length' ? 'warn' : 'info');
     return { raw: choice?.message?.content || '{}', truncated: choice?.finish_reason === 'length' };
   });
+}
+
+
+function generateFallbackCandidates(content: SocialContent, bundle: EvidenceBundle): RawPlaceCandidate[] {
+  const candidates: RawPlaceCandidate[] = [];
+  const addedNames = new Set<string>();
+
+  const rawLocTag = typeof content.locationTag === 'string' ? content.locationTag : content.locationTag?.name || '';
+  if (rawLocTag && rawLocTag.trim()) {
+    const name = rawLocTag.trim();
+    if (!GENERIC_NAMES.has(name.toLowerCase())) {
+      const city = LocationService.detectCityFromText(name) || LocationService.detectCityFromText(content.caption || '') || '';
+      candidates.push({
+        name,
+        mention_type: 'explicit',
+        role: 'featured',
+        name_evidence: ['L1'],
+        location_evidence: ['L1'],
+        city,
+        neighborhood: '',
+        address: '',
+        base_category: 'CITY',
+        category: 'CITY',
+        description: 'Platform location tag',
+        search_query: '',
+      });
+      addedNames.add(name.toLowerCase());
+    }
+  }
+
+  if (Array.isArray(content.taggedUsers)) {
+    for (const user of content.taggedUsers) {
+      if (!user) continue;
+      const displayName = (user.full_name || user.username || '').replace(/^@/, '').trim();
+      if (displayName && displayName.length >= 3 && !GENERIC_NAMES.has(displayName.toLowerCase()) && !addedNames.has(displayName.toLowerCase())) {
+        candidates.push({
+          name: displayName,
+          mention_type: user.full_name ? 'explicit' : 'handle',
+          role: 'featured',
+          name_evidence: ['A1'],
+          location_evidence: [],
+          city: LocationService.detectCityFromText(content.caption || '') || '',
+          neighborhood: '',
+          address: '',
+          base_category: 'RESTAURANTS',
+          category: 'RESTAURANTS',
+          description: 'Tagged venue account',
+          search_query: '',
+        });
+        addedNames.add(displayName.toLowerCase());
+      }
+    }
+  }
+
+  for (const item of bundle.items) {
+    if (/^📍/u.test(item.text)) {
+      const cleaned = item.text.replace(/^📍\s*/u, '').trim();
+      const parts = cleaned.split(/·|\n|\|/).map((p) => p.trim()).filter(Boolean);
+      if (parts.length > 0) {
+        const name = parts[0];
+        if (name && name.length >= 3 && !GENERIC_NAMES.has(name.toLowerCase()) && !addedNames.has(name.toLowerCase())) {
+          const address = parts.find((p) => /\d/.test(p) && isPlausibleStreetAddress(p)) || '';
+          const city = LocationService.detectCityFromText(cleaned) || LocationService.detectCityFromText(content.caption || '') || '';
+          candidates.push({
+            name,
+            mention_type: 'explicit',
+            role: 'featured',
+            name_evidence: [item.id],
+            location_evidence: [item.id],
+            city,
+            neighborhood: '',
+            address,
+            base_category: 'RESTAURANTS',
+            category: 'RESTAURANTS',
+            description: 'On-screen location marker',
+            search_query: '',
+          });
+          addedNames.add(name.toLowerCase());
+        }
+      }
+    }
+  }
+
+  return candidates;
+}
+
+const VISUAL_GUIDE_RE = /\b(?:dining|restaurants?|caf(?:e|é)s?|coffee|bars?|food|spots?|places|guide|itinerary|top)\b/i;
+
+function visualTextKey(text: string): string {
+  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+}
+
+function guideCategory(text: string): BaseCategory | null {
+  if (/\b(?:dining|restaurants?|food)\b/i.test(text)) return 'RESTAURANTS';
+  if (/\b(?:caf(?:e|é)s?|coffee|tea)\b/i.test(text)) return 'COFFEE';
+  if (/\b(?:bars?|pubs?|cocktails?|wine)\b/i.test(text)) return 'BARS';
+  if (/\b(?:shops?|stores?|shopping|markets?)\b/i.test(text)) return 'SHOPPING';
+  return null;
+}
+
+/**
+ * Recover cards from a clearly labelled visual guide without asking the model
+ * to rediscover text that Vision has already transcribed. It is deliberately
+ * limited to guides whose visible title establishes the place category.
+ */
+function generateVisualGuideCandidates(
+  content: SocialContent,
+  media: MediaEvidenceInput,
+  bundle: EvidenceBundle
+): RawPlaceCandidate[] {
+  const frames = media.visionFrames || [];
+  if (!['video', 'reel'].includes(content.contentType) || frames.length < 2) return [];
+
+  const allText = [content.caption || '', ...frames.flatMap((frame) => frame.texts || [])].join('\n');
+  const baseCategory = guideCategory(allText);
+  if (!baseCategory || !VISUAL_GUIDE_RE.test(allText)) return [];
+
+  const appearances = new Map<string, Set<number>>();
+  for (const frame of frames) {
+    for (const text of new Set((frame.texts || []).map((line) => line.trim()).filter(Boolean))) {
+      const key = visualTextKey(text);
+      if (key) appearances.set(key, new Set([...(appearances.get(key) || []), frame.frameIndex]));
+    }
+  }
+  const repeatedTitleKeys = new Set(
+    [...appearances.entries()]
+      .filter(([, seen]) => seen.size >= Math.max(3, Math.ceil(frames.length * 0.6)))
+      .map(([key]) => key)
+  );
+  const city = LocationService.detectCityFromText(allText) || '';
+  const candidates: RawPlaceCandidate[] = [];
+  const added = new Set<string>();
+
+  for (const frame of frames) {
+    const lines = [...new Set((frame.texts || []).map((line) => line.trim()).filter(Boolean))]
+      .filter((line) => line.length >= 3 && !repeatedTitleKeys.has(visualTextKey(line)));
+    // The guide cover contains category/headline text, not a venue card.
+    if (lines.length === 0 || lines.some((line) => VISUAL_GUIDE_RE.test(line))) continue;
+
+    // Venue cards use the final line for an area. The preceding one or two
+    // lines are the display name (e.g. "THE PRIMO BY" + "MANN & SALWA").
+    const nameLines = lines.length > 1 ? lines.slice(0, -1) : lines;
+    const name = nameLines.join(' ').replace(/\s+/g, ' ').trim();
+    const key = visualTextKey(name.replace(/^@/, ''));
+    if (key.length < 3 || added.has(key) || GENERIC_NAMES.has(key)) continue;
+
+    const frameEvidence = bundle.items.filter((item) =>
+      item.source === 'vision_ocr' && item.frames?.includes(frame.frameIndex)
+    );
+    const nameEvidence = frameEvidence
+      .filter((item) => nameLines.some((line) => visualTextKey(item.text) === visualTextKey(line)))
+      .map((item) => item.id);
+    if (nameEvidence.length === 0) continue;
+
+    candidates.push({
+      name,
+      mention_type: name.startsWith('@') ? 'handle' : 'explicit',
+      role: 'featured',
+      name_evidence: nameEvidence,
+      location_evidence: city ? frameEvidence.filter((item) => visualTextKey(item.text).includes(visualTextKey(city))).map((item) => item.id) : [],
+      city,
+      neighborhood: '',
+      address: '',
+      base_category: baseCategory,
+      category: baseCategory,
+      description: '',
+      search_query: '',
+    });
+    added.add(key);
+  }
+  return candidates;
+}
+
+function generateFallbackAnalysis(content: SocialContent, bundle: EvidenceBundle, places: PlaceExtraction[]): Record<string, any> {
+  const caption = (content.caption || '').trim();
+  const summary = caption.length > 0 ? caption.split(/\s+/).slice(0, 20).join(' ') : `Social media post by @${content.authorUsername}`;
+
+  const hashtags = (content.hashtags || []).map((h: string) => h.replace(/^#/, ''));
+  const captionWords = caption.toLowerCase().match(/\b[a-z]{4,}\b/g) || [];
+  const stopwords = new Set(['this', 'that', 'with', 'from', 'have', 'were', 'what', 'your', 'about', 'some', 'they', 'there', 'here', 'when', 'which', 'where']);
+  const keywords = Array.from(new Set([...hashtags, ...captionWords.filter((w) => !stopwords.has(w))])).slice(0, 5);
+
+  let primary_category = 'CITY';
+  if (places.length > 0 && places[0].category) {
+    primary_category = places[0].category;
+  } else if (hashtags.some((h) => /food|eats|restaurant|cafe|dinner|brunch/i.test(h))) {
+    primary_category = 'RESTAURANTS';
+  } else if (hashtags.some((h) => /travel|trip|explore|vacation/i.test(h))) {
+    primary_category = 'TRAVEL';
+  }
+
+  const detectedCity = LocationService.detectCityFromText(caption) || (places.length > 0 ? places[0].city : '');
+
+  return {
+    summary,
+    primary_category,
+    topics: hashtags.slice(0, 3),
+    keywords,
+    tone: ['informative'],
+    niche: primary_category.toLowerCase(),
+    is_promotional: Boolean(content.paidPartnership),
+    is_sponsored: Boolean(content.paidPartnership),
+    promotion_type: content.paidPartnership ? 'sponsored' : '',
+    call_to_actions: [],
+    offers: [],
+    primary_audience: 'General',
+    audience_interests: hashtags.slice(0, 2),
+    geographic_focus: detectedCity ? [detectedCity] : [],
+    audience_intent: 'Inspiration',
+    audience_confidence: 0.6,
+  };
 }
 
 export class AiEnrichmentService {
@@ -705,9 +940,15 @@ export class AiEnrichmentService {
   static async extractPlaces(content: SocialContent, media: MediaEvidenceInput): Promise<PlaceExtractionOutcome> {
     const bundle = buildEvidence(content, media);
     if (bundle.items.length === 0) return { places: [], rejected: [] };
-    const { raw, truncated } = await callExtractionModel(bundle, false, RECOVERY_OUTPUT_TOKENS);
-    if (truncated) plog('model', 'Places-only response hit the output budget', undefined, 'warn');
-    return finalizeCandidates(parseCandidates(raw), bundle, content.authorUsername);
+    try {
+      const { raw, truncated } = await callExtractionModel(bundle, false, RECOVERY_OUTPUT_TOKENS);
+      if (truncated) plog('model', 'Places-only response hit the output budget', undefined, 'warn');
+      return finalizeCandidates(parseCandidates(raw), bundle, content.authorUsername);
+    } catch (err: any) {
+      plog('model', 'Places-only extraction AI call failed; generating fallback candidates from evidence', { error: err.message || String(err) }, 'warn');
+      const fallbackCandidates = generateFallbackCandidates(content, bundle);
+      return finalizeCandidates(fallbackCandidates, bundle, content.authorUsername);
+    }
   }
 
   /** Legacy signature: plain transcript text and OCR strings. */
@@ -729,7 +970,7 @@ export class AiEnrichmentService {
     content: SocialContent,
     rawApifyData: any,
     media: MediaEvidenceInput
-  ): Promise<{ analysis: AiAnalysisResult; places: PlaceExtraction[]; rejected: PlaceExtractionOutcome['rejected'] } | null> {
+  ): Promise<{ analysis: AiAnalysisResult; places: PlaceExtraction[]; rejected: PlaceExtractionOutcome['rejected']; warning?: string } | null> {
     const bundle = buildEvidence(content, media);
     plog('evidence', `Evidence built: ${bundle.items.length} items`, {
       availability: bundle.availability,
@@ -739,52 +980,82 @@ export class AiEnrichmentService {
 
     let parsed: any = {};
     let outcome: PlaceExtractionOutcome = { places: [], rejected: [] };
+    let warning: string | undefined;
 
     if (bundle.items.length > 0) {
-      const { raw, truncated } = await callExtractionModel(bundle, true, MAX_OUTPUT_TOKENS);
-      let parsedJson: unknown;
       try {
-        parsedJson = JSON.parse(raw);
-      } catch {
-        throw new Error('[AI Analysis] Model returned invalid JSON.');
-      }
-      parsed = isRecord(parsedJson) && isRecord(parsedJson.analysis) ? parsedJson.analysis : {};
-
-      let candidates: RawPlaceCandidate[] = [];
-      try {
-        candidates = parseCandidates(raw);
-      } catch (placeError) {
-        plog('model', 'Combined response had no usable places', { error: String(placeError) }, 'warn');
-      }
-      outcome = await finalizeCandidates(candidates, bundle, content.authorUsername);
-
-      // Recovery: the list was cut off, or the evidence has more distinct
-      // street-address rows than places returned. A places-only pass is merged
-      // by entity; generated data is never trusted without the same checks.
-      const sourceAddressCount = distinctSourceAddressCount(bundle.items.map((item) => item.text));
-      // Every 📍-marked line (any pin style, normalised) is a location the creator pointed at.
-      const markedLocations = bundle.items.filter((item) => /^📍/u.test(item.text)).length;
-      const expected = Math.max(sourceAddressCount, markedLocations);
-      if (truncated || expected > outcome.places.length) {
-        plog('model', 'Running places-only recovery pass', {
-          truncated,
-          sourceAddresses: sourceAddressCount,
-          markedLocations,
-          placesSoFar: outcome.places.length,
-        }, 'warn');
+        const { raw, truncated } = await callExtractionModel(bundle, true, MAX_OUTPUT_TOKENS);
+        let parsedJson: unknown;
         try {
-          const found = outcome.places.map((place) => place.name).filter(Boolean).join(', ');
-          const note = `CHECK: the evidence marks ${markedLocations} location(s) with 📍 and ${sourceAddressCount} street address(es), ` +
-            `but only ${outcome.places.length} place(s) were returned${found ? ` (${found})` : ''}. Return EVERY place, including those already found.`;
-          const recovery = await callExtractionModel(bundle, false, RECOVERY_OUTPUT_TOKENS, note);
-          const recovered = await finalizeCandidates(parseCandidates(recovery.raw), bundle, content.authorUsername);
-          outcome = {
-            places: mergeSameEntities([...outcome.places, ...recovered.places], bundle),
-            rejected: [...outcome.rejected, ...recovered.rejected],
-          };
-        } catch (recoveryError: any) {
-          plog('model', 'Recovery pass failed', { error: recoveryError.message || String(recoveryError) }, 'warn');
+          parsedJson = JSON.parse(raw);
+        } catch {
+          throw new Error('[AI Analysis] Model returned invalid JSON.');
         }
+        parsed = isRecord(parsedJson) && isRecord(parsedJson.analysis) ? parsedJson.analysis : {};
+
+        let candidates: RawPlaceCandidate[] = [];
+        try {
+          candidates = parseCandidates(raw);
+        } catch (placeError) {
+          plog('model', 'Combined response had no usable places', { error: String(placeError) }, 'warn');
+        }
+        outcome = await finalizeCandidates(candidates, bundle, content.authorUsername);
+
+        const visualGuideCandidates = generateVisualGuideCandidates(content, media, bundle);
+        if (visualGuideCandidates.length > 0) {
+          const visualGuideOutcome = await finalizeCandidates(visualGuideCandidates, bundle, content.authorUsername);
+          const before = outcome.places.length;
+          outcome = {
+            places: mergeSameEntities([...outcome.places, ...visualGuideOutcome.places], bundle),
+            rejected: [...outcome.rejected, ...visualGuideOutcome.rejected],
+          };
+          const added = outcome.places.length - before;
+          if (added > 0) {
+            plog('model', 'Recovered source-backed venue cards from Vision frames', {
+              candidates: visualGuideCandidates.length,
+              added,
+              places: outcome.places.map((place) => place.name),
+            }, 'info');
+          }
+        }
+
+        // Recovery: the list was cut off, or the evidence has more distinct
+        // street-address rows than places returned. A places-only pass is merged
+        // by entity; generated data is never trusted without the same checks.
+        const sourceAddressCount = distinctSourceAddressCount(bundle.items.map((item) => item.text));
+        // Every 📍-marked line (any pin style, normalised) is a location the creator pointed at.
+        const markedLocations = bundle.items.filter((item) => /^📍/u.test(item.text)).length;
+        const expected = Math.max(sourceAddressCount, markedLocations);
+        if (truncated || expected > outcome.places.length) {
+          plog('model', 'Running places-only recovery pass', {
+            truncated,
+            sourceAddresses: sourceAddressCount,
+            markedLocations,
+            placesSoFar: outcome.places.length,
+          }, 'warn');
+          try {
+            const found = outcome.places.map((place) => place.name).filter(Boolean).join(', ');
+            const note = `CHECK: the evidence marks ${markedLocations} location(s) with 📍 and ${sourceAddressCount} street address(es), ` +
+              `but only ${outcome.places.length} place(s) were returned${found ? ` (${found})` : ''}. Return EVERY place, including those already found.`;
+            const recovery = await callExtractionModel(bundle, false, RECOVERY_OUTPUT_TOKENS, note);
+            const recovered = await finalizeCandidates(parseCandidates(recovery.raw), bundle, content.authorUsername);
+            outcome = {
+              places: mergeSameEntities([...outcome.places, ...recovered.places], bundle),
+              rejected: [...outcome.rejected, ...recovered.rejected],
+            };
+          } catch (recoveryError: any) {
+            plog('model', 'Recovery pass failed', { error: recoveryError.message || String(recoveryError) }, 'warn');
+          }
+        }
+      } catch (error) {
+        warning = analysisFallbackWarning(error);
+        plog('model', 'All AI extraction providers failed; fulfilling request using metadata & evidence fallback', {
+          error: error instanceof Error ? error.message : String(error),
+          warning,
+        }, 'warn');
+        const fallbackCandidates = generateFallbackCandidates(content, bundle);
+        outcome = await finalizeCandidates(fallbackCandidates, bundle, content.authorUsername);
+        parsed = generateFallbackAnalysis(content, bundle, outcome.places);
       }
     } else {
       plog('model', 'No evidence available; skipping the model call', undefined, 'warn');
@@ -900,6 +1171,6 @@ export class AiEnrichmentService {
       })),
     };
 
-    return { analysis, places, rejected: outcome.rejected };
+    return { analysis, places, rejected: outcome.rejected, ...(warning ? { warning } : {}) };
   }
 }

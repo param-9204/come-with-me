@@ -4,6 +4,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { after } from 'next/server';
 import { ScraperService } from '@/lib/services/scraper.service';
 import { DbService } from '@/lib/services/db.service';
+import { PipelineLog, recordPipelineOperation, withPipelineLog } from '@/lib/services/pipeline-log';
 
 // The background pipeline runs in `after()` within this invocation.
 export const maxDuration = 300;
@@ -14,7 +15,9 @@ async function runBackgroundPipeline(
   socialPostId: string,
   userId: string | null,
   contentData: any,
-  rawApifyDataObj: any
+  rawApifyDataObj: any,
+  pipelineRunId: string,
+  pipelineStartedAt: string,
 ) {
   console.log(`[Background Pipeline] Starting for: ${cleanUrl} (ID: ${socialPostId})`);
   let currentStage = 'media';
@@ -22,10 +25,25 @@ async function runBackgroundPipeline(
     // One shared media pipeline (key frames → local OCR → vision fallback on
     // hard frames; platform subtitles or Whisper). Every stage is non-fatal.
     const { MediaEvidenceService } = await import('@/lib/services/media-evidence.service');
-    const { PipelineLog, withPipelineLog } = await import('@/lib/services/pipeline-log');
-    const mediaLog = new PipelineLog(String(contentData?.contentId || socialPostId), { route: 'stream', socialPostId, url: cleanUrl });
+    const mediaLog = new PipelineLog(String(contentData?.contentId || socialPostId), {
+      route: 'stream', socialPostId, url: cleanUrl, pipelineRunId, pipelineStartedAt,
+    });
+    mediaLog.setRunInput({
+      platform: contentData.platform,
+      inputUrl: cleanUrl,
+      socialPostId,
+      entrypoint: 'stream',
+      contentId: contentData.contentId,
+      contentType: contentData.contentType,
+      caption: contentData.caption,
+      hashtags: contentData.hashtags,
+      mentions: contentData.mentions,
+      taggedAccounts: contentData.taggedUsers,
+      metadata: { videoDuration: contentData.videoDuration, dimensions: contentData.dimensions },
+    });
     const media = await withPipelineLog(mediaLog, () => MediaEvidenceService.collect(contentData, rawApifyDataObj));
     mediaLog.flush();
+    await mediaLog.flushDatabase();
     const ocrResultsList = media.ocrFrames;
     const gptVisionResultsList = media.visionFrames;
     const whisperTranscript = media.transcriptText;
@@ -53,10 +71,13 @@ async function runBackgroundPipeline(
         transcriptLanguage: media.transcript?.language || null,
         apifyOcrFrames: ocrResultsList,
         gptVisionFrames: gptVisionResultsList,
+        processingWarnings: media.warnings,
         url: cleanUrl,
         audioUploadId: audioUploadObj?.id,
         userId,
         socialPostId,
+        pipelineRunId,
+        pipelineStartedAt,
       }),
     });
 
@@ -68,6 +89,17 @@ async function runBackgroundPipeline(
     console.log(`[Background Pipeline] Finished successfully for: ${cleanUrl}`);
   } catch (err: any) {
     console.error(`[Background Pipeline] Critical failure for URL: ${cleanUrl}`, err.message);
+    const failureLog = new PipelineLog(`stream-failure-${socialPostId}`, {
+      route: 'stream', socialPostId, url: cleanUrl, pipelineRunId, pipelineStartedAt,
+    });
+    failureLog.setRunInput({
+      platform: cleanUrl.includes('tiktok.com') ? 'tiktok' : 'instagram',
+      inputUrl: cleanUrl,
+      socialPostId,
+      entrypoint: 'stream',
+    });
+    failureLog.fail(err, { failedStage: currentStage });
+    await failureLog.flushDatabase();
     const errorPayload = {
       failed_stage: currentStage,
       error_code: err.code || `${currentStage.toUpperCase()}_FAILURE`,
@@ -135,6 +167,8 @@ export async function POST(request: Request) {
       };
 
       let socialPostId: string | undefined;
+      const pipelineRunId = uuidv4();
+      const pipelineStartedAt = new Date().toISOString();
 
       try {
         // ── 0. Check for cached completed post ──────────────────────────────
@@ -228,7 +262,33 @@ export async function POST(request: Request) {
         }
         console.log(`[SSE Stream] Initiating scrape with webhookUrl: ${webhookUrl}`);
 
-        await ScraperService.initiateScrape(cleanUrl, webhookUrl, socialPostId);
+        const scrapeLog = new PipelineLog(`stream-scrape-${socialPostId}`, {
+          route: 'stream', socialPostId, url: cleanUrl, pipelineRunId, pipelineStartedAt,
+        });
+        scrapeLog.setRunInput({
+          platform,
+          inputUrl: cleanUrl,
+          socialPostId,
+          entrypoint: 'stream',
+        });
+        const scrapeStartedAt = new Date();
+        try {
+          await withPipelineLog(scrapeLog, async () => {
+            const result = await ScraperService.initiateScrape(cleanUrl, webhookUrl, socialPostId);
+            recordPipelineOperation({
+              stage: 'scrape', operation: 'start_actor_webhook', provider: 'apify', model: result.actorId,
+              startedAt: scrapeStartedAt, finishedAt: new Date(), requestSummary: { webhook: true },
+              resultSummary: { actorRunId: result.runId },
+            });
+            return result;
+          });
+        } catch (error) {
+          scrapeLog.fail(error);
+          throw error;
+        } finally {
+          scrapeLog.flush();
+          await scrapeLog.flushDatabase();
+        }
 
         // ── 4. Poll database status and stream pipeline progression ─────────
         let contentData: any = null;
@@ -295,7 +355,9 @@ export async function POST(request: Request) {
                 socialPostId!,
                 userId || null,
                 contentData,
-                rawApifyDataObj
+                rawApifyDataObj,
+                pipelineRunId,
+                pipelineStartedAt,
               );
               try {
                 after(() => bgPromise);

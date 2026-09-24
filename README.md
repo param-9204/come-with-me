@@ -67,10 +67,15 @@ OCR_FALLBACK_PROVIDER=google
 GOOGLE_VISION_API_KEY=
 OCR_FALLBACK_MAX_FRAMES=     # optional cap on vision OCR for unreadable video frames (default: none)
 OCR_MAX_KEY_FRAMES=          # optional cap on frames per video, spread evenly (default: none)
+# Maximum longest edge for the paid colour image sent to GPT Vision / Cloud Vision.
+# Tesseract retains its higher-resolution local copy. Default: 1024 (minimum: 512).
+VISION_OCR_MAX_DIMENSION=1024
 OCR_WORKERS=                 # parallel Tesseract workers (default: min(4, CPU cores))
 OCR_LANGS=eng+hin            # Tesseract languages
-GROQ_API_KEY=                # if set, Groq whisper-large-v3 is used first for speech
-OPENAI_CHAT_MODEL=gpt-4o
+GROQ_API_KEY=                # enables Groq fallback for chat extraction and OpenAI rate limits; also uses Groq whisper-large-v3 first for speech
+OPENAI_CHAT_MODEL=gpt-4o-mini
+# Default for OCR; override only when you intentionally need a different vision model.
+OPENAI_VISION_MODEL=gpt-4o
 # Geocoding fallback when Google is not configured, out of quota, or finds no
 # verified match. NEXT_PUBLIC_MAPBOX_TOKEN is used if this is not set.
 MAPBOX_ACCESS_TOKEN=

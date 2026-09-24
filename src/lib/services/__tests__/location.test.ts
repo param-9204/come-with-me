@@ -48,6 +48,27 @@ afterEach(() => {
 });
 
 describe('LocationService without the Geocoding API', () => {
+  it('rejects founding-year prose as an address while preserving real addresses', () => {
+    expect(LocationService.sanitizeSourceAddress('2017 by Street')).toBe('');
+    expect(LocationService.sanitizeSourceAddress('Founded in 2017 by two brothers')).toBe('');
+    expect(LocationService.sanitizeSourceAddress('49 Camino Wy')).toBe('49 Camino Wy');
+    expect(LocationService.sanitizeSourceAddress('110 SE 6th St Suite 115')).toBe('110 SE 6th St Suite 115');
+    expect(LocationService.sanitizeSourceAddress('10 we Street')).toBe('');
+    expect(LocationService.sanitizeSourceAddress('17 courses Street')).toBe('');
+    expect(LocationService.sanitizeSourceAddress('10 Eats Street')).toBe('');
+  });
+
+  it('retries a venue by name and city after rejecting an untrusted source address', async () => {
+    const queries: string[] = [];
+    mockFetch((_url, init) => {
+      queries.push(JSON.parse(String(init?.body || '{}')).textQuery || '');
+      return { body: { places: [place({ displayName: { text: 'Culture Espresso' }, formattedAddress: '72 W 38th St, New York, NY 10018, USA' })] } };
+    });
+    const result = await LocationService.geocodePlace('Culture Espresso', 'New York', '10 we Street');
+    expect(queries[0]).toBe('Culture Espresso, New York');
+    expect(result).toMatchObject({ matchedName: 'Culture Espresso', formattedAddress: '72 W 38th St, New York, NY 10018, USA' });
+  });
+
   it('resolves a city centre from the Places result typed locality', async () => {
     const calls = mockFetch(() => ({
       body: {

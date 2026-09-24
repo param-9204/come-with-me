@@ -1,4 +1,5 @@
 import OpenAI from 'openai';
+import { plog, recordPipelineOperation, type PipelineStage } from './pipeline-log';
 
 export type AITaskType = 'chat' | 'vision' | 'audio' | 'audio-translation';
 
@@ -9,18 +10,32 @@ export interface AIClientConfig {
   isGroq: boolean;
 }
 
+export interface AIUsageReport {
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  totalTokens?: number | null;
+  requestSummary?: Record<string, unknown>;
+  resultSummary?: Record<string, unknown>;
+}
+
+export type AIUsageReporter = (usage: AIUsageReport) => void;
+
+function stageForTask(task: AITaskType): PipelineStage {
+  if (task === 'vision') return 'vision';
+  if (task === 'audio' || task === 'audio-translation') return 'transcript';
+  return 'model';
+}
+
 function envModel(name: string, fallback: string): string {
   return process.env[name]?.trim() || fallback;
 }
 
 function openAiConfig(task: AITaskType, apiKey: string): AIClientConfig {
   const model = task === 'audio' || task === 'audio-translation'
-    // whisper-1 is used because verbose_json segments (timestamps, no-speech
-    // probability) are required for evidence alignment and hallucination filtering.
     ? envModel('OPENAI_AUDIO_MODEL', 'whisper-1')
     : task === 'vision'
       ? envModel('OPENAI_VISION_MODEL', 'gpt-4o')
-      : envModel('OPENAI_CHAT_MODEL', 'gpt-4o');
+      : envModel('OPENAI_CHAT_MODEL', 'gpt-4o-mini');
   return { client: new OpenAI({ apiKey }), model, provider: 'openai', isGroq: false };
 }
 
@@ -36,14 +51,6 @@ function groqConfig(task: AITaskType, apiKey: string): AIClientConfig {
   };
 }
 
-/**
- * Provider order per task:
- * - chat: OpenAI first, Groq fallback.
- * - audio: Groq whisper-large-v3 first when configured (lower per-minute price),
- *   OpenAI whisper-1 fallback.
- * - vision: OpenAI only. The configured Groq chat model is text-only, so a Groq
- *   "fallback" for images would always fail.
- */
 export function getAIClientConfigs(task: AITaskType): AIClientConfig[] {
   const groqKey = process.env.GROQ_API_KEY?.trim();
   const openAiKey = process.env.OPENAI_API_KEY?.trim();
@@ -66,41 +73,115 @@ export function getAIClientConfigs(task: AITaskType): AIClientConfig[] {
   return configs;
 }
 
-/** Legacy single-client accessor (returns the first provider for the task). */
 export function getAIClient(task: AITaskType): AIClientConfig {
   return getAIClientConfigs(task)[0];
 }
 
-/** Reasoning-model families reject `temperature`; classic chat models accept it. */
 export function supportsTemperature(model: string): boolean {
   return !/^(o\d|gpt-5)/i.test(model.replace(/^openai\//, ''));
 }
 
 /**
  * Executes an AI task with automatic provider fallback in the order returned by
- * getAIClientConfigs. Any provider error (rate limit, validation, network)
- * moves on to the next provider.
+ * getAIClientConfigs. Rate limit (429) errors are retried with exponential backoff.
  */
 export async function executeAICall<T>(
   task: AITaskType,
-  fn: (config: AIClientConfig) => Promise<T>
+  fn: (config: AIClientConfig, reportUsage: AIUsageReporter) => Promise<T>
 ): Promise<T> {
   const configs = getAIClientConfigs(task);
   let lastError: any = null;
 
   for (let i = 0; i < configs.length; i++) {
     const config = configs[i];
-    try {
-      if (i > 0) {
-        console.log(`[AI Client] Falling back to provider #${i + 1}: ${config.provider} (${config.model})...`);
+    const maxRetries = 2;
+
+    for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+      const startedAt = new Date();
+      let usage: AIUsageReport = {};
+      try {
+        if (i > 0 || attempt > 1) {
+          plog(stageForTask(task), 'AI provider call attempt', {
+            task,
+            provider: config.provider,
+            model: config.model,
+            attempt,
+            providerIndex: i + 1,
+          }, 'warn');
+        }
+        const result = await fn(config, (reported) => {
+          usage = { ...usage, ...reported };
+        });
+        recordPipelineOperation({
+          stage: stageForTask(task),
+          operation: `ai_${task}`,
+          provider: config.provider,
+          model: config.model,
+          attempt,
+          isFallback: i > 0 || attempt > 1,
+          startedAt,
+          finishedAt: new Date(),
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          totalTokens: usage.totalTokens,
+          requestSummary: { task, ...(usage.requestSummary || {}) },
+          resultSummary: usage.resultSummary,
+        });
+        return result;
+      } catch (err: any) {
+        lastError = err;
+        const status = Number(err?.status ?? err?.statusCode);
+        const msg = String(err?.message || err || '');
+        const isRateLimit = status === 429 || /(?:rate limit|tpm|rpm|too many requests|429)/i.test(msg);
+
+        recordPipelineOperation({
+          stage: stageForTask(task),
+          operation: `ai_${task}`,
+          provider: config.provider,
+          model: config.model,
+          status: 'failed',
+          attempt,
+          isFallback: i > 0 || attempt > 1,
+          startedAt,
+          finishedAt: new Date(),
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          totalTokens: usage.totalTokens,
+          requestSummary: { task, ...(usage.requestSummary || {}) },
+          error: err,
+          retryable: attempt <= maxRetries || i < configs.length - 1,
+        });
+
+        if (isRateLimit && attempt <= maxRetries) {
+          const msMatch = msg.match(/try again in (\d+)(ms|s)?/i);
+          let delayMs = 1200;
+          if (msMatch) {
+            const val = parseInt(msMatch[1], 10);
+            const unit = msMatch[2]?.toLowerCase();
+            delayMs = unit === 's' ? val * 1000 : val;
+            delayMs = Math.max(delayMs + 200, 800);
+          } else {
+            delayMs = attempt * 1000;
+          }
+          plog(stageForTask(task), `Rate limit (429) hit. Retrying in ${delayMs}ms (attempt ${attempt}/${maxRetries})`, {
+            task,
+            provider: config.provider,
+            model: config.model,
+            error: msg,
+          }, 'warn');
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          continue;
+        }
+
+        plog(stageForTask(task), 'AI provider failed', {
+          task,
+          provider: config.provider,
+          model: config.model,
+          attempt,
+          error: err.message || String(err),
+        }, i < configs.length - 1 ? 'warn' : 'error');
+        break;
       }
-      return await fn(config);
-    } catch (err: any) {
-      lastError = err;
-      console.warn(
-        `[AI Client] Provider ${config.provider} (${config.model}) failed for ${task}:`,
-        err.message || err
-      );
     }
   }
 

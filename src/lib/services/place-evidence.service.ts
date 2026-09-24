@@ -63,7 +63,7 @@ const HIDDEN_GEM_RE = /hidden gem|secret (?:spot|place|bar|garden|beach|cafe|res
 /** Platform UI text that OCR picks up from screen recordings and overlays. */
 const UI_CHROME_RE = /^(?:follow(?:ing)?|like[sd]?|reply|share|send|save[sd]?|original audio|sponsored|paid partnership(?: with .*)?|see translation|view all \d+ comments|add a comment\.*|tiktok|reels?|instagram|for you|following|live|more|comments?|\d+(?:[.,]\d+)?[km]?)$/i;
 
-const GENERIC_NAMES = new Set([
+export const GENERIC_NAMES = new Set([
   'restaurant', 'restaurants', 'cafe', 'coffee shop', 'coffee', 'bar', 'bars', 'pub', 'club', 'hotel', 'shop', 'store',
   'this place', 'this spot', 'the spot', 'spot', 'place', 'my place', 'home', 'my kitchen', 'kitchen', 'hidden gem',
   'bakery', 'market', 'beach', 'park', 'museum', 'rooftop', 'brunch', 'dinner', 'lunch', 'breakfast', 'food',
@@ -195,6 +195,7 @@ const isScreenText = (item: EvidenceItem) => item.source === 'ocr' || item.sourc
 const PIN_RE = /^\s*📍/u;
 /** Bulleted or numbered lines: a deliberate list, never scenery. */
 const LIST_ITEM_RE = /^\s*(?:[•·●▪◦\-–*]|\d{1,2}[.)])\s*\S/u;
+const GUIDE_HEADING_RE = /\b(?:dining|restaurants?|caf(?:e|é)s?|coffee|bars?|food|spots?|places|guide|itinerary|top)\b/i;
 
 // ──────────────────────────────────────────────────────────────────────
 // Location markers
@@ -491,7 +492,10 @@ export function buildEvidence(content: SocialContent, media: MediaEvidenceInput 
 
   const visionEntries: OcrEntry[] = [];
   for (const frame of media.visionFrames || []) {
-    for (const textLine of frame.texts || []) {
+    // `locations` is structured Vision output and may contain a name that is
+    // absent from the plain transcription. Preserve it as normal visual
+    // evidence, but do not duplicate text returned in both fields.
+    for (const textLine of new Set([...(frame.texts || []), ...(frame.locations || [])])) {
       visionEntries.push({ text: normalizeLocationMarker(textLine), confidence: 0.9, timestamp: isSingleVideo ? frame.timestamp : undefined, frame: frame.frameIndex });
     }
   }
@@ -711,7 +715,13 @@ export function sanitizeCandidateLocation<T extends { city: string; neighborhood
     else next.neighborhood = '';
   }
   if (next.address.trim()) {
-    const supporting = items.filter((item) => addressMentionedIn(next.address, item));
+    // The model can copy a nearby date or prose fragment into `address` even
+    // though it is present in the evidence. Apply the same strict guard used
+    // at persistence before treating that value as location evidence.
+    next.address = LocationService.sanitizeSourceAddress(next.address);
+    const supporting = next.address
+      ? items.filter((item) => addressMentionedIn(next.address, item))
+      : [];
     if (supporting.length) supporting.forEach((item) => groundedLocationIds.add(item.id));
     else next.address = '';
   }
@@ -819,6 +829,21 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
     ? places.filter((place) => !!place.name && findNameSupport(place.name, bundle).some(isPinned)).length
     : 0;
   const pinLabelled = pinnedCandidates >= 2;
+  const isAreaCandidate = (place: ScorablePlace) => (place.base_category || place.category) === 'CITY';
+  const visualAreaCandidates = places.filter((place) => {
+    const name = (place.name || '').trim();
+    return !!name && isAreaCandidate(place) && findNameSupport(name, bundle).some(isScreenText);
+  });
+  const visualAreaNames = new Set(visualAreaCandidates.map((place) => compact(place.name || '')));
+  const guideContext = bundle.items
+    .filter((item) => !isScreenText(item))
+    .some((item) => /\b(?:guide|itinerary|neighbou?rhoods?|areas?|map|where\s+to\s+(?:live|stay|visit)|explore|list)\b/i.test(item.text));
+  // Three distinct area labels with a guide/map context—or four with no
+  // textual context—are strong evidence that labels such as Ridgewood are the
+  // itinerary itself, not incidental map scenery.
+  const visualAreaGuide = visualAreaNames.size >= 3 && (guideContext || visualAreaNames.size >= 4);
+  const visualGuideHeading = bundle.items.some((item) => isScreenText(item) && GUIDE_HEADING_RE.test(item.text));
+  const visualFrameCount = new Set(bundle.items.filter(isScreenText).flatMap((item) => item.frames || [])).size;
 
   for (const place of places) {
     const name = (place.name || '').trim();
@@ -836,9 +861,8 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
         place.role = 'recommended';
       }
     }
-    if (role && !['featured', 'recommended'].includes(role)) { reject(`role:${role}`); continue; }
-
     let support: EvidenceItem[];
+    let canPromoteRole = false;
     if (place.mention_type === 'indirect' && !name) {
       // The city is grounded separately (it may come from a hashtag or tag),
       // so only the descriptive words must appear in the evidence text.
@@ -867,12 +891,29 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
       support = findNameSupport(name, bundle);
       if (support.length === 0) { reject('name not found in evidence'); continue; }
       if (support.every((item) => item.source === 'creator_bio')) { reject('only in creator bio'); continue; }
+      const repeatedFrames = new Set(support.filter(isScreenText).flatMap((item) => item.frames || [])).size;
+      if (visualGuideHeading && support.every(isScreenText) && repeatedFrames >= Math.max(3, Math.ceil(visualFrameCount * 0.6))) {
+        reject('repeated visual guide title or watermark'); continue;
+      }
       // A list line ("• Mei Lah Wah", "1. Kasama") is part of the guide even when
       // other places carry pins; only stray text (a poster, a plate) is dropped.
       const isListItem = (item: EvidenceItem) => isScreenText(item) && LIST_ITEM_RE.test(item.text);
-      if (pinLabelled && support.every(isScreenText) && !support.some(isPinned) && !support.some(isListItem)) {
+      const deliberateScreenLabel = support.some(isPinned) || support.some(isListItem);
+      const mapAreaLabel = visualAreaGuide && isAreaCandidate(place) && support.some(isScreenText);
+      canPromoteRole = deliberateScreenLabel || mapAreaLabel;
+      if (pinLabelled && support.every(isScreenText) && !deliberateScreenLabel && !mapAreaLabel) {
         reject('un-pinned screen text in a pin-labelled post'); continue;
       }
+    }
+
+    if (role && !['featured', 'recommended'].includes(role)) {
+      if (!canPromoteRole) { reject(`role:${role}`); continue; }
+      plog('candidates', `Promoted "${name}" from ${role} using deliberate visual location evidence`, {
+        reason: isAreaCandidate(place) ? 'multi-area guide label' : 'pinned/list label',
+        evidence: support.map((item) => item.id),
+      });
+      role = 'recommended';
+      place.role = 'recommended';
     }
 
     const score = scorePlace(place, support, bundle);

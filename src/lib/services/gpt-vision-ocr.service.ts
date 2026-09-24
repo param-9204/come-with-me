@@ -18,15 +18,32 @@ function cleanStrings(value: unknown): string[] {
 }
 
 /**
- * GPT vision OCR. The media pipeline uses the batched method only as a
- * fallback for frames local OCR could not read (when Cloud Vision is not
- * available); the legacy /ocr-frame route still uses analyzeFrame.
+ * GPT vision OCR. The media pipeline's accuracy-first mode uses the batched
+ * method for every extracted frame in parallel with local Tesseract; its
+ * explicit selective mode uses it only as a fallback. The legacy /ocr-frame
+ * route still uses analyzeFrame.
  */
 export class GptVisionOcrService {
+  static readonly LIMIT_WARNING_MESSAGE =
+    'GPT Vision token or rate limit was reached. Tesseract OCR continued, so some on-screen text may be unavailable.';
+
+  private static limitWarning(error: unknown): GptVisionFrameResult['warning'] | undefined {
+    const candidate = error as { status?: unknown; statusCode?: unknown; code?: unknown; message?: unknown } | null;
+    const status = Number(candidate?.status ?? candidate?.statusCode);
+    const detail = [candidate?.code, candidate?.message]
+      .filter((value) => value !== null && value !== undefined)
+      .join(' ')
+      .toLowerCase();
+    const isLimit = status === 429 || /(?:insufficient[_ -]?quota|rate[_ -]?limit|quota|tokens?\s+(?:per|limit)|tpm|billing)/i.test(detail);
+    return isLimit
+      ? { code: 'gpt_vision_limit_exceeded', message: this.LIMIT_WARNING_MESSAGE }
+      : undefined;
+  }
+
   static async analyzeFrame(frame: VideoFrame): Promise<GptVisionFrameResult> {
     try {
       const image = fs.readFileSync(frame.colorFilePath || frame.filePath).toString('base64');
-      return await executeAICall('vision', async ({ client, model }) => {
+      return await executeAICall('vision', async ({ client, model }, reportUsage) => {
         const response = await client.chat.completions.create({
           model,
           messages: [
@@ -45,6 +62,13 @@ export class GptVisionOcrService {
           response_format: { type: 'json_object' },
           max_tokens: 700,
         });
+        reportUsage({
+          inputTokens: response.usage?.prompt_tokens,
+          outputTokens: response.usage?.completion_tokens,
+          totalTokens: response.usage?.total_tokens,
+          requestSummary: { frames: 1, detail: 'high', maxCompletionTokens: 700 },
+          resultSummary: { finishReason: response.choices[0]?.finish_reason || null },
+        });
         const result = JSON.parse(response.choices[0]?.message?.content || '{}');
         return {
           frameIndex: frame.frameIndex,
@@ -61,7 +85,7 @@ export class GptVisionOcrService {
       });
     } catch (error: any) {
       plog('vision', `GPT vision frame ${frame.frameIndex} failed`, { error: error.message || String(error) }, 'warn');
-      return this.emptyResult(frame);
+      return this.emptyResult(frame, this.limitWarning(error));
     }
   }
 
@@ -75,7 +99,7 @@ export class GptVisionOcrService {
 
   /** One request for up to 4 images. Returns null texts when the answer was cut off or unreadable. */
   private static async readBatch(batch: VideoFrame[], tokensPerImage: number): Promise<{ texts: string[][] | null; truncated: boolean }> {
-    return executeAICall('vision', async ({ client, model }) => {
+    return executeAICall('vision', async ({ client, model }, reportUsage) => {
       const response = await client.chat.completions.create({
         model,
         messages: [
@@ -100,6 +124,13 @@ export class GptVisionOcrService {
       });
       const choice = response.choices[0];
       const truncated = choice?.finish_reason === 'length';
+      reportUsage({
+        inputTokens: response.usage?.prompt_tokens,
+        outputTokens: response.usage?.completion_tokens,
+        totalTokens: response.usage?.total_tokens,
+        requestSummary: { frames: batch.length, detail: 'high', maxCompletionTokens: tokensPerImage * batch.length },
+        resultSummary: { finishReason: choice?.finish_reason || null, truncated },
+      });
       plog('vision', 'GPT vision batch', {
         model,
         frames: batch.length,
@@ -128,8 +159,16 @@ export class GptVisionOcrService {
   static async extractTextFromFramesBatched(frames: VideoFrame[], perRequest = 4): Promise<GptVisionFrameResult[]> {
     const results: GptVisionFrameResult[] = [];
     const toResult = (frame: VideoFrame, texts: string[]) => ({ ...this.emptyResult(frame), texts });
+    let limitReached: GptVisionFrameResult['warning'] | undefined;
     for (let offset = 0; offset < frames.length; offset += perRequest) {
       const batch = frames.slice(offset, offset + perRequest);
+      if (limitReached) {
+        // An account/rate quota cannot be recovered by sending more batches.
+        // Preserve frame alignment for downstream evidence while avoiding
+        // needless paid requests; Tesseract continues independently.
+        results.push(...batch.map((frame) => this.emptyResult(frame)));
+        continue;
+      }
       try {
         const first = await this.readBatch(batch, 1_500);
         if (first.texts && !first.truncated) {
@@ -137,16 +176,46 @@ export class GptVisionOcrService {
           continue;
         }
         plog('vision', 'GPT vision answer was cut off; re-reading images one at a time', { frames: batch.length }, 'warn');
-        for (const frame of batch) {
-          const single = await this.readBatch([frame], 4_000);
-          if (!single.texts || single.truncated) {
-            plog('vision', `GPT vision could not read all text on frame ${frame.frameIndex}`, { truncated: single.truncated }, 'error');
+        for (let index = 0; index < batch.length; index++) {
+          const frame = batch[index];
+          try {
+            const single = await this.readBatch([frame], 4_000);
+            if (!single.texts || single.truncated) {
+              plog('vision', `GPT vision could not read all text on frame ${frame.frameIndex}`, { truncated: single.truncated }, 'error');
+            }
+            results.push(toResult(frame, single.texts?.[0] || []));
+          } catch (error: any) {
+            const warning = this.limitWarning(error);
+            if (warning) {
+              limitReached = warning;
+              plog('vision', 'GPT Vision token/rate limit reached during single-frame retry; retaining Tesseract OCR', {
+                frameIndex: frame.frameIndex,
+                remainingFrames: Math.max(0, frames.length - offset - index - 1),
+                error: error.message || String(error),
+                warning: warning.message,
+              }, 'warn');
+              results.push(this.emptyResult(frame, warning));
+              results.push(...batch.slice(index + 1).map((remaining) => this.emptyResult(remaining)));
+              break;
+            }
+            plog('vision', `GPT vision single-frame retry failed for frame ${frame.frameIndex}`, { error: error.message || String(error) }, 'warn');
+            results.push(this.emptyResult(frame));
           }
-          results.push(toResult(frame, single.texts?.[0] || []));
         }
       } catch (error: any) {
-        plog('vision', 'GPT vision batch failed', { frames: batch.length, error: error.message || String(error) }, 'warn');
-        results.push(...batch.map((frame) => this.emptyResult(frame)));
+        const warning = this.limitWarning(error);
+        if (warning) {
+          limitReached = warning;
+          plog('vision', 'GPT Vision token/rate limit reached; stopping further Vision batches and retaining Tesseract OCR', {
+            framesInFailedBatch: batch.length,
+            remainingFrames: Math.max(0, frames.length - offset - batch.length),
+            error: error.message || String(error),
+            warning: warning.message,
+          }, 'warn');
+        } else {
+          plog('vision', 'GPT vision batch failed', { frames: batch.length, error: error.message || String(error) }, 'warn');
+        }
+        results.push(...batch.map((frame, index) => this.emptyResult(frame, index === 0 ? warning : undefined)));
       }
     }
     return results;
@@ -163,12 +232,13 @@ export class GptVisionOcrService {
     };
   }
 
-  private static emptyResult(frame: VideoFrame): GptVisionFrameResult {
+  private static emptyResult(frame: VideoFrame, warning?: GptVisionFrameResult['warning']): GptVisionFrameResult {
     return {
       frameIndex: frame.frameIndex,
       timestamp: frame.timestamp,
       texts: [], brands: [], locations: [], prices: [], cta: [],
       description: '', confidence: 0, method: 'gpt-4o-vision',
+      ...(warning ? { warning } : {}),
     };
   }
 }

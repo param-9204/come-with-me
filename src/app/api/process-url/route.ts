@@ -137,6 +137,8 @@ function contentFromStoredPost(post: any): SocialContent {
 
 async function runSynchronousPipeline(origin: string, url: string, socialPostId: string, userId?: string): Promise<{ finalPostId: string; analyzeData: any }> {
   console.log(`[Synchronous Pipeline] Starting process-url for: ${url} (origin: ${origin})`);
+  const pipelineRunId = uuidv4();
+  const pipelineStartedAt = new Date().toISOString();
   try {
     // Update status to scraping
     await supabaseAdmin
@@ -148,7 +150,7 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
     const initRes = await fetch(`${origin}/api/process-url/scrape/initiate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ url, pipelineRunId, pipelineStartedAt }),
     });
     const initData = await initRes.json();
     if (!initRes.ok || !initData.success) {
@@ -164,7 +166,7 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
       pollCount++;
       await new Promise((resolve) => setTimeout(resolve, 2000));
       const statusRes = await fetch(
-        `${origin}/api/process-url/scrape/status?runId=${runId}&actorId=${actorId}`
+        `${origin}/api/process-url/scrape/status?runId=${encodeURIComponent(runId)}&actorId=${encodeURIComponent(actorId)}&pipelineRunId=${encodeURIComponent(pipelineRunId)}&pipelineStartedAt=${encodeURIComponent(pipelineStartedAt)}&url=${encodeURIComponent(url)}`
       );
       const statusData = await statusRes.json();
       if (!statusRes.ok || !statusData.success) {
@@ -194,9 +196,25 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
 
     // 2. Media evidence in-process: one download, key frames, local OCR,
     // vision fallback only for hard frames, platform subtitles or Whisper.
-    const mediaLog = new PipelineLog(String(contentData?.contentId || socialPostId), { route: 'process-url', socialPostId, url });
+    const mediaLog = new PipelineLog(String(contentData?.contentId || socialPostId), {
+      route: 'process-url', socialPostId, url, pipelineRunId, pipelineStartedAt,
+    });
+    mediaLog.setRunInput({
+      platform: contentData.platform,
+      inputUrl: url,
+      socialPostId,
+      entrypoint: 'process-url',
+      contentId: contentData.contentId,
+      contentType: contentData.contentType,
+      caption: contentData.caption,
+      hashtags: contentData.hashtags,
+      mentions: contentData.mentions,
+      taggedAccounts: contentData.taggedUsers,
+      metadata: { videoDuration: contentData.videoDuration, dimensions: contentData.dimensions },
+    });
     const media = await withPipelineLog(mediaLog, () => MediaEvidenceService.collect(contentData, rawApifyDataObj));
     mediaLog.flush();
+    await mediaLog.flushDatabase();
     const whisperTranscript = media.transcriptText;
     const audioUploadObj = media.audioUpload;
     const ocrResultsList = media.ocrFrames;
@@ -215,10 +233,13 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
         transcriptLanguage: media.transcript?.language || null,
         apifyOcrFrames: ocrResultsList,
         gptVisionFrames: gptVisionResultsList,
+        processingWarnings: media.warnings,
         url,
         audioUploadId: audioUploadObj?.id,
         userId: userId || null,
-        socialPostId: socialPostId
+        socialPostId: socialPostId,
+        pipelineRunId,
+        pipelineStartedAt,
       }),
     });
 
@@ -234,6 +255,17 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
     };
   } catch (err: any) {
     console.error(`[Synchronous Pipeline] Error processing: ${url}`, err.message);
+    const failureLog = new PipelineLog(`process-url-failure-${socialPostId}`, {
+      route: 'process-url', socialPostId, url, pipelineRunId, pipelineStartedAt,
+    });
+    failureLog.setRunInput({
+      platform: url.includes('tiktok.com') ? 'tiktok' : 'instagram',
+      inputUrl: url,
+      socialPostId,
+      entrypoint: 'process-url',
+    });
+    failureLog.fail(err, { failedStage: 'process-url' });
+    await failureLog.flushDatabase();
     try {
       await supabaseAdmin
         .from('social_posts')
@@ -483,6 +515,7 @@ export async function POST(request: Request) {
       success: true,
       partial: Boolean(analyzeData?.partial),
       error: analyzeData?.partial ? analyzeData.error : null,
+      warnings: Array.isArray(analyzeData?.warnings) ? analyzeData.warnings : [],
       socialPostId: completedPost.id,
       data: completedPost,
       rawApifyData: analyzeData?.rawApifyData || completedPost.raw_apify_data || null,
