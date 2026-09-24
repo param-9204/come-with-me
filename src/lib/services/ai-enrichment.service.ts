@@ -58,7 +58,7 @@ const PLACE_RULES = `You extract real-world places, and where each one is, from 
 EVIDENCE SOURCES (id prefix)
 C caption · L platform location tag · A tagged / collab / mentioned account with its display name · O on-screen text from OCR (may contain letter errors) · V on-screen text from high-accuracy OCR · S speech transcript · H hashtags · K comments (the creator's own comments are marked) · X image description · B creator bio (context only, never enough on its own).
 Line tags: t= seconds into the video · img=N the Nth image or carousel slide (lines with the same img are on the same slide) · scene = text physically in the filmed scene (shop or street sign, menu, packaging, cup, billboard). On-screen lines without "scene" were added by the creator: titles, stickers, list overlays, pins, subtitles.
-A place can appear in only ONE source. Captions are often silent while the venue name is only on screen, only spoken, only a tagged account, or only the location tag. Read every line before answering.
+A place can appear in only ONE independent venue source. Captions are often silent while the venue name is only on screen, only spoken, or only in the location tag. An account tag alone is not independent venue evidence; use it only to confirm the canonical name of a place established elsewhere. Read every line before answering.
 
 METHOD — work through these steps in order
 1. POST SHAPE. Decide what the post is: one venue (review, visit, vlog), a list or guide (a caption list, list slides, one venue card per scene or slide, a map of areas), an itinerary (days, stops, "first / next / last"), or a mix. Guides with 20–60 places are normal.
@@ -71,7 +71,7 @@ METHOD — work through these steps in order
    - Venue cards: when each slide or scene shows one venue, its name is the large text, sometimes split over two or three lines that must be joined ("THE PRIMO BY" + "MANN & SALWA", "UNDER THE NEEM" + "TREES"). The smaller line under it is that venue's area or street: it goes into neighborhood or address, never a separate place. A handle on a card ("@MANGO") is the venue's name. A slide that shows only an area name, with no venue ("Greenwich Village", "LES"), is an area-guide entry: return it by that name, category CITY.
    - On-screen text: a short creator label shown for one scene or on one slide names the place shown there; text repeated on every frame is the post's title. A "scene" line is a place only when it is the storefront sign of the venue being visited. Street signs, billboards, cup logos, packaging, posters and menus are never places on their own, but they can confirm a place named elsewhere (a cup reading "ANGELINA" supports "Angelina Paris" from the caption).
    - Speech: venues the creator says they are at, visiting or recommending.
-   - Accounts: tagged or mentioned venue accounts.
+   - Accounts: a tagged or mentioned account is supporting metadata, not a place by itself. Return it as a place only when another source independently shows or recommends the venue: a caption recommendation, location pin, venue label, speech, list item, or address. Credits, collaborators, friends, photographers, creators, brands and bare tags are not places.
    - Other people's comments: places they suggest ("you left out @x", "try Y") are mentioned_only, because the creator did not choose them.
 4. FIELDS. Split each candidate's text into fields:
    - name: the venue's own name only, as written. Remove words that are not part of the name: cuisine or type tags ("Hangawi-korean" → "Hangawi", "Uptown thai- Thai" → "Uptown thai"), notes and rules ("Indian accent - children under 10 not allowed" → "Indian accent", "NY dosas - food cart" → "NY dosas"), prices, hours, ratings, numbering, emoji, pins and "@". Keep words that belong to the name ("Tamarind Tribeca", "Joe's Pizza", "Franchia Vegan"). Put the removed descriptive words in "description".
@@ -998,29 +998,10 @@ function generateFallbackCandidates(content: SocialContent, bundle: EvidenceBund
     }
   }
 
-  if (Array.isArray(content.taggedUsers)) {
-    for (const user of content.taggedUsers) {
-      if (!user) continue;
-      const displayName = (user.full_name || user.username || '').replace(/^@/, '').trim();
-      if (displayName && displayName.length >= 3 && !GENERIC_NAMES.has(displayName.toLowerCase()) && !addedNames.has(displayName.toLowerCase())) {
-        candidates.push({
-          name: displayName,
-          mention_type: user.full_name ? 'explicit' : 'handle',
-          role: 'featured',
-          name_evidence: ['A1'],
-          location_evidence: [],
-          city: LocationService.detectCityFromText(content.caption || '') || '',
-          neighborhood: '',
-          address: '',
-          base_category: 'RESTAURANTS',
-          category: 'RESTAURANTS',
-          description: 'Tagged venue account',
-          search_query: '',
-        });
-        addedNames.add(displayName.toLowerCase());
-      }
-    }
-  }
+  // Tags identify accounts, not places.  In the no-model fallback we have no
+  // independent judgement that a tag is a venue, so never manufacture a place
+  // candidate from it.  Captions, pins, OCR venue labels, and addresses below
+  // can still create a candidate when they provide venue evidence.
 
   for (const item of bundle.items) {
     if (/^📍/u.test(item.text)) {
@@ -1061,6 +1042,13 @@ const VISUAL_GUIDE_RE = /\b(?:dining|restaurants?|caf(?:e|é)s?|coffee|bars?|foo
  * DINING" or "Cafe Lumière" is not mistaken for the cover.
  */
 const GUIDE_COVER_RE = /\b(?:guides?|spots|places|itinerary|restaurants|caf(?:e|é)s|bars|things to do|where to|top\s*\d+|must[- ]visit)\b/i;
+/**
+ * Generic food words occur in ordinary reviews ("a bakery and cafe"), so they
+ * do not establish a multi-place guide on their own. A guide needs explicit
+ * list/collection language, or several deliberately labelled entries.
+ */
+const GUIDE_INTENT_RE = /\b(?:guide|itinerary|(?:top\s*\d+)|must[-\s]?visit|where\s+to\s+(?:eat|drink|go|visit|stay)|(?:best|favorite|favourite|hidden)\s+(?:restaurants?|caf(?:e|é)s?|coffee\s+shops?|bars?|spots?|places?)|(?:dining|food|restaurants?|caf(?:e|é)s?|coffee|bars?)\s+(?:spots?|places|guide))\b/i;
+const STRUCTURED_VISUAL_ENTRY_RE = /^\s*(?:📍|[•·●▪◦\-–*]|\d{1,2}[.)])\s*\S/u;
 
 function visualTextKey(text: string): string {
   return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
@@ -1104,7 +1092,7 @@ function guideCategory(text: string): BaseCategory | null {
  * to rediscover text that Vision has already transcribed. It is deliberately
  * limited to guides whose visible title establishes the place category.
  */
-function generateVisualGuideCandidates(
+export function generateVisualGuideCandidates(
   content: SocialContent,
   media: MediaEvidenceInput,
   bundle: EvidenceBundle
@@ -1114,7 +1102,17 @@ function generateVisualGuideCandidates(
 
   const allText = [content.caption || '', ...frames.flatMap((frame) => frame.texts || [])].join('\n');
   const baseCategory = guideCategory(allText);
-  if (!baseCategory || !VISUAL_GUIDE_RE.test(allText)) return [];
+  const explicitGuideIntent = GUIDE_INTENT_RE.test(allText);
+  const structuredEntries = new Set(
+    frames.flatMap((frame) => (frame.texts || [])
+      .filter((line) => STRUCTURED_VISUAL_ENTRY_RE.test(line))
+      .map((line) => visualTextKey(cardName(line))))
+      .filter(Boolean)
+  ).size;
+  // A normal review can have many OCR fragments, menu words and signs. Do not
+  // reinterpret those fragments as venue cards unless the post is explicitly
+  // framed as a guide or it contains at least three deliberate list/pin labels.
+  if (!baseCategory || !VISUAL_GUIDE_RE.test(allText) || (!explicitGuideIntent && structuredEntries < MIN_VISUAL_CARDS)) return [];
 
   const appearances = new Map<string, Set<number>>();
   for (const frame of frames) {
@@ -1315,15 +1313,25 @@ export class AiEnrichmentService {
         // is merged by entity; generated data is never trusted without the same
         // checks. Scene text (a billboard address, a street sign) does not count.
         const creatorItems = bundle.items.filter((item) => !item.scene);
-        const sourceAddressCount = distinctSourceAddressCount(creatorItems.map((item) => item.text));
+        // Only creator-authored caption/comment text and explicit pins can
+        // establish that a post contains several addresses. Raw OCR fragments
+        // from a normal reel must not trigger a second extraction pass.
+        const trustedLocationItems = creatorItems.filter((item) =>
+          item.source === 'caption' ||
+          item.source === 'comment_creator' ||
+          ((item.source === 'ocr' || item.source === 'vision_ocr') && /^📍/u.test(item.text))
+        );
+        const sourceAddressCount = distinctSourceAddressCount(trustedLocationItems.map((item) => item.text));
         // Every 📍-marked line (any pin style, normalised) is a location the creator pointed at.
         const markedLocations = creatorItems.filter((item) => /^📍/u.test(item.text)).length;
         const listEntries = countListEntries([
           bundle.items.filter((item) => item.source === 'caption').map((item) => item.text).join('\n'),
           ...bundle.items.filter((item) => item.source === 'comment_creator').map((item) => item.text),
         ]);
-        // Venue cards / area slides: one creator label per slide or scene.
-        const screenCards = countScreenCards(media.visionFrames || []);
+        // Only cards accepted by the structured-guide gate count toward
+        // recovery. Counting every OCR line creates a feedback loop on normal
+        // reels and turns descriptions such as "iced" or "good" into places.
+        const screenCards = visualGuideCandidates.length;
         const expected = Math.max(sourceAddressCount, markedLocations, screenCards);
         const listShortfall = listEntries * LIST_RECOVERY_RATIO > outcome.places.length;
         if (truncated || expected > outcome.places.length || listShortfall) {

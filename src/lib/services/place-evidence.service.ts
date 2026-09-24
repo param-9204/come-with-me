@@ -886,21 +886,23 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
   const visualFrameCount = new Set(bundle.items.filter(isScreenText).flatMap((item) => item.frames || [])).size;
 
   for (const place of places) {
-    const name = (place.name || '').trim();
+    let name = (place.name || '').trim();
     const reject = (reason: string) => rejected.push({ name: name || place.search_query || '(unnamed)', reason });
 
-    let role = place.candidateRole || place.role;
-    if (role === 'mentioned_only' && name) {
-      // The creator tagged this account on the post: it is part of the guide,
-      // not a passing reference, whatever the model's reading of the caption.
-      const tagged = findNameSupport(name, bundle).some((item) =>
-        item.source === 'account' && (item.relation === 'tagged' || item.relation === 'coauthor'));
-      if (tagged) {
-        plog('candidates', `"${name}" is tagged by the creator; kept as recommended (model said mentioned_only)`);
-        role = 'recommended';
-        place.role = 'recommended';
-      }
+    // A handle is an account identifier, whereas the account display name is
+    // the human-facing venue name.  Canonicalise only when they refer to the
+    // same account supplied by the platform; this is not a guessed rename.
+    const matchingAccount = bundle.items.find((item) =>
+      item.source === 'account' &&
+      compact(item.username || '') === compact(name) &&
+      !!item.displayName?.trim()
+    );
+    if (matchingAccount?.displayName) {
+      name = matchingAccount.displayName.trim();
+      place.name = name;
     }
+
+    let role = place.candidateRole || place.role;
     let support: EvidenceItem[];
     let canPromoteRole = false;
     if (place.mention_type === 'indirect' && !name) {
@@ -931,6 +933,12 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
       support = findNameSupport(name, bundle);
       if (support.length === 0) { reject('name not found in evidence'); continue; }
       if (support.every((item) => item.source === 'creator_bio')) { reject('only in creator bio'); continue; }
+      // Tags and mentions identify an account, not necessarily a place in this
+      // post. They may help resolve a name that is independently shown or
+      // recommended, but must never be the sole reason a place is persisted.
+      if (support.every((item) => item.source === 'account' || item.source === 'hashtags')) {
+        reject('account-only evidence; no independent venue signal'); continue;
+      }
       const repeatedFrames = new Set(support.filter(isScreenText).flatMap((item) => item.frames || [])).size;
       if (visualGuideHeading && support.every(isScreenText) && repeatedFrames >= Math.max(3, Math.ceil(visualFrameCount * 0.6))) {
         reject('repeated visual guide title or watermark'); continue;
@@ -1136,11 +1144,12 @@ export function googleTypeConflict(
   types: string[] | null | undefined
 ): BaseCategory | null {
   if (!extracted || extracted === 'HIDDEN GEMS') return null;
-  const mapped = [primaryType, ...(types || [])].map(categoryFromGoogleType).filter((value): value is BaseCategory => !!value);
-  const primary = categoryFromGoogleType(primaryType) || mapped[0];
+  // Secondary provider types are frequently broad labels such as "store".
+  // They must not override a specific source-backed food/drink classification.
+  const primary = categoryFromGoogleType(primaryType);
   if (!primary) return null;
   const family = CATEGORY_FAMILY[extracted as BaseCategory];
-  if (mapped.some((category) => CATEGORY_FAMILY[category] === family)) return null;
+  if (CATEGORY_FAMILY[primary] === family) return null;
   // Streets, squares and urban landmarks carry all kinds of Google types.
   if (family === 'city') return null;
   return primary;
@@ -1158,8 +1167,7 @@ export function reconcileCategoryWithGoogle(
   types: string[] | null | undefined
 ): PlaceCategory {
   if (category === 'HIDDEN GEMS') return category;
-  const mapped = [primaryType, ...(types || [])].map(categoryFromGoogleType).filter((value): value is BaseCategory => !!value);
-  if (mapped.length === 0 || mapped.includes(category as BaseCategory)) return category;
-  const primary = categoryFromGoogleType(primaryType) || mapped[0];
+  const primary = categoryFromGoogleType(primaryType);
+  if (!primary || primary === category) return category;
   return VENUE_CATEGORIES.has(primary) ? primary : category;
 }

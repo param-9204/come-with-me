@@ -18,6 +18,8 @@ export type GeocodeResult = {
   ambiguous?: boolean;
   /** Which geocoder verified the result. */
   provider?: 'google' | 'mapbox';
+  /** How strongly the provider result identifies the extracted venue. */
+  identity?: 'exact_name' | 'source_address' | 'fuzzy';
 };
 
 /**
@@ -31,6 +33,11 @@ const NAME_DESCRIPTORS = new Set([
   'bakery', 'bakehouse', 'kitchen', 'grill', 'pizzeria', 'pizza', 'deli', 'delicatessen', 'bistro', 'brasserie',
   'trattoria', 'taqueria', 'eatery', 'diner', 'shop', 'store', 'boutique', 'market', 'hotel', 'hostel', 'resort',
   'inn', 'museum', 'gallery', 'park', 'beach', 'club', 'lounge', 'rooftop', 'house', 'bbq', 'patisserie', 'tea',
+  // Providers commonly append a venue type to an otherwise exact venue name
+  // (for example, "Name - Cocktail Bar"). These identify the same venue, but
+  // only in the existing exact-token containment check; they never make two
+  // unrelated names match.
+  'cocktail', 'wine', 'beer', 'spirits', 'taproom', 'tavern', 'gastropub',
   'room', 'studio', 'official', 'nyc', 'ny', 'la', 'sf', 'phl', 'philly', 'usa', 'uk', 'llc', 'inc',
   // Venue listings frequently add these legal/brand descriptors while captions
   // omit them: "Casa Carmen Winery" vs "Casa Carmen Farm and Winery".
@@ -509,13 +516,13 @@ export class LocationService {
       this.cityMatches(cityInfo.name, [this.googlePlaceCity(place) || ''], place.formattedAddress || '') &&
       this.addressesMatch(address, [place.formattedAddress || ''])
     );
-    if (match) return { ...this.resultFromPlace(match, cityInfo.name), placeId: null, primaryType: null, types: [], matchedName: null };
+    if (match) return { ...this.resultFromPlace(match, cityInfo.name), placeId: null, primaryType: null, types: [], matchedName: null, identity: 'source_address' };
     const addressResults = await this.geocodeAddress(addressQuery, apiKey);
     const addressMatch = addressResults.find((result) =>
       this.cityMatches(cityInfo.name, [], result.formatted_address || '') &&
       this.addressesMatch(address, [result.formatted_address || ''])
     );
-    return addressMatch ? this.geocodeResultFromAddress(addressMatch, cityInfo.name) : null;
+    return addressMatch ? { ...this.geocodeResultFromAddress(addressMatch, cityInfo.name), identity: 'source_address' } : null;
   }
 
   private static geocodeResultFromAddress(result: GoogleGeocodeResult, fallbackCity: string): GeocodeResult {
@@ -668,7 +675,14 @@ export class LocationService {
         neighborhoodMatches &&
         this.addressesMatch(cleanAddress, [resultAddress, resultName]) &&
         this.cityMatches(cityInfo.name, [this.googlePlaceCity(place) || ''], resultAddress);
-      return { place, rank, similarity: addressIdentity ? Math.max(similarity, 0.9) : similarity, valid };
+      return {
+        place,
+        rank,
+        similarity: addressIdentity ? Math.max(similarity, 0.9) : similarity,
+        valid,
+        exactName: cleanName ? this.namesExactlyMatch(cleanName, resultName) : false,
+        addressIdentity,
+      };
     });
     // Best name similarity wins; the provider's own ranking breaks ties.
     const matches = scored.filter((entry) => entry.valid).sort((a, b) => b.similarity - a.similarity || a.rank - b.rank);
@@ -698,6 +712,7 @@ export class LocationService {
     if (matches.length === 0) return null;
     const best = matches[0];
     const result = this.resultFromPlace(best.place, cityInfo.name);
+    result.identity = best.exactName ? 'exact_name' : best.addressIdentity ? 'source_address' : 'fuzzy';
     // Chains: several near-identical names in the same city with nothing
     // (address/neighbourhood) to choose between them. Listings within
     // ~300 m are the same venue (box office, entrance), not branches.
@@ -849,6 +864,7 @@ export class LocationService {
             types: [],
             matchedName: null,
             provider: 'mapbox',
+            identity: 'source_address',
           };
           plog('geocode', 'Verified by street address on Mapbox (venue not listed)', { place: cleanName, address: result.formattedAddress, lat: result.lat, lng: result.lng });
           return result;

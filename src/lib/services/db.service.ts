@@ -243,8 +243,13 @@ export class DbService {
       );
       // A fuzzy name match of a different kind of venue is the wrong entity
       // (e.g. poster text "La Dolce Vita" → a shoe store called "Dolce Vita").
-      const exactName = !!coords.matchedName && LocationService.nameSimilarity(placeData.name, coords.matchedName) === 1;
-      const conflict = coords.lat !== null && !exactName
+      // A verified source address identifies the same physical venue even when
+      // a creator uses a descriptive name and the provider uses its canonical
+      // name. Category disagreement must only reject a fuzzy identity match;
+      // otherwise it discards valid coordinates after the geocoder succeeded.
+      const strongIdentity = coords.identity === 'exact_name' || coords.identity === 'source_address'
+        || (!!coords.matchedName && LocationService.nameSimilarity(placeData.name, coords.matchedName) === 1);
+      const conflict = coords.lat !== null && !strongIdentity
         ? googleTypeConflict(placeData.base_category || (placeData.category as PlaceCategory), coords.primaryType, coords.types)
         : null;
       if (conflict) {
