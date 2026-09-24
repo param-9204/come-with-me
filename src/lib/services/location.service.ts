@@ -565,7 +565,8 @@ export class LocationService {
       .replace(/[^a-z]/gi, ' ')
       .trim()
       .toLowerCase();
-    const rejectedStreetWords = /\b(?:we|courses?|eats?|ways?|things?|restaurants?|cafes?|bars?|spots?|places?|best|top|favorite|must)\b/i;
+    // Prose around a number ("children under 10 not allowed") is not a street.
+    const rejectedStreetWords = /\b(?:we|courses?|eats?|ways?|things?|restaurants?|cafes?|bars?|spots?|places?|best|top|favorite|must|not|under|allowed|kids|children|people|minutes?|mins?|hours?|years?)\b/i;
     if ((!streetPart && !hasNumberedStreetName) || rejectedStreetWords.test(streetPart)) return '';
     return address;
   }
@@ -719,35 +720,89 @@ export class LocationService {
     return result;
   }
 
-  private static async geocodeWithGoogle(lookup: PreparedLookup, apiKey: string): Promise<GeocodeResult | null> {
-    const { cleanName, cleanAddress, cleanNeighborhood, cityInfo, query } = lookup;
+  /**
+   * Google Places for every lookup variant, in order, until one verifies.
+   * Before a looser variant (no neighbourhood) spends another request, the
+   * results already fetched are checked against it: the venue is often in them
+   * and was only rejected for a neighbourhood that came from the post's
+   * context. Returns null when Google found nothing verified or failed
+   * (quota, rate limit, network), so the caller can fall back to Mapbox.
+   */
+  private static async geocodeWithGoogle(lookups: PreparedLookup[], apiKey: string): Promise<GeocodeResult | null> {
+    const [first] = lookups;
+    let current = first;
     try {
       // City-only lookup (cities table): only an area-typed result counts as
       // the city centre, never an arbitrary venue in that city.
-      if (!cleanName && !cleanAddress && cityInfo.name) return await this.lookupCity(cityInfo, apiKey);
+      if (!first.cleanName && !first.cleanAddress && first.cityInfo.name) return await this.lookupCity(first.cityInfo, apiKey);
 
-      const places = await this.textSearch(query, apiKey, cityInfo.country);
-      const verified = this.verifyCandidates(places.map((place) => ({ ...place, provider: 'google' as const })), lookup, 'Google Maps');
-      if (verified) return verified;
+      let fetched: ProviderPlace[] | null = null;
+      for (const lookup of lookups) {
+        current = lookup;
+        if (fetched) {
+          plog('geocode', `Retrying "${lookup.cleanName}" on Google without the neighbourhood "${first.cleanNeighborhood}"`, undefined, 'warn');
+          const reused = this.verifyCandidates(fetched, lookup, 'Google Maps (same results)');
+          if (reused) return reused;
+        }
+        const places = await this.textSearch(lookup.query, apiKey, lookup.cityInfo.country);
+        fetched = places.map((place) => ({ ...place, provider: 'google' as const }));
+        const verified = this.verifyCandidates(fetched, lookup, 'Google Maps');
+        if (verified) return verified;
 
-      // A source-provided street address still resolves when a small venue is
-      // absent from the Places database.
-      if (cleanAddress && cityInfo.name) {
-        const result = await this.lookupAddress(cleanAddress, cleanNeighborhood, cityInfo, apiKey);
-        if (result) {
-          plog('geocode', 'Verified by street address on Google (venue not listed)', { place: cleanName, address: result.formattedAddress, lat: result.lat, lng: result.lng });
-          return result;
+        // A source-provided street address still resolves when a small venue is
+        // absent from the Places database.
+        if (lookup.cleanAddress && lookup.cityInfo.name) {
+          const result = await this.lookupAddress(lookup.cleanAddress, lookup.cleanNeighborhood, lookup.cityInfo, apiKey);
+          if (result) {
+            plog('geocode', 'Verified by street address on Google (venue not listed)', { place: lookup.cleanName, address: result.formattedAddress, lat: result.lat, lng: result.lng });
+            return result;
+          }
         }
       }
     } catch (error) {
       // Quota errors are already reported once; avoid a stack trace per place.
-      if ((error as any)?.status === 429) plog('geocode', `Google skipped "${query}" (quota)`, { error: (error as Error).message }, 'warn');
-      else plog('geocode', `Google lookup failed for "${query}"`, { error: (error as Error)?.message || String(error) }, 'error');
+      if ((error as { status?: number } | null)?.status === 429) plog('geocode', `Google skipped "${current.query}" (quota)`, { error: (error as Error).message }, 'warn');
+      else plog('geocode', `Google lookup failed for "${current.query}"`, { error: (error as Error)?.message || String(error) }, 'error');
     }
     return null;
   }
 
-  private static async geocodeWithMapbox(lookup: PreparedLookup): Promise<GeocodeResult | null> {
+  /**
+   * Mapbox for every lookup variant, in order, until one verifies. Identical
+   * searches are sent once per call: the name-only query is the same with or
+   * without a neighbourhood, so the looser variant re-checks those results.
+   */
+  private static async geocodeWithMapbox(lookups: PreparedLookup[]): Promise<GeocodeResult | null> {
+    const searches = new Map<string, Promise<MapboxFeature[]>>();
+    const searchPoi = (text: string, centre: [number, number] | null, country?: string) => {
+      if (!searches.has(text)) {
+        searches.set(text, (async () => {
+          let features = await MapboxService.searchPoi(text, { proximity: centre, country, limit: 10 });
+          if (features.length === 0) {
+            // Observed: identical requests intermittently return no results
+            // during bursts of lookups. One short retry recovers those.
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            features = await MapboxService.searchPoi(text, { proximity: centre, country, limit: 10 });
+            if (features.length > 0) plog('geocode', `Mapbox returned results for "${text}" on retry`, { results: features.length }, 'warn');
+          }
+          return features;
+        })());
+      }
+      return searches.get(text)!;
+    };
+
+    for (const [index, lookup] of lookups.entries()) {
+      if (index > 0) plog('geocode', `Retrying "${lookup.cleanName}" on Mapbox without the neighbourhood "${lookups[0].cleanNeighborhood}"`, undefined, 'warn');
+      const result = await this.geocodeWithMapboxLookup(lookup, searchPoi);
+      if (result?.lat !== null && result?.lat !== undefined) return result;
+    }
+    return null;
+  }
+
+  private static async geocodeWithMapboxLookup(
+    lookup: PreparedLookup,
+    searchPoi: (text: string, centre: [number, number] | null, country?: string) => Promise<MapboxFeature[]>
+  ): Promise<GeocodeResult | null> {
     const { cleanName, cleanAddress, cleanNeighborhood, cityInfo } = lookup;
     try {
       const centre = await this.mapboxCityCentre(cityInfo);
@@ -765,14 +820,7 @@ export class LocationService {
         // Cognac New York" → JFK Airport; "Brasserie Cognac" → both branches).
         const queries = [cleanName, cleanNeighborhood ? `${cleanName} ${cleanNeighborhood}` : ''].filter(Boolean);
         for (const text of queries) {
-          let features = await MapboxService.searchPoi(text, { proximity: centre, country: cityInfo.country, limit: 10 });
-          if (features.length === 0) {
-            // Observed: identical requests intermittently return no results
-            // during bursts of lookups. One short retry recovers those.
-            await new Promise((resolve) => setTimeout(resolve, 500));
-            features = await MapboxService.searchPoi(text, { proximity: centre, country: cityInfo.country, limit: 10 });
-            if (features.length > 0) plog('geocode', `Mapbox returned results for "${text}" on retry`, { results: features.length }, 'warn');
-          }
+          const features = await searchPoi(text, centre, cityInfo.country);
           const verified = this.verifyCandidates(features.map((feature) => this.placeFromMapbox(feature)), { ...lookup, query: text }, 'Mapbox');
           if (verified) return verified;
         }
@@ -813,9 +861,11 @@ export class LocationService {
   }
 
   /**
-   * Resolve a place to verified coordinates. Google Places first (when a key
-   * is configured and the daily quota is not exhausted), then Mapbox (when
-   * Google is unavailable or finds no verified match).
+   * Resolve a place to verified coordinates. Google Places is tried first and
+   * fully: the lookup as given, then without a neighbourhood that may have
+   * come from the post's context ("Day 3 - Dumbo" before a pizzeria elsewhere).
+   * Mapbox is called only when Google is not configured, is over its daily
+   * quota, fails, or finds no verified match.
    */
   static async geocodePlace(name: string, city: string, address?: string, neighborhood?: string): Promise<GeocodeResult> {
     const startedAt = new Date();
@@ -841,12 +891,21 @@ export class LocationService {
     };
     const lookup = this.prepareLookup(name, city, address, neighborhood);
     if (!lookup) return finish(this.emptyResult(), 'skipped');
+    // The same lookup without the neighbourhood; the city constraint still applies.
+    const lookups = [lookup];
+    if (lookup.cleanNeighborhood && lookup.cityInfo.name) {
+      lookups.push({
+        ...lookup,
+        cleanNeighborhood: '',
+        query: [lookup.cleanName, lookup.cleanAddress, lookup.cityInfo.name].filter(Boolean).join(', ').slice(0, 256),
+      });
+    }
     const tried: string[] = [];
 
     const apiKey = this.apiKey();
     if (apiKey && !this.placesQuotaExhausted()) {
       tried.push('Google');
-      const result = await this.geocodeWithGoogle(lookup, apiKey);
+      const result = await this.geocodeWithGoogle(lookups, apiKey);
       if (result?.lat !== null && result?.lat !== undefined) return finish(result);
       if (result && lookup.cleanName && !lookup.cityInfo.name && !lookup.cleanAddress) return finish(result, 'partial'); // name-only ambiguity is final
     } else if (apiKey) {
@@ -855,16 +914,8 @@ export class LocationService {
 
     if (MapboxService.isConfigured()) {
       tried.push('Mapbox');
-      const result = await this.geocodeWithMapbox(lookup);
+      const result = await this.geocodeWithMapbox(lookups);
       if (result?.lat !== null && result?.lat !== undefined) return finish(result);
-    }
-
-    // The neighbourhood can come from the post's context rather than the place
-    // itself (a "Day 3 - Dumbo" itinerary ending at a pizzeria elsewhere).
-    // Retry once without it; the city constraint still applies.
-    if (lookup.cleanNeighborhood && lookup.cityInfo.name) {
-      plog('geocode', `Retrying "${lookup.cleanName}" without the neighbourhood "${lookup.cleanNeighborhood}"`, undefined, 'warn');
-      return finish(await this.geocodePlace(name, city, address, ''), 'partial');
     }
 
     plog('geocode', `No verified result for "${lookup.query}"`, { tried: tried.length ? tried : ['none configured'] }, 'warn');

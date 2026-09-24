@@ -2,11 +2,11 @@ import { executeAICall, supportsTemperature } from './ai-client';
 import { LocationService } from './location.service';
 import { plog } from './pipeline-log';
 import {
-  BASE_CATEGORIES, GENERIC_NAMES, buildEvidence, formatEvidenceForPrompt, mergeSameEntities, resolveHiddenGem,
+  BASE_CATEGORIES, GENERIC_NAMES, buildEvidence, formatEvidenceForPrompt, mergeSameEntities, normalizeForMatch, resolveHiddenGem,
   sanitizeCandidateLocation, scoreAndFilterCandidates,
   type BaseCategory, type EvidenceBundle, type MediaEvidenceInput, type RawPlaceCandidate,
 } from './place-evidence.service';
-import type { SocialContent, AiAnalysisResult, PlaceExtraction, PlaceCategory } from '../types/social';
+import type { SocialContent, AiAnalysisResult, GptVisionFrameResult, PlaceExtraction, PlaceCategory } from '../types/social';
 
 const PLACE_CATEGORIES = [
   'RESTAURANTS', 'COFFEE', 'TRAVEL', 'ADVENTURE', 'NATURE', 'CITY',
@@ -17,14 +17,30 @@ const MENTION_TYPES = ['explicit', 'handle', 'indirect'] as const;
 const ROLES = ['featured', 'recommended', 'mentioned_only', 'background'] as const;
 
 /**
- * Keep the requested completion below the 20k TPM tier once the evidence
- * prompt is included. A larger reservation is rejected before the model can
- * return any data (for example, 8k prompt + 16k completion = 24k TPM).
- * Ten thousand tokens remains ample for a structured place list; a truncated
- * result uses the existing grounded recovery pass.
+ * Completion budget per extraction call. A 48-place guide used about 3,500
+ * output tokens, so 16,000 leaves room for roughly 200 places; a truncated
+ * result still triggers the grounded recovery pass. The requested budget
+ * counts against the account's tokens-per-minute limit (gpt-4o-mini: 200k
+ * per minute on this account as of 2026-09-24).
  */
-const MAX_OUTPUT_TOKENS = 20_000;
-const RECOVERY_OUTPUT_TOKENS = 20_000;
+const MAX_OUTPUT_TOKENS = 16_000;
+const RECOVERY_OUTPUT_TOKENS = 16_000;
+
+/**
+ * Output caps OpenAI enforces per model. A larger request is not trimmed: it
+ * fails with HTTP 400 and every extraction falls back to "AI analysis is
+ * temporarily unavailable". Both caps were confirmed from the API's own error
+ * message on 2026-09-24. Models not listed get the requested budget.
+ */
+const MODEL_OUTPUT_CAPS: Array<[RegExp, number]> = [
+  [/^gpt-4o-mini\b/i, 16_384],
+  [/^gpt-4o\b/i, 16_384],
+];
+
+function outputBudget(model: string, requested: number): number {
+  const cap = MODEL_OUTPUT_CAPS.find(([pattern]) => pattern.test(model.replace(/^openai\//, '')))?.[1];
+  return cap ? Math.min(requested, cap) : requested;
+}
 
 function analysisFallbackWarning(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
@@ -37,48 +53,75 @@ function analysisFallbackWarning(error: unknown): string {
 // Prompt
 // ──────────────────────────────────────────────────────────────────────
 
-const PLACE_RULES = `You extract real-world places from ONE Instagram/TikTok post. Use ONLY the numbered EVIDENCE lines — never your own knowledge of places, cities, or addresses.
+const PLACE_RULES = `You extract real-world places, and where each one is, from ONE Instagram/TikTok post. Use ONLY the numbered EVIDENCE lines — never your own knowledge of places, cities, or addresses.
 
 EVIDENCE SOURCES (id prefix)
-C caption · L platform location tag · A tagged / collab / mentioned account with its display name · O on-screen text from OCR (may contain letter errors; t = seconds) · V on-screen text from high-accuracy OCR · S speech transcript (seconds) · H hashtags · K comments (creator's own comments are marked) · X image description · B creator bio (context only, never enough on its own).
-The place can appear in only ONE source. Captions are often silent while the venue name is only on screen, only spoken, only a tagged account, or only the location tag. Read every line before answering.
+C caption · L platform location tag · A tagged / collab / mentioned account with its display name · O on-screen text from OCR (may contain letter errors) · V on-screen text from high-accuracy OCR · S speech transcript · H hashtags · K comments (the creator's own comments are marked) · X image description · B creator bio (context only, never enough on its own).
+Line tags: t= seconds into the video · img=N the Nth image or carousel slide (lines with the same img are on the same slide) · scene = text physically in the filmed scene (shop or street sign, menu, packaging, cup, billboard). On-screen lines without "scene" were added by the creator: titles, stickers, list overlays, pins, subtitles.
+A place can appear in only ONE source. Captions are often silent while the venue name is only on screen, only spoken, only a tagged account, or only the location tag. Read every line before answering.
+
+METHOD — work through these steps in order
+1. POST SHAPE. Decide what the post is: one venue (review, visit, vlog), a list or guide (a caption list, list slides, one venue card per scene or slide, a map of areas), an itinerary (days, stops, "first / next / last"), or a mix. Guides with 20–60 places are normal.
+2. LOCATION CONTEXT. Collect every city, neighbourhood and area the evidence names, and what each one covers. The most specific source wins:
+   - One place (wins over everything): text on the same line, the same list item, the same slide (same img) or the same moment (t within about 3 seconds). "📍 Weehawken NJ Waterfront" is in Weehawken even when the location tag says New York.
+   - A section: a heading such as "BROOKLYN:", "Day 2 – Williamsburg", "📍 Paris" or "London spots" covers every item below it until the next heading. In a multi-city post each place takes the city of its own section.
+   - The whole post (used only when nothing more specific applies): the location tag, a title ("NYC VEGETARIAN FOOD GUIDE"), a location hashtag (#phillyeats → Philadelphia), or a city said aloud. When one city is named and nothing contradicts it, it applies to every place.
+3. CANDIDATES. Walk the evidence line by line and write down every place:
+   - Caption and creator comments: every item of a list is one candidate, with or without bullets, numbers, emoji or pins. Headings that name a cuisine, category or price ("🥡Asian:", "Pizza :", "Cafe:", "Under $20") are not places; they describe the items below them.
+   - Venue cards: when each slide or scene shows one venue, its name is the large text, sometimes split over two or three lines that must be joined ("THE PRIMO BY" + "MANN & SALWA", "UNDER THE NEEM" + "TREES"). The smaller line under it is that venue's area or street: it goes into neighborhood or address, never a separate place. A handle on a card ("@MANGO") is the venue's name. A slide that shows only an area name, with no venue ("Greenwich Village", "LES"), is an area-guide entry: return it by that name, category CITY.
+   - On-screen text: a short creator label shown for one scene or on one slide names the place shown there; text repeated on every frame is the post's title. A "scene" line is a place only when it is the storefront sign of the venue being visited. Street signs, billboards, cup logos, packaging, posters and menus are never places on their own, but they can confirm a place named elsewhere (a cup reading "ANGELINA" supports "Angelina Paris" from the caption).
+   - Speech: venues the creator says they are at, visiting or recommending.
+   - Accounts: tagged or mentioned venue accounts.
+   - Other people's comments: places they suggest ("you left out @x", "try Y") are mentioned_only, because the creator did not choose them.
+4. FIELDS. Split each candidate's text into fields:
+   - name: the venue's own name only, as written. Remove words that are not part of the name: cuisine or type tags ("Hangawi-korean" → "Hangawi", "Uptown thai- Thai" → "Uptown thai"), notes and rules ("Indian accent - children under 10 not allowed" → "Indian accent", "NY dosas - food cart" → "NY dosas"), prices, hours, ratings, numbering, emoji, pins and "@". Keep words that belong to the name ("Tamarind Tribeca", "Joe's Pizza", "Franchia Vegan"). Put the removed descriptive words in "description".
+   - address: a street address written with the place (same line, list item, slide or moment), copied exactly ("140 N. 2nd", "209 Chestnut St"). A line that is only an address is never a place: attach it to the venue on the same line, slide or moment. A street sign in the scene ("W 23 St") is not an address.
+   - neighborhood and city: from step 2, in this order: the place's own line, then its section, then the whole post. When the place's own line names another town, state or country ("📍 Weehawken NJ Waterfront"), that is its city, even in a post about a different city.
+5. ROLE. featured = shown, visited, reviewed · recommended = suggested but not shown · mentioned_only = comparison, joke, "better than X", passing reference, other people's suggestions · background = visible but not the subject (a logo on a cup, a passing sign, a photo credit). Every entry of the creator's own guide, list or itinerary is featured or recommended, never mentioned_only ("Day 2 - Evening plans @brasseriecognac", "SHOPS: Vowels, PHOS").
+6. CHECK. Count the list items and venue labels you found in step 3 and make sure every one is in "places"; a venue listed twice is returned once. Never stop early, summarise, or trust a stated count ("top 5" with 7 entries → 7).
 
 WHAT IS A PLACE
-A specific, named, physical location someone can visit: restaurant, cafe, bar, club, shop, market, hotel, museum, gallery, park, beach, trail, viewpoint, landmark, street, or a town/island that is itself the destination.
-Not places: people, the creator, DJs/artists, the audio track, brands or products with no specific location (a drink brand, an app), dishes, events without a venue, generic phrases ("this cafe", "the best pizza spot").
+A specific, named, physical location someone can visit: restaurant, cafe, bar, club, shop, market, food cart or truck, hotel, museum, gallery, park, beach, trail, viewpoint, landmark, street, or a town/island that is itself the destination.
+Not places: people, the creator, DJs/artists, the audio track, brands or products with no specific location (a drink brand, an app), dishes, events without a venue, generic phrases ("this cafe", "the best pizza spot"), website addresses and watermarks.
 A city, state, or country that only says WHERE the other places are is location context: put it in those places' "city" field instead of returning it as a place.
-Posts often contain several places (lists, itineraries, guides, "3 spots in…", "bonus stop"); guides with 20–40 places are normal. Return every one separately — never stop early or summarise. Do not trust a stated count; return what the evidence shows. Every 📍 line is a candidate: return it unless it is clearly not a place.
-
-ROLE (return every candidate; the system keeps only featured and recommended)
-featured = shown, visited, reviewed · recommended = suggested but not shown · mentioned_only = comparison, joke, "better than X", passing reference · background = visible but not the subject (a logo on a cup, a passing sign, a photo credit).
-Entries of a guide, itinerary or list ("Day 2 - Evening plans @brasseriecognac", "SHOPS: Vowels, PHOS") are featured or recommended — never mentioned_only.
 
 NAME
-- Copy the venue's display name as written in the evidence. Fix an OCR letter error only when another line confirms the spelling (O3 "CAFE LUMIFRE" + A1 "Café Lumière" → "Café Lumière").
+- Fix an OCR letter error only when another line confirms the spelling (O3 "CAFE LUMIFRE" + A1 "Café Lumière" → "Café Lumière").
 - If an account identifies the venue, prefer its display name from the A line ("Joe's Pizza" for @joespizzanyc). With no display name anywhere, use the handle without @ and set mention_type "handle".
 - Never use a headline, slogan, ranking ("#1"), price, hashtag, or caption sentence as a name.
-- mention_type "indirect": the creator clearly describes ONE specific place without naming it ("the horror bookstore on Frankford Ave"). Set name "" and search_query to words copied from the evidence plus the city ("horror bookstore Frankford Ave Philadelphia"). Otherwise search_query "".
+- mention_type "indirect": the creator clearly describes ONE specific place without naming it ("the horror bookstore on Frankford Ave"). Set name "" and search_query to words copied from the evidence plus the city ("horror bookstore Frankford Ave Philadelphia"). Otherwise search_query "". Anything written with its name — a venue, a park, a neighbourhood such as "LES" — is explicit, never indirect.
 - mention_type "explicit" for every normally named place.
 
 LOCATION
-- city / neighborhood / address only when the evidence states them: a line, the location tag, or a location hashtag (#phillyeats → Philadelphia).
-- One-city post: when the location tag, caption, or hashtags name a single city and nothing contradicts it, that city applies to every place.
-- address: copy the street line exactly ("140 N. 2nd", "209 Chestnut St", "(400 Ranstead)") and pair it with the place in the same line, the same list item, or the same moment. Never invent, complete, or move an address. Sizes, prices, dates, and counts are not addresses.
+- city / neighborhood / address only when the evidence states them: a line, a heading, the location tag, or a location hashtag. Never invent, complete, or move an address. Sizes, prices, dates, and counts are not addresses.
+- "📍" marks a location marker. Creators use many styles (📍 📌 🗺️ pins, map-pin icons, location stickers, "Location:"/"Address:" labels); all are shown as "📍". Everything on one marker belongs to the same place: "📍 Buvette · 42 Grove St · West Village" gives name, address and neighbourhood. A marker holding only an address or area locates the venue shown or named in the same scene or slide.
 - Same moment: on-screen text and speech within about 3 seconds of each other describe the same scene. Use this to pair a name on screen with a city or address spoken aloud, and the reverse.
-- "📍" marks a location marker. Creators use many styles (📍 📌 🗺️ pins, map-pin icons, location stickers, "Location:"/"Address:" labels); all are shown as "📍". Everything on one marker belongs to the same place: "📍 Buvette · 42 Grove St · West Village" gives name, address and neighbourhood. A marker holding only an address or area locates the venue shown or named in the same scene.
-- A short on-screen label that appears only for one scene (often a location marker, e.g. "📍 Buvette" or just "Buvette") names the place shown in that scene, while text repeated on every frame is the post's title.
 - Map and area-guide labels are destinations, not scenery: when a post shows several named neighbourhoods, towns, parks, or areas on a map/list, return each as category CITY with role featured or recommended. This applies even when OCR splits a label across adjacent lines ("Ridge" + "Wood" = "Ridgewood").
-- Text that is physically inside the scene — posters, artwork, menus, plates, product labels, film titles — is role "background", not a venue, unless it is the storefront sign of the place being visited. When the post labels its places with pin stickers or overlays, only those labels are places.
+- When the post labels its places with pin stickers or overlays, only those labels are places; other on-screen text is scenery.
 
 EVIDENCE IDS (required)
-name_evidence: ids of the lines that contain the name or identify the venue. location_evidence: ids supporting city / neighborhood / address. Cite only ids present in EVIDENCE.
+name_evidence: ids of the lines that contain the name or identify the venue. location_evidence: ids supporting city / neighborhood / address, including the heading or title a city came from. Cite only ids present in EVIDENCE.
 
 CATEGORY
-base_category = what the place IS: RESTAURANTS (restaurants, food spots, bakeries, street food) · COFFEE (cafes, coffee, tea) · BARS (bars, pubs, cocktail/wine bars, breweries) · NIGHTLIFE (clubs, live music, late-night venues) · SHOPPING (shops, markets, malls, boutiques) · CULTURE (museums, galleries, theatres, historic or religious sites) · NATURE (parks, beaches, lakes, mountains, gardens, trails) · ADVENTURE (activities: tours, diving, climbing, theme parks, water sports) · TRAVEL (hotels, resorts, stays; towns/islands visited as a trip) · CITY (streets, squares, neighbourhoods, city viewpoints, urban landmarks).
+base_category = what the place IS: RESTAURANTS (restaurants, food spots, bakeries, street food) · COFFEE (cafes, coffee, tea) · BARS (bars, pubs, cocktail/wine bars, breweries) · NIGHTLIFE (clubs, live music, late-night venues) · SHOPPING (shops, markets, malls, boutiques) · CULTURE (museums, galleries, theatres, historic or religious sites) · NATURE (parks, beaches, lakes, mountains, gardens, trails) · ADVENTURE (activities: tours, diving, climbing, theme parks, water sports) · TRAVEL (hotels, resorts, stays; towns/islands visited as a trip) · CITY (streets, squares, neighbourhoods, city viewpoints, urban landmarks). A list heading such as "Pizza" or "Cafe" tells you the category of the items under it.
 category = base_category, or "HIDDEN GEMS" only when the evidence explicitly calls the place a hidden gem, secret, underrated, hole-in-the-wall, or locals-only spot.
 description: at most 12 words taken from the evidence, or "".`;
 
-const ANALYSIS_RULES = `ANALYSIS (compact, from evidence only): {"summary":"<20 words","primary_category":"","topics":[max 3],"keywords":[max 3],"tone":[max 2],"niche":"","is_promotional":false,"is_sponsored":false,"promotion_type":"","call_to_actions":[],"offers":[],"primary_audience":"","audience_interests":[max 2],"geographic_focus":[max 2],"audience_intent":"","audience_confidence":0}. Use ""/[]/false when unsupported.`;
+const ANALYSIS_RULES = `ANALYSIS (compact, from evidence only):
+- summary: factual post summary in at most 20 words. Do not add claims that are absent from EVIDENCE.
+- primary_category: exactly one of RESTAURANTS, COFFEE, BARS, NIGHTLIFE, SHOPPING, CULTURE, NATURE, ADVENTURE, TRAVEL, CITY, HIDDEN GEMS, or "". Prefer the category supported by the featured places; otherwise use "".
+- topics and keywords: at most 3 each; include only meaningful themes/terms explicit in EVIDENCE. Do not include a hashtag merely because it exists.
+- tone: at most 2 labels describing the creator's writing or speaking style, not the atmosphere of a venue. Use [] when unsupported.
+- niche: explicit content niche only, otherwise "".
+- is_sponsored: true only with an explicit paid/sponsored/partner/advertisement disclosure. is_promotional: true only when the post explicitly promotes a brand, product, place, event, or offer. promotion_type: sponsored, affiliate, gifted, self_promotion, event, or "".
+- call_to_actions: at most 3 direct calls to action stated in EVIDENCE (for example, "save this" or "book now"); do not convert ordinary commentary into a CTA.
+- offers: at most 3 explicit prices, discounts, deals, menus, or promotion codes; otherwise [].
+- primary_audience: return only an explicitly stated or strongly post-level indicated intended audience; otherwise "". Do not infer demographics from a venue.
+- audience_interests: at most 2 explicit interests. geographic_focus: at most 2 city/region/country names explicitly stated in EVIDENCE; never infer geography from venue knowledge.
+- audience_intent: exactly one of Inspiration, Planning, Education, Purchase, Entertainment, or "".
+- audience_confidence: number 0 to 1 for the audience fields: 0 when unsupported, 0.5 for indirect post-level evidence, 0.8 for explicit audience wording, 1 only for an unambiguous direct statement.
+Use ""/[]/false/0 when unsupported.`;
+ 
 
 const COMBINED_SYSTEM_PROMPT = `${PLACE_RULES}
 
@@ -164,6 +207,48 @@ function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback
   return allowed.includes(candidate) ? candidate : fallback;
 }
 
+/**
+ * Words that describe a venue rather than name it, as creators append them to list entries
+ */
+const DESCRIPTOR_WORDS = new Set([
+  'american', 'asian', 'chinese', 'szechuan', 'sichuan', 'cantonese', 'hunan', 'korean', 'japanese', 'thai', 'vietnamese',
+  'indian', 'south', 'north', 'gujarati', 'punjabi', 'bengali', 'italian', 'mexican', 'mediterranean', 'ethiopian', 'french',
+  'greek', 'lebanese', 'turkish', 'spanish', 'middle', 'eastern', 'caribbean', 'peruvian', 'brazilian', 'filipino',
+  'vegan', 'vegetarian', 'veg', 'plant', 'based', 'food', 'cart', 'truck', 'street', 'fine', 'dining', 'casual',
+  'cuisine', 'kitchen', 'bakery', 'dessert', 'desserts', 'brunch', 'cafe', 'café', 'coffee', 'tea', 'bar', 'restaurant',
+  'and', '&', 'style', 'fusion', 'only', 'options',
+]);
+/** Visitor notes appended to list entries: "children under 10 not allowed", "cash only", "$$". */
+const NOTE_RE = /\b(?:children|kids|not allowed|allowed|cash only|reservations?|closed|must try|walk[- ]?ins?|per person|open late)\b|^\$+$/i;
+
+function isDescriptorTail(tail: string): boolean {
+  const words = tail.toLowerCase().replace(/[()]/g, ' ').split(/\s+/).filter(Boolean);
+  if (words.length === 0) return false;
+  return words.every((word) => DESCRIPTOR_WORDS.has(word)) || NOTE_RE.test(tail);
+}
+
+/**
+ * Split a trailing cuisine tag or note off a name. Only separators creators use
+ * for annotations count (a dash or hyphen, a bar, a closing parenthesis), and
+ * only when every word after it is descriptive, so "Jean-Georges" and
+ * "Canto - West Village" are left for the model's own fields.
+ */
+export function splitNameDescriptor(name: string): { name: string; note: string } {
+  const patterns = [
+    /^(.*?\p{L}.*?)\s*\(([^()]+)\)\s*$/u,
+    /^(.*?\p{L}.*?)\s*[|]\s*(.+)$/u,
+    /^(.*?\p{L}.*?)\s*[-–—]\s*(.+)$/u,
+  ];
+  for (const pattern of patterns) {
+    const match = name.match(pattern);
+    if (!match) continue;
+    const head = match[1].trim();
+    const tail = match[2].trim();
+    if ((head.match(/\p{L}/gu) || []).length >= 3 && isDescriptorTail(tail)) return { name: head, note: tail };
+  }
+  return { name, note: '' };
+}
+
 export function parseCandidates(raw: string): RawPlaceCandidate[] {
   let parsed: unknown;
   try {
@@ -184,13 +269,17 @@ export function parseCandidates(raw: string): RawPlaceCandidate[] {
       : (BASE_CATEGORIES.includes(category as BaseCategory) ? category as BaseCategory : null);
     if (!base) continue;
     // Trademark signs and emoji come from account display names ("L'industrie Pizzeria ™️").
-    const name = str(value.name)
+    const cleanedName = str(value.name)
       .replace(/^@/, '')
       .replace(/[\u2122\u00AE\u00A9]\uFE0F?/g, '')
       .replace(/[\p{Extended_Pictographic}\uFE0F\u200D]/gu, '')
       .replace(/\s+/g, ' ')
       .trim();
-    if (name.includes('#')) continue;
+    if (cleanedName.includes('#')) continue;
+    // A cuisine tag or visitor note left in the name stops the map lookup from
+    // matching the venue ("Hangawi-korean" vs Google's "Hangawi").
+    const { name, note } = splitNameDescriptor(cleanedName);
+    const description = str(value.description) || note;
     candidates.push({
       name,
       mention_type: oneOf(value.mention_type, MENTION_TYPES, 'explicit'),
@@ -202,7 +291,7 @@ export function parseCandidates(raw: string): RawPlaceCandidate[] {
       address: str(value.address),
       base_category: base,
       category: PLACE_CATEGORIES.includes(category as any) ? category : base,
-      description: str(value.description).split(/\s+/).slice(0, 16).join(' '),
+      description: description.split(/\s+/).slice(0, 16).join(' '),
       search_query: str(value.search_query),
     });
   }
@@ -333,8 +422,28 @@ function isPlausibleStreetAddress(value: string): boolean {
   if (/^\d{1,6}\s+(?:cozy|best|top|great|favorite|popular|new|nice|amazing|restaurants?|cafes?|bars?|places?|spots?|stops?|things?|days?|hours?|minutes?|mins?|people|dollars?|years?)\b/i.test(normalized)) {
     return false;
   }
+  // Without a road suffix, the short social form needs a street-shaped word
+  // after the number: an ordinal ("140 N. 2nd") or a capitalised name ("400
+  // Ranstead"). Prose such as "children under 10 not allowed" would otherwise
+  // become the address "10 not Street".
+  const hasRoadSuffix = /\s(?:St|Street|Ave|Avenue|Blvd|Boulevard|Rd|Road|Dr|Drive|Ln|Lane|Way|Ct|Court|Pl|Place|Pkwy|Parkway)\.?$/i.test(normalized);
+  if (!hasRoadSuffix) {
+    const streetWord = normalized
+      .replace(/^\d{1,6}\s+/, '')
+      .replace(/^(?:[NSEW]\.?|North|South|East|West)\s+/i, '')
+      .split(/\s+/)[0] || '';
+    const ordinal = /^\d+(?:st|nd|rd|th)$/i.test(streetWord);
+    const properName = /^\p{Lu}/u.test(streetWord) && !PROSE_WORDS.has(streetWord.toLowerCase());
+    if (!ordinal && !properName) return false;
+  }
   return true;
 }
+
+/** Words that follow a number in prose, never a street name ("10 not allowed", "5 Under 20"). */
+const PROSE_WORDS = new Set([
+  'not', 'under', 'over', 'to', 'for', 'of', 'and', 'or', 'per', 'at', 'in', 'on', 'with', 'the', 'a', 'an',
+  'kids', 'children', 'allowed', 'only', 'people', 'guests', 'min', 'mins', 'minutes', 'hours', 'years', 'am', 'pm',
+]);
 
 function expandShortStreetAddress(address: string): string {
   let next = normalizeAddressCandidate(address);
@@ -388,7 +497,13 @@ function attachAddressesFromSources(
   const blob = sources.filter(Boolean).join('\n');
   if (!blob || places.length === 0) return places;
 
-  const found = findStreetAddressesInText(blob);
+  // A number that starts a venue's own name ("11 Madison Park", "15 East") is
+  // not a street address to hand to a neighbouring list entry.
+  const nameKeys = places.map((place) => collapseAlnum(place.name || '')).filter(Boolean);
+  const found = findStreetAddressesInText(blob).filter((addr) => {
+    const rawKey = collapseAlnum(blob.slice(addr.index, addr.end));
+    return !nameKeys.some((key) => key.includes(rawKey));
+  });
   if (found.length === 0) return places;
 
   const used = new Set<number>();
@@ -545,7 +660,12 @@ function refineExtractedPlaces(places: PlaceExtraction[], bundle: EvidenceBundle
   const caption = textOf(['caption']).join('\n');
   const speech = textOf(['speech']).join(' ');
   const fallbackSources = [caption, speech].filter(Boolean);
-  const addressSources = [caption, ...textOf(['ocr', 'vision_ocr', 'comment_creator']), speech].filter(Boolean);
+  // Scene text is excluded: a billboard or street sign ("1540 BROADWAY",
+  // "W 23 St") is not the address of the venue named nearby.
+  const creatorScreenText = bundle.items
+    .filter((item) => ['ocr', 'vision_ocr', 'comment_creator'].includes(item.source) && !item.scene)
+    .map((item) => item.text);
+  const addressSources = [caption, ...creatorScreenText, speech].filter(Boolean);
 
   const withNames = places.map((place) => {
     if (!place.name) return place;
@@ -559,6 +679,94 @@ function refineExtractedPlaces(places: PlaceExtraction[], bundle: EvidenceBundle
   const withAddresses = attachAddressesFromSources(withNames, addressSources);
   const inputBlob = bundle.items.map((item) => item.text).join(' ');
   return applySharedGeoContext(withAddresses, inputBlob);
+}
+
+/** Bulleted or numbered list lines are list entries whatever their length. */
+const LIST_BULLET_RE = /^\s*(?:[•·●▪◦\-–*]|\d{1,2}[.)])\s*\S/u;
+
+function letters(value: string): number {
+  return (value.match(/\p{L}/gu) || []).length;
+}
+
+/** A section heading inside a list: "🥡Asian:", "Pizza :", "DAY 2:". */
+function isListHeading(line: string): boolean {
+  return /:\s*$/.test(line) && line.trim().split(/\s+/).length <= 5 && letters(line) >= 2;
+}
+
+/**
+ * A short line that can be one list entry: not a sentence, not hashtags.
+ * Entries often carry a note ("Indian accent - children under 10 not
+ * allowed"), so up to ten words still count.
+ */
+function isShortEntry(line: string): boolean {
+  const trimmed = line.trim();
+  return letters(trimmed) >= 3 &&
+    trimmed.length <= 70 &&
+    trimmed.split(/\s+/).length <= 10 &&
+    !/[.!?]$/.test(trimmed) &&
+    !trimmed.startsWith('#') &&
+    !isListHeading(trimmed);
+}
+
+/**
+ * Lines of the creator's own text that look like entries of a list: bulleted
+ * or numbered lines, plus runs of at least three short lines (headings may sit
+ * between them, as in "🥡Asian:" / "Planta queen" / "Beyond sushi"). Used only
+ * to decide whether a places-only recovery call is worth making.
+ */
+export function countListEntries(texts: string[]): number {
+  let total = 0;
+  for (const text of texts) {
+    let run = 0;
+    const flush = () => {
+      if (run >= 3) total += run;
+      run = 0;
+    };
+    for (const line of text.split(/\r?\n/)) {
+      if (letters(line) < 2) continue; // "." spacer lines neither count nor break a run
+      if (LIST_BULLET_RE.test(line)) { total += 1; continue; }
+      if (isListHeading(line)) continue;
+      if (isShortEntry(line)) run += 1;
+      else flush();
+    }
+    flush();
+  }
+  return total;
+}
+
+/** Recovery runs when fewer than this share of the list entries became places. */
+const LIST_RECOVERY_RATIO = 0.7;
+
+/**
+ * Distinct creator labels shown one per slide or scene (venue cards, area
+ * slides). Title text repeated across frames, guide covers, scene text, web
+ * addresses, street signs and subtitle-length sentences are not labels. Each
+ * card counts once however many frames it stays on screen.
+ */
+export function countScreenCards(frames: GptVisionFrameResult[]): number {
+  if (frames.length < 2) return 0;
+  const seen = new Map<string, Set<number>>();
+  for (const frame of frames) {
+    for (const line of new Set(frame.texts || [])) {
+      const key = visualTextKey(line);
+      if (key) seen.set(key, new Set([...(seen.get(key) || []), frame.frameIndex]));
+    }
+  }
+  const isTitle = (key: string) => {
+    const count = seen.get(key)?.size || 0;
+    return count >= 3 && count >= frames.length * 0.4;
+  };
+  const cards = new Set<string>();
+  for (const frame of frames) {
+    const sceneKeys = new Set((frame.sceneTexts || []).map(visualTextKey));
+    const lines = (frame.texts || []).filter((line) => {
+      const key = visualTextKey(line);
+      return letters(line) >= 3 && !isTitle(key) && isCardLine(line, sceneKeys) && line.trim().split(/\s+/).length <= 6;
+    });
+    if (lines.length === 0 || lines.some((line) => GUIDE_COVER_RE.test(line))) continue;
+    cards.add(visualTextKey(cardName(lines[0])));
+  }
+  return cards.size;
 }
 
 /**
@@ -584,17 +792,45 @@ export interface PlaceExtractionOutcome {
 }
 
 /**
+ * The model sometimes marks a plainly named place as "indirect" (name "",
+ * search_query "LES New York"). When the query, minus the city, is exactly
+ * one evidence line ("LES", "📍 Greenwich Village"), the place is named there:
+ * use that line instead of a Google search that may not resolve it.
+ */
+function nameIndirectFromEvidence(candidate: RawPlaceCandidate, bundle: EvidenceBundle): RawPlaceCandidate {
+  if (candidate.mention_type !== 'indirect' || candidate.name || !candidate.search_query) return candidate;
+  let phrase = candidate.search_query.trim();
+  for (const city of [candidate.city, LocationService.cleanCityName(candidate.city)]) {
+    if (city && phrase.toLowerCase().endsWith(` ${city.toLowerCase()}`)) phrase = phrase.slice(0, -city.length).trim();
+  }
+  const key = normalizeForMatch(phrase);
+  if (!key) return candidate;
+  const line = bundle.items.find((item) =>
+    item.source !== 'account' && normalizeForMatch(item.text.replace(/^📍\s*/u, '')) === key);
+  if (!line) return candidate;
+  plog('candidates', `"${phrase}" is named in ${line.id}; treated as a named place, not an indirect description`);
+  return {
+    ...candidate,
+    name: line.text.replace(/^📍\s*/u, '').trim(),
+    mention_type: 'explicit',
+    name_evidence: [line.id],
+    search_query: '',
+  };
+}
+
+/**
  * Deterministic post-processing of model candidates:
  * ground location fields → refine from source text → verify names against
  * evidence and score → HIDDEN GEMS check → merge duplicates → resolve
  * indirect mentions (Google, single-result only).
  */
 export async function finalizeCandidates(
-  candidates: RawPlaceCandidate[],
+  rawCandidates: RawPlaceCandidate[],
   bundle: EvidenceBundle,
   authorUsername: string,
   options: { resolveIndirect?: boolean } = {}
 ): Promise<PlaceExtractionOutcome> {
+  const candidates = rawCandidates.map((candidate) => nameIndirectFromEvidence(candidate, bundle));
   const asPlaces: PlaceExtraction[] = candidates.map((candidate) => {
     const located = sanitizeCandidateLocation({
       city: LocationService.cleanCityName(candidate.city),
@@ -636,10 +872,26 @@ export async function finalizeCandidates(
     candidateRole: candidateRoles[index],
   }));
 
-  const { places: scored, rejected } = scoreAndFilterCandidates(refined, bundle);
+  const { places: scoredAll, rejected } = scoreAndFilterCandidates(refined, bundle);
+  // A card's address line returned as its own "place" ("331 West 4th Street"
+  // next to Corner Bistro at that address) is the venue's address, not a venue.
+  const addressKeys = new Set(scoredAll.map((place) => collapseAlnum(place.address || '')).filter((key) => key.length >= 5));
+  const scored = scoredAll.filter((place) => {
+    const nameKey = collapseAlnum(place.name || '');
+    if (!place.address && addressKeys.has(nameKey)) {
+      rejected.push({ name: place.name || '', reason: "another place's street address" });
+      return false;
+    }
+    return true;
+  });
   for (const item of rejected) plog('candidates', `Rejected "${item.name}"`, { reason: item.reason });
 
-  const categorized = scored.map((place) => ({ ...place, category: resolveHiddenGem(place, bundle) }));
+  const categorized = scored.map((place) => ({
+    ...place,
+    category: resolveHiddenGem(place, bundle),
+    // An area returned as a place ("Greenwich Village") is not its own neighbourhood.
+    neighborhood: normalizeForMatch(place.neighborhood) === normalizeForMatch(place.name) ? '' : place.neighborhood,
+  }));
   let merged = mergeSameEntities(categorized, bundle);
 
   if (options.resolveIndirect !== false) {
@@ -685,7 +937,9 @@ async function callExtractionModel(
   note?: string
 ): Promise<{ raw: string; truncated: boolean }> {
   const userMessage = note ? `${note}\n\n${formatEvidenceForPrompt(bundle)}` : formatEvidenceForPrompt(bundle);
-  return executeAICall('chat', async ({ client, model, isGroq }, reportUsage) => {
+  // The second look (it carries the CHECK note) may use a stronger model: see OPENAI_RECOVERY_MODEL.
+  return executeAICall(note ? 'chat-recovery' : 'chat', async ({ client, model, isGroq }, reportUsage) => {
+    maxTokens = outputBudget(model, maxTokens);
     const response = await client.chat.completions.create({
       model,
       ...(supportsTemperature(model) ? { temperature: 0 } : {}),
@@ -801,9 +1055,40 @@ function generateFallbackCandidates(content: SocialContent, bundle: EvidenceBund
 }
 
 const VISUAL_GUIDE_RE = /\b(?:dining|restaurants?|caf(?:e|é)s?|coffee|bars?|food|spots?|places|guide|itinerary|top)\b/i;
+/**
+ * A guide's cover or headline slide ("DINING SPOTS", "FOOD GUIDE", "Top 5").
+ * Narrower than VISUAL_GUIDE_RE so a venue card such as "RUNGG PREMIUM
+ * DINING" or "Cafe Lumière" is not mistaken for the cover.
+ */
+const GUIDE_COVER_RE = /\b(?:guides?|spots|places|itinerary|restaurants|caf(?:e|é)s|bars|things to do|where to|top\s*\d+|must[- ]visit)\b/i;
 
 function visualTextKey(text: string): string {
   return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+}
+
+/** Fewest distinct venue cards before on-screen text is treated as a card guide. */
+const MIN_VISUAL_CARDS = 3;
+
+/** Website addresses and watermarks: "thenomadic.com", "www.x.co". */
+const WEB_ADDRESS_RE = /(?:^|\s)(?:www\.|https?:\/\/)|\b[\p{L}\p{N}-]+\.(?:com|net|org|co|io|in|uk|me|app|shop|store|tv)\b/iu;
+/**
+ * A street sign: a numbered street or a compass-prefixed street with no
+ * building number ("W 23 St", "5th Ave", "E Houston St"). Named streets on
+ * their own ("Abbey Road") are left alone; they can be destinations.
+ */
+const STREET_SIGN_RE = /^(?:(?:(?:[NSEW]|north|south|east|west)\.?\s+)?\d{1,3}(?:st|nd|rd|th)?|(?:[NSEW]|north|south|east|west)\.?\s+\p{L}+)\s+(?:st|street|ave|avenue|rd|road|blvd|boulevard|pl|place|dr|drive)\.?$/iu;
+
+/**
+ * Card text that can name a venue: creator overlays only. Scene text (a sign
+ * on a building, a cup logo), web addresses and bare street signs never can.
+ */
+function isCardLine(line: string, sceneKeys: Set<string>): boolean {
+  return !sceneKeys.has(visualTextKey(line)) && !WEB_ADDRESS_RE.test(line) && !STREET_SIGN_RE.test(line.trim());
+}
+
+/** "📍 Buvette · 42 Grove St" → "Buvette": the name part of a pinned card line. */
+function cardName(line: string): string {
+  return line.replace(/^📍\s*/u, '').split(/\s+·\s+/)[0].trim();
 }
 
 function guideCategory(text: string): BaseCategory | null {
@@ -848,15 +1133,18 @@ function generateVisualGuideCandidates(
   const added = new Set<string>();
 
   for (const frame of frames) {
+    const sceneKeys = new Set((frame.sceneTexts || []).map(visualTextKey));
     const lines = [...new Set((frame.texts || []).map((line) => line.trim()).filter(Boolean))]
-      .filter((line) => line.length >= 3 && !repeatedTitleKeys.has(visualTextKey(line)));
+      .filter((line) => line.length >= 3 && !repeatedTitleKeys.has(visualTextKey(line)) && isCardLine(line, sceneKeys));
     // The guide cover contains category/headline text, not a venue card.
-    if (lines.length === 0 || lines.some((line) => VISUAL_GUIDE_RE.test(line))) continue;
+    if (lines.length === 0 || lines.some((line) => GUIDE_COVER_RE.test(line))) continue;
 
-    // Venue cards use the final line for an area. The preceding one or two
-    // lines are the display name (e.g. "THE PRIMO BY" + "MANN & SALWA").
-    const nameLines = lines.length > 1 ? lines.slice(0, -1) : lines;
-    const name = nameLines.join(' ').replace(/\s+/g, ' ').trim();
+    // A pinned card carries the name on the marker ("📍 Buvette · 42 Grove St").
+    // Otherwise venue cards use the final line for an area and the preceding
+    // one or two lines for the display name ("THE PRIMO BY" + "MANN & SALWA").
+    const pinned = lines.find((line) => /^📍/u.test(line));
+    const nameLines = pinned ? [pinned] : lines.length > 1 ? lines.slice(0, -1) : lines;
+    const name = (pinned ? cardName(pinned) : nameLines.join(' ')).replace(/\s+/g, ' ').trim();
     const key = visualTextKey(name.replace(/^@/, ''));
     if (key.length < 3 || added.has(key) || GENERIC_NAMES.has(key)) continue;
 
@@ -884,7 +1172,10 @@ function generateVisualGuideCandidates(
     });
     added.add(key);
   }
-  return candidates;
+  // A card guide shows a series of venue cards. One or two stray lines (a sign
+  // behind the creator, a cup logo) are not a guide; the model call already
+  // covers single labels.
+  return candidates.length >= MIN_VISUAL_CARDS ? candidates : [];
 }
 
 function generateFallbackAnalysis(content: SocialContent, bundle: EvidenceBundle, places: PlaceExtraction[]): Record<string, any> {
@@ -1019,24 +1310,37 @@ export class AiEnrichmentService {
           }
         }
 
-        // Recovery: the list was cut off, or the evidence has more distinct
-        // street-address rows than places returned. A places-only pass is merged
-        // by entity; generated data is never trusted without the same checks.
-        const sourceAddressCount = distinctSourceAddressCount(bundle.items.map((item) => item.text));
+        // Recovery: the list was cut off, or the evidence holds more street
+        // addresses, pins or list entries than places returned. A places-only pass
+        // is merged by entity; generated data is never trusted without the same
+        // checks. Scene text (a billboard address, a street sign) does not count.
+        const creatorItems = bundle.items.filter((item) => !item.scene);
+        const sourceAddressCount = distinctSourceAddressCount(creatorItems.map((item) => item.text));
         // Every 📍-marked line (any pin style, normalised) is a location the creator pointed at.
-        const markedLocations = bundle.items.filter((item) => /^📍/u.test(item.text)).length;
-        const expected = Math.max(sourceAddressCount, markedLocations);
-        if (truncated || expected > outcome.places.length) {
+        const markedLocations = creatorItems.filter((item) => /^📍/u.test(item.text)).length;
+        const listEntries = countListEntries([
+          bundle.items.filter((item) => item.source === 'caption').map((item) => item.text).join('\n'),
+          ...bundle.items.filter((item) => item.source === 'comment_creator').map((item) => item.text),
+        ]);
+        // Venue cards / area slides: one creator label per slide or scene.
+        const screenCards = countScreenCards(media.visionFrames || []);
+        const expected = Math.max(sourceAddressCount, markedLocations, screenCards);
+        const listShortfall = listEntries * LIST_RECOVERY_RATIO > outcome.places.length;
+        if (truncated || expected > outcome.places.length || listShortfall) {
           plog('model', 'Running places-only recovery pass', {
             truncated,
             sourceAddresses: sourceAddressCount,
             markedLocations,
+            listEntries,
+            screenCards,
             placesSoFar: outcome.places.length,
           }, 'warn');
           try {
             const found = outcome.places.map((place) => place.name).filter(Boolean).join(', ');
-            const note = `CHECK: the evidence marks ${markedLocations} location(s) with 📍 and ${sourceAddressCount} street address(es), ` +
-              `but only ${outcome.places.length} place(s) were returned${found ? ` (${found})` : ''}. Return EVERY place, including those already found.`;
+            const note = `CHECK: the evidence marks ${markedLocations} location(s) with 📍, ${sourceAddressCount} street address(es), ` +
+              `${listEntries} list line(s) and ${screenCards} slide/scene label(s), ` +
+              `but only ${outcome.places.length} place(s) were returned${found ? ` (${found})` : ''}. ` +
+              'Follow the METHOD again and return EVERY place, including those already found.';
             const recovery = await callExtractionModel(bundle, false, RECOVERY_OUTPUT_TOKENS, note);
             const recovered = await finalizeCandidates(parseCandidates(recovery.raw), bundle, content.authorUsername);
             outcome = {
