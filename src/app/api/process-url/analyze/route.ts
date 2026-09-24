@@ -240,6 +240,10 @@ async function handleAnalyze(request: Request, log: PipelineLog) {
       // We throw this error because saving the social post is critical
       throw dbErr;
     }
+    // Direct /analyze callers may not have supplied a post ID. The durable
+    // audit flush happens after this handler, so attach the persisted ID now
+    // and every audit child row receives the same social_post_id.
+    log.setRunInput({ socialPostId });
 
     // 6. Link Audio Upload to Social Post
     let linkedAudio = null;

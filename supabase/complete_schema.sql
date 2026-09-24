@@ -247,6 +247,7 @@ CREATE TABLE IF NOT EXISTS public.extraction_runs (
 CREATE TABLE IF NOT EXISTS public.extraction_run_events (
   id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   run_id uuid NOT NULL REFERENCES public.extraction_runs(id) ON DELETE CASCADE,
+  social_post_id uuid REFERENCES public.social_posts(id) ON DELETE SET NULL,
   occurred_at timestamptz NOT NULL DEFAULT now(),
   elapsed_ms integer NOT NULL DEFAULT 0,
   stage text NOT NULL,
@@ -258,6 +259,7 @@ CREATE TABLE IF NOT EXISTS public.extraction_run_events (
 CREATE TABLE IF NOT EXISTS public.extraction_stage_runs (
   id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   run_id uuid NOT NULL REFERENCES public.extraction_runs(id) ON DELETE CASCADE,
+  social_post_id uuid REFERENCES public.social_posts(id) ON DELETE SET NULL,
   stage text NOT NULL,
   operation text NOT NULL,
   status text NOT NULL CHECK (status IN ('success', 'partial', 'failed', 'skipped')),
@@ -287,6 +289,7 @@ CREATE TABLE IF NOT EXISTS public.extraction_stage_runs (
 CREATE TABLE IF NOT EXISTS public.extraction_evidence (
   id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   run_id uuid NOT NULL REFERENCES public.extraction_runs(id) ON DELETE CASCADE,
+  social_post_id uuid REFERENCES public.social_posts(id) ON DELETE SET NULL,
   evidence_id text NOT NULL,
   source_type text NOT NULL,
   text_value text NOT NULL,
@@ -304,6 +307,7 @@ CREATE TABLE IF NOT EXISTS public.extraction_evidence (
 CREATE TABLE IF NOT EXISTS public.extraction_place_candidates (
   id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   run_id uuid NOT NULL REFERENCES public.extraction_runs(id) ON DELETE CASCADE,
+  social_post_id uuid REFERENCES public.social_posts(id) ON DELETE SET NULL,
   candidate_key text NOT NULL,
   place_id uuid REFERENCES public.places(id) ON DELETE SET NULL,
   name text,
@@ -332,10 +336,14 @@ CREATE INDEX IF NOT EXISTS idx_extraction_runs_created_at ON public.extraction_r
 CREATE INDEX IF NOT EXISTS idx_extraction_runs_platform_url ON public.extraction_runs(platform, input_url);
 CREATE INDEX IF NOT EXISTS idx_extraction_runs_social_post ON public.extraction_runs(social_post_id);
 CREATE INDEX IF NOT EXISTS idx_extraction_events_run_time ON public.extraction_run_events(run_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_extraction_events_social_post ON public.extraction_run_events(social_post_id, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_extraction_stages_run_time ON public.extraction_stage_runs(run_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_extraction_stages_social_post ON public.extraction_stage_runs(social_post_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_extraction_stages_failure ON public.extraction_stage_runs(stage, status) WHERE status <> 'success';
 CREATE INDEX IF NOT EXISTS idx_extraction_evidence_run_source ON public.extraction_evidence(run_id, source_type);
+CREATE INDEX IF NOT EXISTS idx_extraction_evidence_social_post ON public.extraction_evidence(social_post_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_extraction_candidates_run_decision ON public.extraction_place_candidates(run_id, decision);
+CREATE INDEX IF NOT EXISTS idx_extraction_candidates_social_post ON public.extraction_place_candidates(social_post_id, created_at);
 
 CREATE OR REPLACE VIEW public.extraction_run_summary AS
 SELECT r.*,

@@ -396,6 +396,10 @@ export class PipelineLog {
     const durationMs = Math.max(0, now.getTime() - this.started.getTime());
     const inferredFailure = this.status === 'running' && this.events.some((event) => event.level === 'error');
     const status = inferredFailure ? 'partial' : this.status;
+    // Keep the post identifier on every audit row. `run_id` remains the
+    // execution-level link; this direct key makes a complete post trace
+    // queryable without joining through extraction_runs first.
+    const socialPostId = this.input.socialPostId || this.context.socialPostId || null;
     const inputSnapshot = safeRecord({
       contentId: this.input.contentId || null,
       contentType: this.input.contentType || null,
@@ -408,7 +412,7 @@ export class PipelineLog {
     const { error: runError } = await supabaseAdmin.from('extraction_runs').upsert({
       id: this.pipelineRunId,
       external_run_id: this.runId,
-      social_post_id: this.input.socialPostId || this.context.socialPostId || null,
+      social_post_id: socialPostId,
       platform: this.input.platform || this.context.platform || null,
       input_url: this.input.inputUrl || this.context.url || null,
       entrypoint: this.input.entrypoint || this.context.route || null,
@@ -425,6 +429,7 @@ export class PipelineLog {
 
     const events = this.events.slice(0, MAX_DB_EVENTS).map((event) => ({
       run_id: this.pipelineRunId,
+      social_post_id: socialPostId,
       occurred_at: event.at,
       elapsed_ms: event.ms,
       stage: event.stage,
@@ -440,6 +445,7 @@ export class PipelineLog {
     if (this.operations.length) {
       const { error } = await supabaseAdmin.from('extraction_stage_runs').insert(this.operations.map((operation) => ({
         run_id: this.pipelineRunId,
+        social_post_id: socialPostId,
         stage: operation.stage,
         operation: operation.operation,
         status: operation.status,
@@ -469,6 +475,7 @@ export class PipelineLog {
     if (this.evidence.length) {
       const rows = [...new Map(this.evidence.map((item) => [item.evidenceId, item])).values()].map((item) => ({
         run_id: this.pipelineRunId,
+        social_post_id: socialPostId,
         evidence_id: item.evidenceId,
         source_type: item.sourceType,
         text_value: item.textValue,
@@ -487,6 +494,7 @@ export class PipelineLog {
     if (this.candidates.size) {
       const rows = [...this.candidates.values()].map((candidate) => ({
         run_id: this.pipelineRunId,
+        social_post_id: socialPostId,
         candidate_key: candidate.candidateKey,
         place_id: candidate.placeId,
         name: candidate.name,
