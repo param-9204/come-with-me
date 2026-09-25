@@ -26,6 +26,115 @@ const ROLES = ['featured', 'recommended', 'mentioned_only', 'background'] as con
 const MAX_OUTPUT_TOKENS = 16_000;
 const RECOVERY_OUTPUT_TOKENS = 16_000;
 
+/** A creator's caption list is an explicit venue signal, unlike a bare tag. */
+const CAPTION_LIST_HANDLE_RE = /^\s*(?:[•·●▪◦\-–*]|\d{1,2}[.)])\s*.*?@([\w.]{3,30})\b/giu;
+const HANDLE_CITY_SUFFIX_RE = /(?:nyc|newyork|usa|uk|london|la|sf|official)$/i;
+const LIST_CORRECTION_ORDINAL_RE = /\b(?:(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+to\s+last|last)\b/i;
+const WRONG_PROFILE_RE = /\b(?:wrong\s+(?:profile|account|tag)|tagged\s+the\s+wrong)\b/i;
+const ORDINAL_FROM_END: Record<string, number> = {
+  first: 1, second: 2, third: 3, fourth: 4, fifth: 5,
+  sixth: 6, seventh: 7, eighth: 8, ninth: 9, tenth: 10,
+};
+
+function compactHandle(value: string): string {
+  return normalizeForMatch(value.replace(/^@/, '')).replace(/\s+/g, '');
+}
+
+function handleBase(value: string): string {
+  return compactHandle(value).replace(HANDLE_CITY_SUFFIX_RE, '');
+}
+
+function handleLikelyMatchesName(handle: string, name: string | null | undefined): boolean {
+  const handleKey = handleBase(handle);
+  const nameKey = handleBase(name || '');
+  if (handleKey.length < 3 || nameKey.length < 3) return false;
+  if (handleKey.includes(nameKey) || nameKey.includes(handleKey)) return true;
+  return LocationService.nameSimilarity(handleKey, nameKey) >= 0.82;
+}
+
+function mapsQueryForHandle(handle: string): string {
+  const raw = handle.replace(/^@/, '').replace(/[._]+/g, ' ').trim();
+  const withCitySpacing = raw.replace(/(nyc|newyork|usa|london)$/i, ' $1').trim();
+  return withCitySpacing || handle;
+}
+
+function categoryForCaptionList(bundle: EvidenceBundle): { base: BaseCategory; category: PlaceCategory } {
+  const text = bundle.items
+    .filter((item) => item.source === 'caption' || item.source === 'comment_creator')
+    .map((item) => item.text)
+    .join(' ')
+    .toLowerCase();
+  if (/\b(?:cafe|cafes|coffee|espresso|latte|tea)\b/.test(text)) return { base: 'COFFEE', category: 'COFFEE' };
+  if (/\b(?:bar|bars|cocktail|wine|pub|brewery)\b/.test(text)) return { base: 'BARS', category: 'BARS' };
+  if (/\b(?:restaurant|restaurants|food|dining|pizza|bakery|brunch)\b/.test(text)) return { base: 'RESTAURANTS', category: 'RESTAURANTS' };
+  return { base: 'CITY', category: 'CITY' };
+}
+
+function recoverExplicitCaptionListHandles(
+  rawCandidates: RawPlaceCandidate[],
+  accepted: PlaceExtraction[],
+  bundle: EvidenceBundle,
+): RawPlaceCandidate[] {
+  const listed: Array<{ handle: string; evidenceId: string }> = [];
+  for (const item of bundle.items) {
+    if (item.source !== 'caption' && item.source !== 'comment_creator') continue;
+    for (const line of item.text.split(/\r?\n/)) {
+      CAPTION_LIST_HANDLE_RE.lastIndex = 0;
+      const match = CAPTION_LIST_HANDLE_RE.exec(line);
+      if (!match?.[1]) continue;
+      const handle = match[1].replace(/\.$/, '').toLowerCase();
+      if (!listed.some((entry) => compactHandle(entry.handle) === compactHandle(handle))) {
+        listed.push({ handle, evidenceId: item.id });
+      }
+    }
+  }
+  if (listed.length === 0) return [];
+
+  const correctedQueries = new Map<number, string>();
+  for (const item of bundle.items.filter((entry) => entry.source === 'comment_creator' || entry.source === 'comment')) {
+    const ordinal = LIST_CORRECTION_ORDINAL_RE.exec(item.text);
+    const replacement = item.text.match(/@([\w.]{3,30})\b/);
+    if (!ordinal || !replacement?.[1] || !WRONG_PROFILE_RE.test(item.text)) continue;
+    const fromEnd = ordinal[1] ? ORDINAL_FROM_END[ordinal[1].toLowerCase()] : 1;
+    const index = listed.length - fromEnd;
+    if (index >= 0) correctedQueries.set(index, replacement[1].replace(/\.$/, ''));
+  }
+
+  const city = LocationService.detectCityFromText(bundle.items.map((item) => item.text).join(' ')) || '';
+  const category = categoryForCaptionList(bundle);
+  const recovered: RawPlaceCandidate[] = [];
+  for (const [index, entry] of listed.entries()) {
+    if (accepted.some((place) => handleLikelyMatchesName(entry.handle, place.name))) continue;
+    const modelCandidate = rawCandidates.find((candidate) => handleLikelyMatchesName(entry.handle, candidate.name));
+    const correctionQuery = correctedQueries.get(index);
+    recovered.push({
+      // This exact caption handle is what validates the candidate. The Maps
+      // query can use a model display name or a narrowly-scoped correction.
+      name: entry.handle,
+      mention_type: 'handle',
+      role: 'recommended',
+      name_evidence: [entry.evidenceId],
+      location_evidence: [],
+      city,
+      neighborhood: '',
+      address: '',
+      base_category: category.base,
+      category: category.category,
+      description: '',
+      search_query: '',
+      map_name: correctionQuery
+        ? mapsQueryForHandle(correctionQuery)
+        : (modelCandidate?.map_name || modelCandidate?.name || mapsQueryForHandle(entry.handle)),
+    });
+  }
+  if (recovered.length) {
+    plog('candidates', 'Recovered explicit caption-list handles omitted or rejected by model', {
+      recovered: recovered.map((candidate) => ({ name: candidate.name, mapName: candidate.map_name, city: candidate.city })),
+    }, 'warn');
+  }
+  return recovered;
+}
+
 /**
  * Output caps OpenAI enforces per model. A larger request is not trimmed: it
  * fails with HTTP 400 and every extraction falls back to "AI analysis is
@@ -128,7 +237,7 @@ const ANALYSIS_RULES = `ANALYSIS (compact, from evidence only):
 - audience_intent: exactly one of Inspiration, Planning, Education, Purchase, Entertainment, or "".
 - audience_confidence: number 0 to 1 for the audience fields: 0 when unsupported, 0.5 for indirect post-level evidence, 0.8 for explicit audience wording, 1 only for an unambiguous direct statement.
 Use ""/[]/false/0 when unsupported.`;
- 
+
 
 const COMBINED_SYSTEM_PROMPT = `${PLACE_RULES}
 
@@ -1297,6 +1406,7 @@ export class AiEnrichmentService {
     let parsed: any = {};
     let outcome: PlaceExtractionOutcome = { places: [], rejected: [] };
     let warning: string | undefined;
+    let modelCandidates: RawPlaceCandidate[] = [];
 
     if (bundle.items.length > 0) {
       try {
@@ -1312,6 +1422,7 @@ export class AiEnrichmentService {
         let candidates: RawPlaceCandidate[] = [];
         try {
           candidates = parseCandidates(raw);
+          modelCandidates = candidates;
         } catch (placeError) {
           plog('model', 'Combined response had no usable places', { error: String(placeError) }, 'warn');
         }
@@ -1401,6 +1512,7 @@ export class AiEnrichmentService {
             plog('model', 'Recovery pass failed', { error: recoveryError.message || String(recoveryError) }, 'warn');
           }
         }
+
       } catch (error) {
         warning = analysisFallbackWarning(error);
         plog('model', 'All AI extraction providers failed; fulfilling request using metadata & evidence fallback', {
@@ -1413,6 +1525,23 @@ export class AiEnrichmentService {
       }
     } else {
       plog('model', 'No evidence available; skipping the model call', undefined, 'warn');
+    }
+
+    // Do not let a model omission turn a deliberately listed venue into a
+    // lost place. It also runs after a model failure, because the caption
+    // itself remains valid source evidence.
+    const explicitHandleCandidates = recoverExplicitCaptionListHandles(modelCandidates, outcome.places, bundle);
+    if (explicitHandleCandidates.length > 0) {
+      const explicitHandleOutcome = await finalizeCandidates(explicitHandleCandidates, bundle, content.authorUsername);
+      outcome = {
+        places: mergeSameEntities([...outcome.places, ...explicitHandleOutcome.places], bundle),
+        rejected: [
+          ...outcome.rejected.filter((rejection) =>
+            !explicitHandleOutcome.places.some((place) => handleLikelyMatchesName(place.name || '', rejection.name))
+          ),
+          ...explicitHandleOutcome.rejected,
+        ],
+      };
     }
 
     // After every pass is merged: an entry that is another place's street

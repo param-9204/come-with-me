@@ -234,6 +234,7 @@ export class DbService {
     let address = LocationService.sanitizeSourceAddress(placeData.address);
     let city = LocationService.cleanCityName(placeData.city);
     let geocode: GeocodeResult | null = null;
+    let acceptedBySimilarity = false;
 
     try {
       let coords = await LocationService.geocodePlace(
@@ -254,14 +255,35 @@ export class DbService {
       const conflict = coords.lat !== null && !strongIdentity
         ? googleTypeConflict(placeData.base_category || (placeData.category as PlaceCategory), coords.primaryType, coords.types)
         : null;
+      const resolvedCityFromAddress = coords.formattedAddress ? LocationService.detectCityFromText(coords.formattedAddress) : '';
+      if (!coords.city && resolvedCityFromAddress) {
+        coords.city = resolvedCityFromAddress;
+      }
       if (conflict) {
-        plog('db', `Rejected Google match for "${placeData.name}": different kind of venue`, {
-          googleName: coords.matchedName,
-          googleType: coords.primaryType,
-          extractedAs: placeData.base_category || placeData.category,
-          googleCategory: conflict,
-        }, 'warn');
-        coords = { lat: null, lng: null, formattedAddress: null, neighborhood: null, city: null };
+        acceptedBySimilarity = typeof coords.similarity === 'number' && coords.similarity >= 0.5 && Boolean(coords.formattedAddress);
+
+
+
+        if (acceptedBySimilarity) {
+          plog('db', `Accepted highest-similarity location for "${placeData.name}" despite category mismatch`, {
+            googleName: coords.matchedName,
+            googleType: coords.primaryType,
+            extractedAs: placeData.base_category || placeData.category,
+            similarity: coords.similarity,
+            candidateCount: coords.candidateCount,
+            address: coords.formattedAddress,
+            sourceAddressMismatch: Boolean(coords.sourceAddressMismatch),
+          }, 'warn');
+        } else {
+          plog('db', `Rejected Google match for "${placeData.name}": different kind of venue`, {
+            googleName: coords.matchedName,
+            googleType: coords.primaryType,
+            extractedAs: placeData.base_category || placeData.category,
+            googleCategory: conflict,
+            similarity: coords.similarity || null,
+          }, 'warn');
+          coords = { lat: null, lng: null, formattedAddress: null, neighborhood: null, city: null };
+        }
       }
       geocode = coords;
       lat = coords.lat;
@@ -269,8 +291,8 @@ export class DbService {
       if (coords.formattedAddress) {
         address = coords.formattedAddress;
       }
-      if (coords.city) {
-        city = coords.city;
+      if (coords.city || resolvedCityFromAddress) {
+        city = coords.city || resolvedCityFromAddress || city;
       }
       // Use neighborhood from forward geocode context if not already known
       if (!neighborhood && coords.neighborhood) {
@@ -388,11 +410,13 @@ export class DbService {
 
     // Google's place type decides what a venue is (bar vs cafe); experience
     // categories and HIDDEN GEMS stay as extracted.
-    const category = reconcileCategoryWithGoogle(
-      (placeData.category || placeData.base_category || 'CITY') as PlaceCategory,
-      geocode?.primaryType,
-      geocode?.types
-    );
+    const category = acceptedBySimilarity
+      ? ((placeData.category || placeData.base_category || 'CITY') as PlaceCategory)
+      : reconcileCategoryWithGoogle(
+        (placeData.category || placeData.base_category || 'CITY') as PlaceCategory,
+        geocode?.primaryType,
+        geocode?.types
+      );
     if (category !== placeData.category) {
       plog('db', `Category for "${placeData.name}" set from Google type`, { extracted: placeData.category, saved: category, googleType: geocode?.primaryType });
     }
@@ -402,10 +426,18 @@ export class DbService {
     // An OCR misspelling or abbreviation matched to a listing ("Greenwhich
     // Vilage" → "Greenwich Village", "LES" → "Lower East Side") is saved
     // under the provider's correct spelling.
-    const displayName = geocode?.matchedName &&
-      (geocode.spellingCorrected || LocationService.nameSimilarity(placeData.map_name || placeData.name, geocode.matchedName) === 1)
-      ? geocode.matchedName
-      : placeData.name.trim();
+    // Once a non-ambiguous provider location wins the similarity ranking, use
+    // that provider's canonical business name with its address/coordinates.
+    // This prevents an OCR/list label such as "1. Cafe Carmellini" from being
+    // saved while the actual provider result was "Café Carmellini".
+    const useProviderName = Boolean(
+      geocode?.matchedName &&
+      typeof geocode.similarity === 'number' && geocode.similarity >= 0.5 &&
+      lat !== null && lng !== null && geocode.formattedAddress
+    );
+    const displayName = useProviderName
+      ? geocode!.matchedName!
+      : placeData.name.trim().replace(/^\s*\d{1,3}\s*[.)]\s+/, '');
 
     const { data: newPlace, error } = await supabaseAdmin
       .from('places')
