@@ -1,4 +1,5 @@
 import { supabaseAdmin } from '@/lib/supabase';
+import { urlJobWorkerSecret } from '@/lib/url-job-worker';
 
 export type UrlProcessingJobStatus = 'queued' | 'processing' | 'waiting' | 'completed' | 'failed';
 
@@ -121,7 +122,7 @@ export class UrlProcessingJobsService {
   }
 
   static async processClaimedJob(job: UrlProcessingJob, origin: string): Promise<void> {
-    const workerSecret = process.env.URL_JOB_WORKER_SECRET;
+    const workerSecret = urlJobWorkerSecret();
     if (!workerSecret) throw new Error('URL_JOB_WORKER_SECRET is required to process queued URLs');
 
     try {

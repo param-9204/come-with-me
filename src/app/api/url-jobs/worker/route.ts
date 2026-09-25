@@ -1,11 +1,12 @@
 import { NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
 import { UrlProcessingJobsService } from '@/lib/services/url-processing-jobs.service';
+import { urlJobWorkerSecret } from '@/lib/url-job-worker';
 
 export const maxDuration = 300;
 
 function isWorkerRequest(request: Request): boolean {
-  const secret = process.env.URL_JOB_WORKER_SECRET;
+  const secret = urlJobWorkerSecret();
   if (!secret) return false;
   return request.headers.get('x-url-job-worker') === secret || request.headers.get('authorization') === `Bearer ${secret}`;
 }

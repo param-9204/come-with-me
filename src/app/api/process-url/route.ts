@@ -10,11 +10,12 @@ import type { SocialContent } from '@/lib/types/social';
 import { v4 as uuidv4 } from 'uuid';
 import { resolveCanonicalSocialSource } from '@/lib/social-source';
 import { UrlProcessingJobsService, type UrlProcessingJobStatus } from '@/lib/services/url-processing-jobs.service';
+import { urlJobWorkerSecret } from '@/lib/url-job-worker';
 
 export const maxDuration = 300;
 
 function isUrlJobWorkerRequest(request: Request): boolean {
-  const secret = process.env.URL_JOB_WORKER_SECRET;
+  const secret = urlJobWorkerSecret();
   return Boolean(secret) && (
     request.headers.get('x-url-job-worker') === secret ||
     request.headers.get('authorization') === `Bearer ${secret}`
@@ -430,7 +431,7 @@ export async function POST(request: Request) {
       // A queued row cannot advance without the protected worker credential.
       // Fail before creating a pending social post, so a deployment mistake is
       // visible to mobile instead of leaving jobs stuck at "queued" forever.
-      if (!process.env.URL_JOB_WORKER_SECRET) {
+      if (!urlJobWorkerSecret()) {
         return NextResponse.json({
           success: false,
           error: 'URL processing worker is not configured. Set URL_JOB_WORKER_SECRET on this server, then retry.',
@@ -449,7 +450,9 @@ export async function POST(request: Request) {
           : null,
       }]);
 
-      const workerScheduled = status === 'queued' && Boolean(process.env.URL_JOB_WORKER_SECRET);
+      // Also drain when this job is waiting: it may be waiting on an older
+      // queued job that was created before a worker became available.
+      const workerScheduled = status !== 'completed' && Boolean(urlJobWorkerSecret());
       if (workerScheduled) {
         const workerId = `submit-${uuidv4()}`;
         after(async () => {

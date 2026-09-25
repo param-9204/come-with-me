@@ -4,6 +4,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { resolveCanonicalSocialSource } from '@/lib/social-source';
 import { UrlProcessingJobsService } from '@/lib/services/url-processing-jobs.service';
+import { urlJobWorkerSecret } from '@/lib/url-job-worker';
 
 export const maxDuration = 300;
 
@@ -57,7 +58,7 @@ export async function POST(request: Request) {
     }));
 
     const jobs = await UrlProcessingJobsService.createJobs(userId, validated);
-    const scheduled = Boolean(process.env.URL_JOB_WORKER_SECRET);
+    const scheduled = Boolean(urlJobWorkerSecret());
     if (scheduled) {
       const origin = originFor(request);
       const workerId = `submit-${uuidv4()}`;
