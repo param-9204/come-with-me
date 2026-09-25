@@ -764,6 +764,11 @@ function cleanDisplayName(displayName: string): string {
   return /^(?:[\p{L}\p{N}] ){2,}[\p{L}\p{N}]$/u.test(cleaned) ? cleaned.replace(/ /g, '') : cleaned;
 }
 
+/** A numbered guide label is not part of the venue name: "4. Cafe Boulud" → "Cafe Boulud". */
+function stripGuideOrdinal(value: string): string {
+  return value.replace(/^\s*\d{1,3}\s*[.)]\s+/, '').trim();
+}
+
 function isCityName(name: string): boolean {
   const detected = LocationService.detectCityFromText(name);
   return !!detected && normalizeForMatch(LocationService.cleanCityName(name)) === normalizeForMatch(detected);
@@ -922,7 +927,8 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
   const visualFrameCount = new Set(bundle.items.filter(isScreenText).flatMap((item) => item.frames || [])).size;
 
   for (const place of places) {
-    let name = (place.name || '').trim();
+    let name = stripGuideOrdinal((place.name || '').trim());
+    place.name = name;
     const reject = (reason: string) => rejected.push({ name: name || place.search_query || '(unnamed)', reason });
 
     // A handle is an account identifier, whereas the account display name is

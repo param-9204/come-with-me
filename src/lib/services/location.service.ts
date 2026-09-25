@@ -20,6 +20,12 @@ export type GeocodeResult = {
   provider?: 'google' | 'mapbox';
   /** How strongly the provider result identifies the extracted place. */
   identity?: 'exact_name' | 'source_address' | 'fuzzy';
+  /** Best accepted provider-name similarity (0–1), before category handling. */
+  similarity?: number;
+  /** Number of same-city provider candidates that passed location checks. */
+  candidateCount?: number;
+  /** The source street differed, so the provider's verified address was used. */
+  sourceAddressMismatch?: boolean;
   /**
    * The post's spelling differs from the provider's only by OCR-style errors
    * or an abbreviation ("Greenwhich Vilage", "LES"); `matchedName` holds the
@@ -833,27 +839,12 @@ export class LocationService {
       plog('geocode', 'Street address without a city; not looked up', { place: name, address: cleanAddress }, 'warn');
       return null;
     }
-    // The search text is the place's own text from the post, plus its city so
-    // the provider looks in the right town. The neighbourhood is not added: it
-    // often comes from a section heading rather than the place itself, and
-    // extra words make providers return other businesses that contain them.
-    // It is used only afterwards, to choose between same-name branches.
+
     const query = [cleanName, cleanAddress, cityInfo.name].filter(Boolean).join(', ').slice(0, 256);
     return { cleanName, cleanAddress, cleanNeighborhood, cityInfo, query, kind };
   }
 
-  /**
-   * Shared verification for Google and Mapbox results. A result is accepted
-   * only when it is the place the post names: the name must match (exactly,
-   * as a listing that adds only descriptor words, as an OCR misspelling, or
-   * as an area abbreviation), and country, city, neighbourhood and street
-   * address must agree. An area must not resolve to a venue and a venue must
-   * not resolve to an area. Among accepted results the single highest name
-   * similarity wins, with the provider's ranking breaking ties. The log keeps
-   * only that result, or the closest result and why it was rejected.
-   * Returns null when nothing verifies, an empty result when a name-only
-   * lookup is ambiguous.
-   */
+
   private static verifyCandidates(places: ProviderPlace[], lookup: PreparedLookup, providerLabel: string): GeocodeResult | null {
     const { cleanName, cleanAddress, cleanNeighborhood, cityInfo, query, kind } = lookup;
     const locationWords = [cityInfo.name, cleanNeighborhood].filter(Boolean);
@@ -863,10 +854,6 @@ export class LocationService {
       const coordinates = place.location;
       const area = this.isAreaResult(place);
       const street = this.isStreetResult(place);
-      // Words of the listing's own address and neighbourhood may appear in its
-      // name ("Joe's Pizza Broadway" at 1435 Broadway, "Benares Tribeca" in
-      // Tribeca) without changing identity. Street names compare with their
-      // abbreviations expanded ("Canal St" = "Canal Street").
       const listingWords = [...locationWords, resultAddress, this.googlePlaceNeighborhood(place) || '', this.googlePlaceCity(place) || ''];
       let name: NameMatch = !cleanName
         ? { score: 0, how: 'fuzzy' }
@@ -876,8 +863,7 @@ export class LocationService {
       if (cleanName && area && kind !== 'venue' && name.score < 0.85 && this.isAcronymOf(cleanName, resultName)) {
         name = { score: 0.9, how: 'acronym' };
       }
-      const addressIdentity = !!cleanAddress && this.addressesMatch(cleanAddress, [resultAddress]);
-      const identityMatches = cleanName ? name.score >= 0.85 || addressIdentity : cleanAddress ? addressIdentity : true;
+      const addressIdentity = !!cleanAddress && this.addressesMatch(cleanAddress, [resultAddress]); const identityMatches = cleanName ? name.score > 0 || addressIdentity : cleanAddress ? addressIdentity : true;
       const country = this.googlePlaceCountry(place);
       const resultNeighborhood = this.googlePlaceNeighborhood(place);
       const reason: string | null =
@@ -885,13 +871,12 @@ export class LocationService {
           : kind === 'venue' && area ? 'an area, not a venue'
             : kind === 'venue' && street ? 'a street, not a venue'
               : kind === 'street' && !street ? 'not the street itself (a business or stop on it)'
-            : !identityMatches ? `name differs (similarity ${Math.round(name.score * 100) / 100})`
-              : cityInfo.country && country && country !== cityInfo.country ? `different country (${country})`
-                : !this.cityMatches(cityInfo.name, [this.googlePlaceCity(place) || ''], resultAddress) ? 'different city'
-                  : cleanNeighborhood && resultNeighborhood && !this.contextNamesMatch(cleanNeighborhood, [resultNeighborhood])
-                    ? `different neighbourhood (${resultNeighborhood})`
-                    : !this.addressesMatch(cleanAddress, [resultAddress, resultName]) ? 'different street address'
-                      : null;
+                : !identityMatches ? `name differs (similarity ${Math.round(name.score * 100) / 100})`
+                  : cityInfo.country && country && country !== cityInfo.country ? `different country (${country})`
+                    : !this.cityMatches(cityInfo.name, [this.googlePlaceCity(place) || ''], resultAddress) ? 'different city'
+                      : cleanNeighborhood && resultNeighborhood && !this.contextNamesMatch(cleanNeighborhood, [resultNeighborhood])
+                        ? `different neighbourhood (${resultNeighborhood})`
+                        : null;
       return { place, rank, name, addressIdentity, reason, similarity: addressIdentity ? Math.max(name.score, 0.9) : name.score };
     });
     type Scored = (typeof scored)[number];
@@ -901,6 +886,7 @@ export class LocationService {
       type: entry.place.primaryType || entry.place.types?.[0],
       similarity: Math.round(entry.similarity * 100) / 100,
       match: entry.addressIdentity && entry.name.score < 0.85 ? 'street address' : entry.name.how,
+      sourceAddressMismatch: Boolean(cleanAddress && !entry.addressIdentity),
     });
     const byScore = (a: Scored, b: Scored) => b.similarity - a.similarity || a.rank - b.rank;
     const matches = scored.filter((entry) => entry.reason === null).sort(byScore);
@@ -932,6 +918,9 @@ export class LocationService {
     if (!best) return null;
     const result = this.resultFromPlace(best.place, cityInfo.name);
     result.identity = best.name.how === 'exact' ? 'exact_name' : best.addressIdentity ? 'source_address' : 'fuzzy';
+    result.similarity = best.similarity;
+    result.candidateCount = matches.length;
+    result.sourceAddressMismatch = Boolean(cleanAddress && !best.addressIdentity);
     result.spellingCorrected = best.name.how === 'typo' || best.name.how === 'acronym';
     if (best.addressIdentity && best.name.score < 0.6) {
       // Only the street address from the post matches: this is the right

@@ -25,6 +25,8 @@ export type Verification = {
   provider?: 'google' | 'mapbox' | 'stored';
 };
 
+export type SocialPostAccessEvent = 'started' | 'retry' | 'joined_processing' | 'cache_hit';
+
 const PROVIDER_LABEL: Record<NonNullable<Verification['provider']>, string> = {
   google: 'Google Maps',
   mapbox: 'Mapbox',
@@ -74,6 +76,28 @@ export class DbService {
       plog('db', `${table}.(${columns}) not found — apply supabase/migration_v25_place_evidence.sql to enable it`, undefined, 'warn');
     }
     return false;
+  }
+
+  /** Record a URL submission separately from the shared social post. */
+  static async recordSocialPostAccess(
+    socialPostId: string | undefined | null,
+    userId: string | undefined | null,
+    canonicalSourceKey: string,
+    sourceUrl: string,
+    event: SocialPostAccessEvent
+  ): Promise<void> {
+    if (!socialPostId) return;
+    if (!(await this.supportsColumns('social_post_accesses', 'social_post_id, user_id, canonical_source_key, source_url, event'))) return;
+    const { error } = await supabaseAdmin
+      .from('social_post_accesses')
+      .insert({
+        social_post_id: socialPostId,
+        user_id: userId || null,
+        canonical_source_key: canonicalSourceKey,
+        source_url: sourceUrl,
+        event,
+      });
+    if (error) plog('db', 'Failed to record social post access', { socialPostId, event, error: error.message }, 'warn');
   }
 
   /** Link one place to a post, storing why it was detected when the columns exist. */
@@ -234,6 +258,7 @@ export class DbService {
     let address = LocationService.sanitizeSourceAddress(placeData.address);
     let city = LocationService.cleanCityName(placeData.city);
     let geocode: GeocodeResult | null = null;
+    let acceptedBySimilarity = false;
 
     try {
       let coords = await LocationService.geocodePlace(
@@ -254,14 +279,35 @@ export class DbService {
       const conflict = coords.lat !== null && !strongIdentity
         ? googleTypeConflict(placeData.base_category || (placeData.category as PlaceCategory), coords.primaryType, coords.types)
         : null;
+      const resolvedCityFromAddress = coords.formattedAddress ? LocationService.detectCityFromText(coords.formattedAddress) : '';
+      if (!coords.city && resolvedCityFromAddress) {
+        coords.city = resolvedCityFromAddress;
+      }
       if (conflict) {
-        plog('db', `Rejected Google match for "${placeData.name}": different kind of venue`, {
-          googleName: coords.matchedName,
-          googleType: coords.primaryType,
-          extractedAs: placeData.base_category || placeData.category,
-          googleCategory: conflict,
-        }, 'warn');
-        coords = { lat: null, lng: null, formattedAddress: null, neighborhood: null, city: null };
+        acceptedBySimilarity = typeof coords.similarity === 'number' && coords.similarity >= 0.5 && Boolean(coords.formattedAddress);
+
+
+
+        if (acceptedBySimilarity) {
+          plog('db', `Accepted highest-similarity location for "${placeData.name}" despite category mismatch`, {
+            googleName: coords.matchedName,
+            googleType: coords.primaryType,
+            extractedAs: placeData.base_category || placeData.category,
+            similarity: coords.similarity,
+            candidateCount: coords.candidateCount,
+            address: coords.formattedAddress,
+            sourceAddressMismatch: Boolean(coords.sourceAddressMismatch),
+          }, 'warn');
+        } else {
+          plog('db', `Rejected Google match for "${placeData.name}": different kind of venue`, {
+            googleName: coords.matchedName,
+            googleType: coords.primaryType,
+            extractedAs: placeData.base_category || placeData.category,
+            googleCategory: conflict,
+            similarity: coords.similarity || null,
+          }, 'warn');
+          coords = { lat: null, lng: null, formattedAddress: null, neighborhood: null, city: null };
+        }
       }
       geocode = coords;
       lat = coords.lat;
@@ -269,8 +315,8 @@ export class DbService {
       if (coords.formattedAddress) {
         address = coords.formattedAddress;
       }
-      if (coords.city) {
-        city = coords.city;
+      if (coords.city || resolvedCityFromAddress) {
+        city = coords.city || resolvedCityFromAddress || city;
       }
       // Use neighborhood from forward geocode context if not already known
       if (!neighborhood && coords.neighborhood) {
@@ -388,11 +434,13 @@ export class DbService {
 
     // Google's place type decides what a venue is (bar vs cafe); experience
     // categories and HIDDEN GEMS stay as extracted.
-    const category = reconcileCategoryWithGoogle(
-      (placeData.category || placeData.base_category || 'CITY') as PlaceCategory,
-      geocode?.primaryType,
-      geocode?.types
-    );
+    const category = acceptedBySimilarity
+      ? ((placeData.category || placeData.base_category || 'CITY') as PlaceCategory)
+      : reconcileCategoryWithGoogle(
+        (placeData.category || placeData.base_category || 'CITY') as PlaceCategory,
+        geocode?.primaryType,
+        geocode?.types
+      );
     if (category !== placeData.category) {
       plog('db', `Category for "${placeData.name}" set from Google type`, { extracted: placeData.category, saved: category, googleType: geocode?.primaryType });
     }
@@ -402,10 +450,18 @@ export class DbService {
     // An OCR misspelling or abbreviation matched to a listing ("Greenwhich
     // Vilage" → "Greenwich Village", "LES" → "Lower East Side") is saved
     // under the provider's correct spelling.
-    const displayName = geocode?.matchedName &&
-      (geocode.spellingCorrected || LocationService.nameSimilarity(placeData.map_name || placeData.name, geocode.matchedName) === 1)
-      ? geocode.matchedName
-      : placeData.name.trim();
+    // Once a non-ambiguous provider location wins the similarity ranking, use
+    // that provider's canonical business name with its address/coordinates.
+    // This prevents an OCR/list label such as "1. Cafe Carmellini" from being
+    // saved while the actual provider result was "Café Carmellini".
+    const useProviderName = Boolean(
+      geocode?.matchedName &&
+      typeof geocode.similarity === 'number' && geocode.similarity >= 0.5 &&
+      lat !== null && lng !== null && geocode.formattedAddress
+    );
+    const displayName = useProviderName
+      ? geocode!.matchedName!
+      : placeData.name.trim().replace(/^\s*\d{1,3}\s*[.)]\s+/, '');
 
     const { data: newPlace, error } = await supabaseAdmin
       .from('places')
@@ -739,13 +795,15 @@ export class DbService {
             .update(finalPayload)
             .eq('id', existingPost.id);
 
-          // Update the placeholder row to completed so the client gets status success
+          // This was a second placeholder for a post already resolved by a
+          // different request or URL form. Keep it as an audit pointer, never
+          // as another completed post with a random pending_* content id.
           await supabaseAdmin
             .from('social_posts')
             .update({
-              status: 'completed',
-              ai_analysis: aiAnalysis,
-              whisper_transcript: transcript || null,
+              status: 'merged',
+              merged_into_post_id: existingPost.id,
+              canonical_source_key: null,
             })
             .eq('id', socialPostId);
 

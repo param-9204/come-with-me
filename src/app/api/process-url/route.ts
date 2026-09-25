@@ -8,8 +8,23 @@ import { PipelineLog, withPipelineLog } from '@/lib/services/pipeline-log';
 import { ScraperService } from '@/lib/services/scraper.service';
 import type { SocialContent } from '@/lib/types/social';
 import { v4 as uuidv4 } from 'uuid';
+import { resolveCanonicalSocialSource } from '@/lib/social-source';
 
 export const maxDuration = 300;
+
+function processingResponse(post: any) {
+  return NextResponse.json({
+    success: true,
+    processing: true,
+    status: post.status,
+    socialPostId: post.id,
+    data: post,
+    places: [],
+    place: null,
+    place_id: null,
+    placeIds: [],
+  }, { status: 202 });
+}
 
 function restrictedAccessMessage(rawApifyData: any): string | null {
   const accessFailure = [rawApifyData?.error, rawApifyData?.http_error_reason, rawApifyData?.errorDescription]
@@ -304,27 +319,38 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'URL is required' }, { status: 400 });
     }
 
-    // Clean URL (strip query parameters)
-    let cleanUrl = url;
+    // Canonical identity is established before any placeholder is inserted.
+    // Invalid URLs retain the existing request validation behaviour below.
+    let source;
     try {
-      const parsedUrl = new URL(url);
-      cleanUrl = `${parsedUrl.origin}${parsedUrl.pathname}`;
-    } catch (_) { }
+      source = await resolveCanonicalSocialSource(url);
+    } catch (_) {
+      return NextResponse.json({ error: 'A valid URL is required' }, { status: 400 });
+    }
+    const { cleanUrl, platform, key: canonicalSourceKey } = source;
 
     let origin = new URL(request.url).origin;
     if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
       origin = origin.replace('https://', 'http://');
     }
 
+    const supportsCanonicalIdentity = await DbService.supportsColumns(
+      'social_posts',
+      'canonical_source_key, merged_into_post_id'
+    );
     const cleanUrlNoSlash = cleanUrl.endsWith('/') ? cleanUrl.slice(0, -1) : cleanUrl;
     const cleanUrlWithSlash = cleanUrlNoSlash + '/';
-
-    // Check if the URL has already been processed and is complete
-    const { data: existingPosts } = await supabaseAdmin
-      .from('social_posts')
-      .select('*')
-      .in('post_url', [cleanUrlNoSlash, cleanUrlWithSlash])
-      .order('created_at', { ascending: false });
+    let existingQuery = supabaseAdmin.from('social_posts').select('*');
+    if (supportsCanonicalIdentity) {
+      existingQuery = existingQuery
+        .eq('platform', platform)
+        .eq('canonical_source_key', canonicalSourceKey)
+        .is('merged_into_post_id', null);
+    } else {
+      // Compatibility while the migration is being deployed.
+      existingQuery = existingQuery.in('post_url', [cleanUrlNoSlash, cleanUrlWithSlash]);
+    }
+    const { data: existingPosts } = await existingQuery.order('created_at', { ascending: false });
 
     const foundCompletedPost = existingPosts?.find(p => p.status === 'completed');
     const existingPost = foundCompletedPost || (existingPosts && existingPosts.length > 0 ? existingPosts[0] : null);
@@ -433,6 +459,7 @@ export async function POST(request: Request) {
           // The cache returns normally on every later request once recovery succeeds.
         }
       } else {
+        await DbService.recordSocialPostAccess(existingPost.id, finalUserId, canonicalSourceKey, cleanUrl, 'cache_hit');
         return NextResponse.json({
           success: true,
           partial: Boolean(partialError),
@@ -453,30 +480,71 @@ export async function POST(request: Request) {
       }
     }
 
+    // Never run the same pending post twice. The caller can poll GET with the
+    // returned socialPostId until the first request reaches completed/failed.
+    if (existingPost && ['pending', 'scraping', 'processing'].includes(existingPost.status)) {
+      await DbService.recordSocialPostAccess(existingPost.id, finalUserId, canonicalSourceKey, cleanUrl, 'joined_processing');
+      return processingResponse(existingPost);
+    }
+
     // Setup temporary placeholder
-    const platform = cleanUrl.includes('tiktok.com') ? 'tiktok' : 'instagram';
     const tempContentId = `pending_${uuidv4()}`;
 
     // Get placeholder ID to track database execution
     let socialPostId = existingPost?.id;
     if (!socialPostId) {
-      const { data: socialPost, error: dbError } = await supabaseAdmin
-        .from('social_posts')
-        .insert({
-          post_url: cleanUrl,
-          status: 'pending',
-          platform,
-          content_id: tempContentId,
-          user_id: finalUserId || null
-        })
-        .select('id')
-        .single();
-
-      if (dbError || !socialPost) {
-        throw new Error(`Failed to create database placeholder: ${dbError?.message}`);
+      if (supportsCanonicalIdentity) {
+        // INSERT ... ON CONFLICT DO NOTHING is the atomic claim. A second
+        // request reads the row created by the first one and receives 202.
+        const { data: inserted, error: dbError } = await supabaseAdmin
+          .from('social_posts')
+          .upsert({
+            post_url: cleanUrl,
+            canonical_source_key: canonicalSourceKey,
+            status: 'pending',
+            platform,
+            content_id: tempContentId,
+            user_id: finalUserId || null,
+          }, { onConflict: 'platform,canonical_source_key', ignoreDuplicates: true })
+          .select('*');
+        if (dbError) throw new Error(`Failed to claim database placeholder: ${dbError.message}`);
+        const socialPost = inserted?.[0] || (await supabaseAdmin
+          .from('social_posts')
+          .select('*')
+          .eq('platform', platform)
+          .eq('canonical_source_key', canonicalSourceKey)
+          .is('merged_into_post_id', null)
+          .single()).data;
+        if (!socialPost) throw new Error('Failed to claim database placeholder');
+        if (!inserted?.length && socialPost.status !== 'failed') {
+          await DbService.recordSocialPostAccess(socialPost.id, finalUserId, canonicalSourceKey, cleanUrl, 'joined_processing');
+          return processingResponse(socialPost);
+        }
+        socialPostId = socialPost.id;
+      } else {
+        const { data: socialPost, error: dbError } = await supabaseAdmin
+          .from('social_posts')
+          .insert({
+            post_url: cleanUrl,
+            status: 'pending',
+            platform,
+            content_id: tempContentId,
+            user_id: finalUserId || null
+          })
+          .select('id')
+          .single();
+        if (dbError || !socialPost) throw new Error(`Failed to create database placeholder: ${dbError?.message}`);
+        socialPostId = socialPost.id;
       }
-      socialPostId = socialPost.id;
     }
+
+    await DbService.recordSocialPostAccess(
+      socialPostId,
+      finalUserId,
+      canonicalSourceKey,
+      cleanUrl,
+      existingPost?.status === 'failed' ? 'retry' : 'started'
+    );
 
     // Execute the pipeline synchronously and await completion
     const { finalPostId, analyzeData } = await runSynchronousPipeline(origin, cleanUrl, socialPostId, finalUserId || undefined);
@@ -549,18 +617,22 @@ export async function GET(request: Request) {
     }
 
     let query = supabaseAdmin.from('social_posts').select('*');
+    const supportsCanonicalIdentity = await DbService.supportsColumns(
+      'social_posts',
+      'canonical_source_key, merged_into_post_id'
+    );
 
     if (id) {
       query = query.eq('id', id);
     } else if (url) {
-      let cleanUrl = url;
       try {
-        const parsed = new URL(url);
-        cleanUrl = `${parsed.origin}${parsed.pathname}`;
-      } catch (_) { }
-      const cleanUrlNoSlash = cleanUrl.endsWith('/') ? cleanUrl.slice(0, -1) : cleanUrl;
-      const cleanUrlWithSlash = cleanUrlNoSlash + '/';
-      query = query.in('post_url', [cleanUrlNoSlash, cleanUrlWithSlash]);
+        const source = await resolveCanonicalSocialSource(url);
+        query = supportsCanonicalIdentity
+          ? query.eq('platform', source.platform).eq('canonical_source_key', source.key).is('merged_into_post_id', null)
+          : query.in('post_url', [source.cleanUrl, `${source.cleanUrl}/`]);
+      } catch (_) {
+        return NextResponse.json({ error: 'A valid URL is required' }, { status: 400 });
+      }
     }
 
     const { data: posts, error } = await query.order('created_at', { ascending: false });
@@ -573,7 +645,18 @@ export async function GET(request: Request) {
       return NextResponse.json({ success: false, error: 'Post not found' }, { status: 404 });
     }
 
-    const post = posts.find(p => p.status === 'completed') || posts[0];
+    let post = posts.find(p => p.status === 'completed') || posts[0];
+    if (supportsCanonicalIdentity && post?.merged_into_post_id) {
+      const { data: canonicalPost, error: canonicalError } = await supabaseAdmin
+        .from('social_posts')
+        .select('*')
+        .eq('id', post.merged_into_post_id)
+        .single();
+      if (canonicalError || !canonicalPost) {
+        return NextResponse.json({ success: false, error: 'Canonical post not found' }, { status: 404 });
+      }
+      post = canonicalPost;
+    }
 
     const places = formatResponsePlaces(await DbService.getPlacesForSocialPost(post.id, post.post_url), {
       authorUsername: authorUsernameFromPost(post),
