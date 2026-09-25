@@ -70,6 +70,28 @@ function responsePlaceIds(places: any[]): string[] {
   return places.map((place) => place?.id || place?.place_id).filter(Boolean);
 }
 
+/**
+ * Instagram's shortcode identifies the post independently of URL spelling
+ * (`www`, a trailing slash, and query parameters must not create a new run).
+ * Do not infer an identifier for other platforms here: their URL formats are
+ * less stable and an incorrect cache hit would return the wrong post.
+ */
+function instagramShortCodeFromUrl(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+    if (hostname !== 'instagram.com') return null;
+
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    if (!['p', 'reel', 'reels', 'tv'].includes(segments[0]?.toLowerCase())) return null;
+
+    const shortCode = segments[1]?.trim() || '';
+    return /^[A-Za-z0-9_-]+$/.test(shortCode) ? shortCode : null;
+  } catch {
+    return null;
+  }
+}
+
 function ocrComparisonFromStoredPost(post: any) {
   const apifyFrames = Array.isArray(post?.ocr_frames_apify) ? post.ocr_frames_apify : [];
   const gptFrames = Array.isArray(post?.ocr_frames_gpt) ? post.ocr_frames_gpt : [];
@@ -318,75 +340,45 @@ export async function POST(request: Request) {
 
     const cleanUrlNoSlash = cleanUrl.endsWith('/') ? cleanUrl.slice(0, -1) : cleanUrl;
     const cleanUrlWithSlash = cleanUrlNoSlash + '/';
+    const platform = cleanUrl.includes('tiktok.com') ? 'tiktok' : 'instagram';
+    const shortCode = platform === 'instagram' ? instagramShortCodeFromUrl(cleanUrl) : null;
 
-    // Check if the URL has already been processed and is complete
-    const { data: existingPosts } = await supabaseAdmin
-      .from('social_posts')
-      .select('*')
-      .in('post_url', [cleanUrlNoSlash, cleanUrlWithSlash])
-      .order('created_at', { ascending: false });
+    // A completed Instagram post is identified by its immutable shortcode, not
+    // by a particular URL spelling. URL matching remains only as a fallback
+    // for TikTok and legacy posts whose shortcode was never stored.
+    let existingPosts: any[] | null = null;
+    if (shortCode) {
+      const { data, error } = await supabaseAdmin
+        .from('social_posts')
+        .select('*')
+        .eq('platform', 'instagram')
+        .eq('short_code', shortCode)
+        .order('created_at', { ascending: false });
+      if (error) throw new Error(`Failed to look up Instagram shortcode: ${error.message}`);
+      existingPosts = data;
+    }
+
+    if (!existingPosts?.length) {
+      const { data, error } = await supabaseAdmin
+        .from('social_posts')
+        .select('*')
+        .in('post_url', [cleanUrlNoSlash, cleanUrlWithSlash])
+        .order('created_at', { ascending: false });
+      if (error) throw new Error(`Failed to look up processed URL: ${error.message}`);
+      existingPosts = data;
+    }
 
     const foundCompletedPost = existingPosts?.find(p => p.status === 'completed');
     const existingPost = foundCompletedPost || (existingPosts && existingPosts.length > 0 ? existingPosts[0] : null);
 
     if (existingPost && existingPost.status === 'completed') {
-      let savedPlaces = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
+      const savedPlaces = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
       const partialError = restrictedAccessMessage(existingPost.raw_apify_data);
-      let responseOnlyPlaces: any[] = [];
       const cachedContent = contentFromStoredPost(existingPost);
 
-      // Restricted records saved by older versions may contain only the raw
-      // Apify payload. Repair the source-backed post fields before returning
-      // it so creator metadata is never reported as "unknown".
-      if (partialError && (existingPost.author_username !== cachedContent.authorUsername || existingPost.caption !== cachedContent.caption)) {
-        const { error: postRepairError } = await supabaseAdmin
-          .from('social_posts')
-          .update({
-            author_username: cachedContent.authorUsername,
-            caption: cachedContent.caption,
-            hashtags: cachedContent.hashtags,
-            mentions: cachedContent.mentions,
-          })
-          .eq('id', existingPost.id);
-        if (postRepairError) {
-          console.warn('[process-url] Failed to repair cached restricted post fields:', postRepairError.message);
-        }
-      }
-
-      if (partialError && savedPlaces.length === 0 && (existingPost.caption || existingPost.raw_apify_data?.description)) {
-        try {
-          responseOnlyPlaces = await AiEnrichmentService.extractPlace(
-            cachedContent,
-            existingPost.whisper_transcript || '',
-            []
-          );
-          const savedIds = await Promise.all(responseOnlyPlaces.map((place) =>
-            DbService.savePlace(
-              place,
-              existingPost.post_url,
-              cachedContent.platform,
-              existingPost.whisper_transcript || '',
-              undefined,
-              existingPost.id,
-              cachedContent.authorUsername
-            )
-          ));
-          if (savedIds.some(Boolean)) {
-            savedPlaces = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
-            const savedPlaceKeys = new Set(savedPlaces.map((place: any) =>
-              `${String(place.name || '').trim().toLowerCase()}|${String(place.city || '').trim().toLowerCase()}`
-            ));
-            responseOnlyPlaces = responseOnlyPlaces.filter((place) =>
-              !savedPlaceKeys.has(`${String(place.name || '').trim().toLowerCase()}|${String(place.city || '').trim().toLowerCase()}`)
-            );
-          }
-          console.log(`[process-url] Recovered ${responseOnlyPlaces.length} place(s) from cached restricted post ${existingPost.id}.`);
-        } catch (placeError: any) {
-          console.warn('[process-url] Cached restricted-place recovery failed:', placeError.message);
-        }
-      }
-
-      const places = formatResponsePlaces([...savedPlaces, ...responseOnlyPlaces], {
+      // A completed post is a cache hit. Return only the persisted result: do
+      // not scrape, run OCR, call AI, or write a recovery result on this path.
+      const places = formatResponsePlaces(savedPlaces, {
         authorUsername: cachedContent.authorUsername,
         sourceUrl: existingPost.post_url,
         platform: cachedContent.platform,
@@ -400,61 +392,27 @@ export async function POST(request: Request) {
         mentions: cachedContent.mentions,
       };
 
-      // Re-run only legacy video records that completed before GPT Vision
-      // evidence was stored and still contain an unresolved saved place. This
-      // repairs historical partial results once without reprocessing healthy
-      // cached posts on every request.
-      const hasNoStoredVisionFrames = !Array.isArray(existingPost.ocr_frames_gpt) || existingPost.ocr_frames_gpt.length === 0;
-      const hasUnresolvedSavedPlace = savedPlaces.length === 0 || savedPlaces.some((place: any) =>
-        place.latitude === null || place.longitude === null || !String(place.address || '').trim()
-      );
-      const storedOcrTexts = Array.isArray(existingPost.ocr_frames_apify)
-        ? existingPost.ocr_frames_apify.flatMap((frame: any) => Array.isArray(frame?.texts) ? frame.texts : [])
-        : [];
-      const sourceAddressCount = AiEnrichmentService.countDistinctSourceAddresses(storedOcrTexts);
-      const hasIncompleteAddressBackedList = sourceAddressCount >= 2 && savedPlaces.length < sourceAddressCount;
-      const needsLegacyVideoRecovery =
-        (cachedContent.contentType === 'video' && hasNoStoredVisionFrames && hasUnresolvedSavedPlace) ||
-        hasIncompleteAddressBackedList;
-
-      if (needsLegacyVideoRecovery) {
-        console.warn(
-          `[process-url] Reprocessing incomplete cached post ${existingPost.id} ` +
-          `(saved=${savedPlaces.length}, source-addresses=${sourceAddressCount}).`
-        );
-        const { error: retryError } = await supabaseAdmin
-          .from('social_posts')
-          .update({ status: 'pending', error_message: null })
-          .eq('id', existingPost.id);
-        if (retryError) {
-          console.warn('[process-url] Unable to mark legacy post for recovery:', retryError.message);
-        } else {
-          // Fall through to the normal pipeline using the existing post ID.
-          // The cache returns normally on every later request once recovery succeeds.
-        }
-      } else {
-        return NextResponse.json({
-          success: true,
-          partial: Boolean(partialError),
-          error: partialError ? partialResultMessage(places.length) : null,
-          socialPostId: existingPost.id,
-          data: responseData,
-          rawApifyData: existingPost.raw_apify_data || null,
-          places,
-          place: firstPlace,
-          place_id: firstPlace?.id || firstPlace?.place_id || null,
-          placeIds: responsePlaceIds(places),
-          aiAnalysis: existingPost.ai_analysis || null,
-          transcript: existingPost.whisper_transcript || null,
-          scrapedData: cachedContent,
-          ocrComparison: ocrComparisonFromStoredPost(existingPost),
-          audioUpload: null,
-        });
-      }
+      return NextResponse.json({
+        success: true,
+        cached: true,
+        partial: Boolean(partialError),
+        error: partialError ? partialResultMessage(places.length) : null,
+        socialPostId: existingPost.id,
+        data: responseData,
+        rawApifyData: existingPost.raw_apify_data || null,
+        places,
+        place: firstPlace,
+        place_id: firstPlace?.id || firstPlace?.place_id || null,
+        placeIds: responsePlaceIds(places),
+        aiAnalysis: existingPost.ai_analysis || null,
+        transcript: existingPost.whisper_transcript || null,
+        scrapedData: cachedContent,
+        ocrComparison: ocrComparisonFromStoredPost(existingPost),
+        audioUpload: null,
+      });
     }
 
     // Setup temporary placeholder
-    const platform = cleanUrl.includes('tiktok.com') ? 'tiktok' : 'instagram';
     const tempContentId = `pending_${uuidv4()}`;
 
     // Get placeholder ID to track database execution
@@ -467,6 +425,7 @@ export async function POST(request: Request) {
           status: 'pending',
           platform,
           content_id: tempContentId,
+          short_code: shortCode,
           user_id: finalUserId || null
         })
         .select('id')

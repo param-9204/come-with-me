@@ -346,7 +346,34 @@ export class DbService {
       }
     }
 
-    // Deduplicate by coordinate proximity (if geocoding succeeded)
+    // The geocoder can return the same coordinates even when the extraction
+    // uses a different spelling, city, or category. Reuse that persisted map
+    // entity and link it to this post instead of inserting another place.
+    if (lat !== null && lng !== null) {
+      const { data: exactCoordinateRows } = await supabaseAdmin
+        .from('places')
+        .select('id, name')
+        .eq('latitude', lat)
+        .eq('longitude', lng)
+        .order('created_at', { ascending: true })
+        .limit(1);
+      const existingAtExactCoordinates = exactCoordinateRows?.[0];
+
+      if (existingAtExactCoordinates) {
+        plog('db', `"${placeData.name}" already in database (same exact coordinates)`, {
+          placeId: existingAtExactCoordinates.id,
+          existingName: existingAtExactCoordinates.name,
+          lat,
+          lng,
+        });
+        await link(existingAtExactCoordinates.id, { verified, ambiguous, provider: geocode?.provider });
+        return existingAtExactCoordinates.id;
+      }
+    }
+
+    // Keep the narrower nearby-coordinate fallback for provider results that
+    // differ by a few metres; it still requires the same normalized name so
+    // distinct businesses in one building are not collapsed.
     if (lat !== null && lng !== null) {
       const margin = 0.0001; // ~10m bounding box
       const { data: existingByCoords } = await supabaseAdmin
