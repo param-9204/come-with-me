@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS public.profiles (
   created_at timestamptz DEFAULT now()
 );
 
+
 -- 3. PLACES TABLE
 CREATE TABLE IF NOT EXISTS public.places (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
