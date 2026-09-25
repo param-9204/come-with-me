@@ -371,6 +371,8 @@ export function splitNameDescriptor(name: string, city = ''): { name: string; no
     if (!match) continue;
     const head = match[1].trim();
     const tail = match[2].trim();
+    // "Market-Bar" is the name: splitting it leaves "Market", which is rejected as generic.
+    if (GENERIC_NAMES.has(normalizeForMatch(head).replace(/^the\s+/, ''))) continue;
     if ((head.match(/\p{L}/gu) || []).length >= 3 && isDescriptorTail(tail)) return { name: head, note: tail };
   }
   return { name, note: '' };
@@ -1451,13 +1453,18 @@ export class AiEnrichmentService {
         // is merged by entity; generated data is never trusted without the same
         // checks. Scene text (a billboard address, a street sign) does not count.
         const creatorItems = bundle.items.filter((item) => !item.scene);
+        const isVideoPost = content.contentType === 'reel' || content.contentType === 'video';
         // Only creator-authored caption/comment text and explicit pins can
         // establish that a post contains several addresses. Raw OCR fragments
         // from a normal reel must not trigger a second extraction pass.
+        // Carousel slides are designed images, not filmed scenes: their Vision
+        // text counts (a 12-slide B44 bar guide printed 24 "Name · address"
+        // lines, the counts said 11, and no second look was taken at 15).
         const trustedLocationItems = creatorItems.filter((item) =>
           item.source === 'caption' ||
           item.source === 'comment_creator' ||
-          ((item.source === 'ocr' || item.source === 'vision_ocr') && /^📍/u.test(item.text))
+          ((item.source === 'ocr' || item.source === 'vision_ocr') && /^📍/u.test(item.text)) ||
+          (!isVideoPost && item.source === 'vision_ocr')
         );
         const sourceAddressCount = distinctSourceAddressCount(trustedLocationItems.map((item) => item.text));
         // Every 📍-marked line (any pin style, normalised) is a location the creator pointed at.
@@ -1483,7 +1490,6 @@ export class AiEnrichmentService {
         // Carousels: the gate never runs on image slides, and designed slides
         // carry no subtitles, so each slide's label counts (an 8-card
         // Ahmedabad guide returned 5 places and no second look was taken).
-        const isVideoPost = content.contentType === 'reel' || content.contentType === 'video';
         const screenCards = isVideoPost ? visualGuideCandidates.length : countScreenCards(media.visionFrames || []);
         const expected = Math.max(sourceAddressCount, markedLocations, screenCards);
         const listShortfall = listEntries * LIST_RECOVERY_RATIO > outcome.places.length;
