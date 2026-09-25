@@ -5,6 +5,7 @@ import { after } from 'next/server';
 import { ScraperService } from '@/lib/services/scraper.service';
 import { DbService } from '@/lib/services/db.service';
 import { PipelineLog, recordPipelineOperation, withPipelineLog } from '@/lib/services/pipeline-log';
+import { resolveCanonicalSocialSource } from '@/lib/social-source';
 
 // The background pipeline runs in `after()` within this invocation.
 export const maxDuration = 300;
@@ -145,11 +146,13 @@ export async function POST(request: Request) {
   }
 
   // Clean URL — strip query params
-  let cleanUrl = url as string;
+  let source;
   try {
-    const parsedUrl = new URL(url);
-    cleanUrl = `${parsedUrl.origin}${parsedUrl.pathname}`;
-  } catch (_) { }
+    source = await resolveCanonicalSocialSource(url);
+  } catch (_) {
+    return new Response('data: {"error":"A valid Instagram or TikTok URL is required"}\n\n', { status: 400 });
+  }
+  const { cleanUrl, platform, key: canonicalSourceKey } = source;
 
   // Resolve origin for internal fetch calls
   let origin = new URL(request.url).origin;
@@ -172,6 +175,7 @@ export async function POST(request: Request) {
 
       try {
         // ── 0. Check for cached completed post ──────────────────────────────
+        const supportsCanonicalIdentity = await DbService.supportsColumns('social_posts', 'canonical_source_key, merged_into_post_id');
         const cleanUrlNoSlash = cleanUrl.endsWith('/') ? cleanUrl.slice(0, -1) : cleanUrl;
         const cleanUrlWithSlash = cleanUrlNoSlash + '/';
         const cleanUrlReelNoSlash = cleanUrlNoSlash.replace('/reels/', '/reel/');
@@ -179,18 +183,12 @@ export async function POST(request: Request) {
         const cleanUrlReelsNoSlash = cleanUrlNoSlash.replace('/reel/', '/reels/');
         const cleanUrlReelsWithSlash = cleanUrlReelsNoSlash + '/';
 
-        const { data: existingPosts } = await supabaseAdmin
-          .from('social_posts')
-          .select('*')
-          .in('post_url', [
-            cleanUrlNoSlash,
-            cleanUrlWithSlash,
-            cleanUrlReelNoSlash,
-            cleanUrlReelWithSlash,
-            cleanUrlReelsNoSlash,
-            cleanUrlReelsWithSlash
-          ])
-          .order('created_at', { ascending: false });
+        const existingQuery = supportsCanonicalIdentity
+          ? supabaseAdmin.from('social_posts').select('*').eq('platform', platform).eq('canonical_source_key', canonicalSourceKey).is('merged_into_post_id', null)
+          : supabaseAdmin.from('social_posts').select('*').in('post_url', [
+            cleanUrlNoSlash, cleanUrlWithSlash, cleanUrlReelNoSlash, cleanUrlReelWithSlash, cleanUrlReelsNoSlash, cleanUrlReelsWithSlash
+          ]);
+        const { data: existingPosts } = await existingQuery.order('created_at', { ascending: false });
 
         const foundCompletedPost = existingPosts?.find(p => p.status === 'completed');
         const existingPost = foundCompletedPost || (existingPosts && existingPosts.length > 0 ? existingPosts[0] : null);
@@ -219,26 +217,41 @@ export async function POST(request: Request) {
           return;
         }
 
+        if (existingPost && ['pending', 'scraping', 'scraped', 'processing:media', 'processing:analysis'].includes(existingPost.status)) {
+          send('processing', { socialPostId: existingPost.id, status: existingPost.status, joined: true });
+          controller.close();
+          return;
+        }
+
         // ── 1. Insert/Retrieve placeholder row ────────────────────────────────
-        const platform = cleanUrl.includes('tiktok.com') ? 'tiktok' : 'instagram';
         socialPostId = existingPost?.id;
 
         if (!socialPostId) {
-          const { data: socialPost, error: dbError } = await supabaseAdmin
-            .from('social_posts')
-            .insert({
+          const tempContentId = `pending_${uuidv4()}`;
+          const create = supportsCanonicalIdentity
+            ? supabaseAdmin.from('social_posts').upsert({
               post_url: cleanUrl,
+              canonical_source_key: canonicalSourceKey,
               status: 'pending',
               platform,
-              content_id: `pending_${uuidv4()}`,
+              content_id: tempContentId,
               user_id: resolvedUserId,
-
-            })
-            .select('id')
-            .single();
+            }, { onConflict: 'platform,canonical_source_key', ignoreDuplicates: true }).select('id, status')
+            : supabaseAdmin.from('social_posts').insert({
+              post_url: cleanUrl, status: 'pending', platform, content_id: tempContentId, user_id: resolvedUserId,
+            }).select('id, status');
+          const { data: inserted, error: dbError } = await create;
+          const socialPost = inserted?.[0] || (supportsCanonicalIdentity
+            ? (await supabaseAdmin.from('social_posts').select('id, status').eq('platform', platform).eq('canonical_source_key', canonicalSourceKey).is('merged_into_post_id', null).single()).data
+            : null);
 
           if (dbError || !socialPost) {
             send('error', { error: `DB error: ${dbError?.message}` });
+            controller.close();
+            return;
+          }
+          if (!inserted?.length && socialPost.status !== 'failed') {
+            send('processing', { socialPostId: socialPost.id, status: socialPost.status, joined: true });
             controller.close();
             return;
           }
