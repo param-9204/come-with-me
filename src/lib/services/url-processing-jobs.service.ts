@@ -1,5 +1,4 @@
 import { supabaseAdmin } from '@/lib/supabase';
-import { urlJobWorkerSecret } from '@/lib/url-job-worker';
 
 export type UrlProcessingJobStatus = 'queued' | 'processing' | 'waiting' | 'completed' | 'failed';
 
@@ -122,15 +121,15 @@ export class UrlProcessingJobsService {
   }
 
   static async processClaimedJob(job: UrlProcessingJob, origin: string): Promise<void> {
-    const workerSecret = urlJobWorkerSecret();
-    if (!workerSecret) throw new Error('URL_JOB_WORKER_SECRET is required to process queued URLs');
+    if (!job.locked_by) throw new Error('Claimed job is missing its worker lock');
 
     try {
       const response = await fetch(`${origin}/api/process-url`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-url-job-worker': workerSecret,
+          'x-url-job-id': job.id,
+          'x-url-job-worker': job.locked_by,
         },
         body: JSON.stringify({ url: job.source_url, userId: job.user_id }),
       });
