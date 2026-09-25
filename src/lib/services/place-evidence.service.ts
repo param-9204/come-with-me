@@ -61,7 +61,7 @@ export type BaseCategory = (typeof BASE_CATEGORIES)[number];
 const HIDDEN_GEM_RE = /hidden gem|secret (?:spot|place|bar|garden|beach|cafe|restaurant)|best[- ]kept secret|locals?[- ]only|off the beaten|underrated|hole[- ]in[- ]the[- ]wall|nobody knows about|hidden spot/i;
 
 /** Platform UI text that OCR picks up from screen recordings and overlays. */
-const UI_CHROME_RE = /^(?:follow(?:ing)?|like[sd]?|reply|share|send|save[sd]?|original audio|sponsored|paid partnership(?: with .*)?|see translation|view all \d+ comments|add a comment\.*|tiktok|reels?|instagram|for you|following|live|more|comments?|\d+(?:[.,]\d+)?[km]?)$/i;
+const UI_CHROME_RE = /^(?:follow(?:ing)?|like[sd]?|reply|share|send|save[sd]?|original audio|sponsored|paid partnership(?: with .*)?|see translation|see (?:details|more)|link in (?:bio|comments?)|swipe(?: (?:up|left|right))?|tap (?:here|for more)|view all \d+ comments|add a comment\.*|tiktok|reels?|instagram|for you|following|live|more|comments?|\d+(?:[.,]\d+)?[km]?)$/i;
 
 export const GENERIC_NAMES = new Set([
   'restaurant', 'restaurants', 'cafe', 'coffee shop', 'coffee', 'bar', 'bars', 'pub', 'club', 'hotel', 'shop', 'store',
@@ -111,6 +111,8 @@ export interface RawPlaceCandidate {
   category: PlaceCategory;
   description: string;
   search_query: string;
+  /** Local-language name for the map search when the post uses another language; '' otherwise. */
+  map_name?: string;
 }
 
 export interface ScoredCandidates {
@@ -194,7 +196,8 @@ export function itemSupportsName(name: string, item: EvidenceItem): boolean {
 const isScreenText = (item: EvidenceItem) => item.source === 'ocr' || item.source === 'vision_ocr';
 const PIN_RE = /^\s*📍/u;
 /** Bulleted or numbered lines: a deliberate list, never scenery. */
-const LIST_ITEM_RE = /^\s*(?:[•·●▪◦\-–*]|\d{1,2}[.)])\s*\S/u;
+/** A word must follow the bullet or number: prices ("9.95") are not list items. */
+const LIST_ITEM_RE = /^\s*(?:[•·●▪◦\-–*]|\d{1,2}[.)])\s*[\p{L}@"'“]/u;
 const GUIDE_HEADING_RE = /\b(?:dining|restaurants?|caf(?:e|é)s?|coffee|bars?|food|spots?|places|guide|itinerary|top)\b/i;
 
 // ──────────────────────────────────────────────────────────────────────
@@ -477,7 +480,11 @@ export function buildEvidence(content: SocialContent, media: MediaEvidenceInput 
   for (const line of captionLines) push('C', { source: 'caption', text: line, weight: SOURCE_WEIGHTS.caption });
 
   if (content.locationTag?.name) {
-    push('L', { source: 'location_tag', text: content.locationTag.name, weight: SOURCE_WEIGHTS.location_tag });
+    const tagAddress = content.locationTag.address?.trim() || '';
+    const tagText = tagAddress && !tagAddress.toLowerCase().includes(content.locationTag.name.toLowerCase())
+      ? `${content.locationTag.name}, ${tagAddress}`
+      : content.locationTag.name;
+    push('L', { source: 'location_tag', text: tagText, weight: SOURCE_WEIGHTS.location_tag });
   }
 
   for (const account of content.accounts || []) {
@@ -728,6 +735,35 @@ function isCreatorOrAudio(name: string, bundle: EvidenceBundle): string | null {
   return null;
 }
 
+/**
+ * Location lines in the creator's own caption or comments that pin a place
+ * without naming another candidate ("📍 Wynwood - 2750 NW 3rd Ave.",
+ * "📍 Locations - Durga Nursery Road & Sukhadia Circle"). On a business's own
+ * post these locate the business itself.
+ */
+function creatorOwnLocationLines(bundle: EvidenceBundle, places: ScorablePlace[], self: ScorablePlace): EvidenceItem[] {
+  const others = places.filter((place) => place !== self && place.name && compact(place.name) !== compact(self.name || ''));
+  return bundle.items.filter((item) =>
+    (item.source === 'caption' || item.source === 'comment_creator') &&
+    PIN_RE.test(item.text) &&
+    !others.some((place) => itemSupportsName(place.name || '', item))
+  );
+}
+
+/**
+ * An account display name used as a place name: without emoji, flags or
+ * trademark signs ("Mariscos El Submarino 🇲🇽" → "Mariscos El Submarino"),
+ * and with letter-spaced styling joined ("S T I C K B A L L" → "STICKBALL").
+ */
+function cleanDisplayName(displayName: string): string {
+  const cleaned = displayName
+    .replace(/[™®©]️?/g, '')
+    .replace(/[\p{Extended_Pictographic}\u{1F1E6}-\u{1F1FF}️‍]/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return /^(?:[\p{L}\p{N}] ){2,}[\p{L}\p{N}]$/u.test(cleaned) ? cleaned.replace(/ /g, '') : cleaned;
+}
+
 function isCityName(name: string): boolean {
   const detected = LocationService.detectCityFromText(name);
   return !!detected && normalizeForMatch(LocationService.cleanCityName(name)) === normalizeForMatch(detected);
@@ -898,7 +934,7 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
       !!item.displayName?.trim()
     );
     if (matchingAccount?.displayName) {
-      name = matchingAccount.displayName.trim();
+      name = cleanDisplayName(matchingAccount.displayName) || name;
       place.name = name;
     }
 
@@ -924,13 +960,27 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
       if (name.length > 70 || name.split(/\s+/).length > 8) { reject('headline, not a name'); continue; }
       if (isGenericName(name)) { reject('generic name'); continue; }
       const excluded = isCreatorOrAudio(name, bundle);
-      if (excluded) { reject(excluded); continue; }
+      // A business posting about itself ("MIAM Café" listing its branches,
+      // "Mr Sandwich Udaipur" pinning its locations) is the place. The creator
+      // is kept only when the creator's own text pins a location that names no
+      // other candidate, so a food blogger's persona is never saved as a venue.
+      const ownVenueLocations = excluded === 'creator account' ? creatorOwnLocationLines(bundle, places, place) : [];
+      if (excluded && ownVenueLocations.length === 0) { reject(excluded); continue; }
       if (isCityName(name) && places.length > 1) { reject('city is location context'); continue; }
       // "Best cafes in Lisbon" → Lisbon is where the places are, not a place itself.
       if (places.length > 1 && otherCities.has(normalizeForMatch(LocationService.cleanCityName(name)))) {
         reject('city is location context'); continue;
       }
       support = findNameSupport(name, bundle);
+      // The creator's @handle written in their own caption, comment or screen
+      // text ("@hotel_anna_bel is Fishtown's newest…", "stumbled upon
+      // @ccfmrkt") is the creator naming the place, not just a tag.
+      const handles = support.filter((item) => item.source === 'account' && item.username).map((item) => item.username!.toLowerCase());
+      const handleLines = handles.length
+        ? bundle.items.filter((item) => !support.includes(item) && ['caption', 'comment_creator', 'ocr', 'vision_ocr', 'speech'].includes(item.source) &&
+          handles.some((handle) => item.text.toLowerCase().includes(`@${handle}`)))
+        : [];
+      support = [...support, ...handleLines, ...ownVenueLocations.filter((item) => !support.includes(item))];
       if (support.length === 0) { reject('name not found in evidence'); continue; }
       if (support.every((item) => item.source === 'creator_bio')) { reject('only in creator bio'); continue; }
       // Tags and mentions identify an account, not necessarily a place in this
@@ -939,13 +989,21 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
       if (support.every((item) => item.source === 'account' || item.source === 'hashtags')) {
         reject('account-only evidence; no independent venue signal'); continue;
       }
-      const repeatedFrames = new Set(support.filter(isScreenText).flatMap((item) => item.frames || [])).size;
-      if (visualGuideHeading && support.every(isScreenText) && repeatedFrames >= Math.max(3, Math.ceil(visualFrameCount * 0.6))) {
-        reject('repeated visual guide title or watermark'); continue;
-      }
       // A list line ("• Mei Lah Wah", "1. Kasama") is part of the guide even when
       // other places carry pins; only stray text (a poster, a plate) is dropped.
       const isListItem = (item: EvidenceItem) => isScreenText(item) && LIST_ITEM_RE.test(item.text);
+      // Text on most frames of a guide is its title or watermark ("SWAGATAM
+      // AMDAVAD" over every venue card). Not when it is a numbered or bulleted
+      // list line (a one-slide list is on every frame), and not when it is the
+      // post's only candidate (a single-venue video shows the venue's name
+      // throughout, e.g. "SUNDOWNER CAFE").
+      const repeatedFrames = new Set(support.filter(isScreenText).flatMap((item) => item.frames || [])).size;
+      // Other candidates that are venues; a city candidate ("Ahmedabad") is context, not a second place.
+      const otherVenues = places.filter((other) => other !== place && !!other.name && !isCityName(other.name)).length;
+      if (visualGuideHeading && otherVenues > 0 && support.every(isScreenText) && !support.some(isListItem) &&
+        repeatedFrames >= Math.max(3, Math.ceil(visualFrameCount * 0.6))) {
+        reject('repeated visual guide title or watermark'); continue;
+      }
       const deliberateScreenLabel = support.some(isPinned) || support.some(isListItem);
       const mapAreaLabel = visualAreaGuide && isAreaCandidate(place) && support.some(isScreenText);
       canPromoteRole = deliberateScreenLabel || mapAreaLabel;

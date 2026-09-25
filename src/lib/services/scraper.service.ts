@@ -48,8 +48,14 @@ export class ScraperService {
           url: text(track?.downloadLink) || text(track?.tiktokLink),
         }))
         .filter((track: SubtitleTrack) => /^https:\/\//i.test(track.url));
+      // TikTok's own location tag ("London Bridge", "London EC4R 3TN, UK").
+      // It was dropped before, so TikTok posts never had a location tag.
+      const meta = raw.locationMeta || {};
+      const tiktokLocation = text(meta.locationName) || text(meta.city);
       return {
-        locationTag: null,
+        locationTag: tiktokLocation
+          ? { name: tiktokLocation, id: meta.locationId != null ? String(meta.locationId) : null, address: text(meta.address) || null }
+          : null,
         comments: [],
         altTexts: [],
         creatorBio: text(raw.authorMeta?.signature),

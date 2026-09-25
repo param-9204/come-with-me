@@ -412,7 +412,9 @@ export class PipelineLog {
     const { error: runError } = await supabaseAdmin.from('extraction_runs').upsert({
       id: this.pipelineRunId,
       external_run_id: this.runId,
-      social_post_id: socialPostId,
+      // Only when known: a request that does not know the post must not
+      // clear the id an earlier or parallel request of the same run saved.
+      ...(socialPostId ? { social_post_id: socialPostId } : {}),
       platform: this.input.platform || this.context.platform || null,
       input_url: this.input.inputUrl || this.context.url || null,
       entrypoint: this.input.entrypoint || this.context.route || null,
@@ -518,6 +520,27 @@ export class PipelineLog {
       }));
       const { error } = await supabaseAdmin.from('extraction_place_candidates').upsert(rows, { onConflict: 'run_id,candidate_key' });
       if (error) throw error;
+    }
+
+    if (typeof socialPostId === 'string' && socialPostId) await this.linkEarlierRows(socialPostId);
+  }
+
+  /**
+   * One pipeline run spans several requests (scrape start and polls, media:
+   * frames, OCR, vision, transcript; then analysis). The social post row is
+   * created only during analysis, so the earlier requests wrote their audit
+   * rows with no post id. The first request that knows the post links every
+   * row of the same run that is still unlinked. A failure here is reported
+   * but does not pause audit logging, since this request's rows are saved.
+   */
+  private async linkEarlierRows(socialPostId: string): Promise<void> {
+    for (const table of ['extraction_run_events', 'extraction_stage_runs', 'extraction_evidence', 'extraction_place_candidates']) {
+      const { error } = await supabaseAdmin
+        .from(table)
+        .update({ social_post_id: socialPostId })
+        .eq('run_id', this.pipelineRunId)
+        .is('social_post_id', null);
+      if (error) console.warn(`[pipeline-log] Could not link earlier ${table} rows to the social post:`, error.message);
     }
   }
 }

@@ -13,6 +13,8 @@ export interface MapboxFeature {
   locality: string | null;
   neighborhood: string | null;
   countryCode: string | null;
+  /** [minLng, minLat, maxLng, maxLat]; present on places (cities) from Geocoding v6. */
+  bbox?: [number, number, number, number] | null;
 }
 
 interface SearchOptions {
@@ -20,6 +22,8 @@ interface SearchOptions {
   proximity?: [number, number] | null;
   /** ISO 3166-1 alpha-2, lower-case. */
   country?: string | null;
+  /** [minLng, minLat, maxLng, maxLat]: only results inside this box. */
+  bbox?: [number, number, number, number] | null;
   limit?: number;
 }
 
@@ -50,6 +54,9 @@ function parseFeature(feature: any): MapboxFeature | null {
     locality: contextName(context, 'locality'),
     neighborhood: contextName(context, 'neighborhood'),
     countryCode: typeof context.country?.country_code === 'string' ? context.country.country_code.toUpperCase() : null,
+    bbox: Array.isArray(properties.bbox) && properties.bbox.length === 4 && properties.bbox.every(Number.isFinite)
+      ? properties.bbox as [number, number, number, number]
+      : null,
   };
 }
 
@@ -108,6 +115,7 @@ export class MapboxService {
       limit: String(options.limit ?? 10),
       ...(options.proximity ? { proximity: `${options.proximity[0]},${options.proximity[1]}` } : {}),
       ...(options.country ? { country: options.country.toLowerCase() } : {}),
+      ...(options.bbox ? { bbox: options.bbox.join(',') } : {}),
     };
   }
 
@@ -119,5 +127,24 @@ export class MapboxService {
   /** Cities, neighbourhoods or street addresses via Geocoding v6. */
   static geocode(query: string, types: 'place' | 'neighborhood' | 'address', options: SearchOptions = {}): Promise<MapboxFeature[]> {
     return this.request(GEOCODING_V6_URL, { q: query.slice(0, 256), types, ...this.baseParams({ limit: 5, ...options }) });
+  }
+
+  /**
+   * Neighbourhoods, districts and towns via Geocoding v6, searched by name
+   * only; pass the city centre as `proximity`. Adding the city to the text
+   * made Mapbox match the city words instead (measured on 2026-09-25:
+   * "Greenwhich Vilage, New York" returned "New York Avenue, Trenton").
+   */
+  static geocodeArea(query: string, options: SearchOptions = {}): Promise<MapboxFeature[]> {
+    return this.request(GEOCODING_V6_URL, { q: query.slice(0, 256), types: 'neighborhood,locality,place', ...this.baseParams({ limit: 5, ...options }) });
+  }
+
+  /**
+   * Streets via Geocoding v6, by name only. The business search returns
+   * businesses and stops named after a street instead ("Canal Street" → a
+   * Staten Island bus stop, "Bleecker Street" → Bleecker Street Pizza).
+   */
+  static geocodeStreet(query: string, options: SearchOptions = {}): Promise<MapboxFeature[]> {
+    return this.request(GEOCODING_V6_URL, { q: query.slice(0, 256), types: 'street', ...this.baseParams({ limit: 5, ...options }) });
   }
 }

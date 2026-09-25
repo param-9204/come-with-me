@@ -115,6 +115,8 @@ export interface ApifyTikTokPost {
 export interface SocialLocationTag {
   name: string;
   id: string | null;
+  /** Postal address the platform attaches to the tag (TikTok `locationMeta.address`), when present. */
+  address?: string | null;
 }
 
 export interface SocialComment {
@@ -549,6 +551,12 @@ export interface PlaceExtraction {
   evidence_snippets?: Array<{ id: string; source: EvidenceSource; text: string; timestamps?: number[] }>;
   /** Maps search text for indirect mentions (words taken from evidence only). */
   search_query?: string;
+  /**
+   * The place's name as the city's own maps write it, when the post uses
+   * another language ("Statue of Liberty" for "Statua della Libertà").
+   * Used only as map search text; `name` stays as written in the post.
+   */
+  map_name?: string;
   google_place_id?: string | null;
 }
 

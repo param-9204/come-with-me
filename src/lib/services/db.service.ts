@@ -176,10 +176,11 @@ export class DbService {
       if (!verified || hasInvalidStoredAddress) {
         try {
           const coords = await LocationService.geocodePlace(
-            placeData.name,
+            placeData.map_name || placeData.name,
             existing.city || placeData.city || '',
             suppliedAddress || storedAddress,
-            placeData.neighborhood || existing.neighborhood || ''
+            placeData.neighborhood || existing.neighborhood || '',
+            { kind: LocationService.kindForCategory(placeData.base_category || placeData.category) }
           );
 
           if (coords.lat !== null && coords.lng !== null) {
@@ -236,10 +237,11 @@ export class DbService {
 
     try {
       let coords = await LocationService.geocodePlace(
-        placeData.name,
+        placeData.map_name || placeData.name,
         city || '',
         address,
-        neighborhood
+        neighborhood,
+        { kind: LocationService.kindForCategory(placeData.base_category || placeData.category) }
       );
       // A fuzzy name match of a different kind of venue is the wrong entity
       // (e.g. poster text "La Dolce Vita" → a shoe store called "Dolce Vita").
@@ -248,7 +250,7 @@ export class DbService {
       // name. Category disagreement must only reject a fuzzy identity match;
       // otherwise it discards valid coordinates after the geocoder succeeded.
       const strongIdentity = coords.identity === 'exact_name' || coords.identity === 'source_address'
-        || (!!coords.matchedName && LocationService.nameSimilarity(placeData.name, coords.matchedName) === 1);
+        || (!!coords.matchedName && LocationService.nameSimilarity(placeData.map_name || placeData.name, coords.matchedName) === 1);
       const conflict = coords.lat !== null && !strongIdentity
         ? googleTypeConflict(placeData.base_category || (placeData.category as PlaceCategory), coords.primaryType, coords.types)
         : null;
@@ -397,7 +399,11 @@ export class DbService {
 
     // Google's listing gives the canonical spelling ("LUCALI" → "Lucali",
     // "Joes Pizza" → "Joe's Pizza") — used only when it is the same name.
-    const displayName = geocode?.matchedName && LocationService.nameSimilarity(placeData.name, geocode.matchedName) === 1
+    // An OCR misspelling or abbreviation matched to a listing ("Greenwhich
+    // Vilage" → "Greenwich Village", "LES" → "Lower East Side") is saved
+    // under the provider's correct spelling.
+    const displayName = geocode?.matchedName &&
+      (geocode.spellingCorrected || LocationService.nameSimilarity(placeData.map_name || placeData.name, geocode.matchedName) === 1)
       ? geocode.matchedName
       : placeData.name.trim();
 
