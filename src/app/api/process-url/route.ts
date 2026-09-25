@@ -427,6 +427,15 @@ export async function POST(request: Request) {
       if (!finalUserId) {
         return NextResponse.json({ success: false, error: 'A valid clerk_user_id is required for mobile processing' }, { status: 400 });
       }
+      // A queued row cannot advance without the protected worker credential.
+      // Fail before creating a pending social post, so a deployment mistake is
+      // visible to mobile instead of leaving jobs stuck at "queued" forever.
+      if (!process.env.URL_JOB_WORKER_SECRET) {
+        return NextResponse.json({
+          success: false,
+          error: 'URL processing worker is not configured. Set URL_JOB_WORKER_SECRET on this server, then retry.',
+        }, { status: 503 });
+      }
       const claimed = await claimSocialPostForMobileJob(cleanUrl, platform, canonicalSourceKey, finalUserId);
       const status = jobStatusForPost(claimed.post, claimed.created);
       const [job] = await UrlProcessingJobsService.createJobs(finalUserId, [{
