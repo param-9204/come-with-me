@@ -1,4 +1,4 @@
-import { NextResponse } from 'next/server';
+import { after, NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
 import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { DbService } from '@/lib/services/db.service';
@@ -9,8 +9,86 @@ import { ScraperService } from '@/lib/services/scraper.service';
 import type { SocialContent } from '@/lib/types/social';
 import { v4 as uuidv4 } from 'uuid';
 import { resolveCanonicalSocialSource } from '@/lib/social-source';
+import { UrlProcessingJobsService, type UrlProcessingJobStatus } from '@/lib/services/url-processing-jobs.service';
 
 export const maxDuration = 300;
+
+function isUrlJobWorkerRequest(request: Request): boolean {
+  const secret = process.env.URL_JOB_WORKER_SECRET;
+  return Boolean(secret) && (
+    request.headers.get('x-url-job-worker') === secret ||
+    request.headers.get('authorization') === `Bearer ${secret}`
+  );
+}
+
+function originFor(request: Request): string {
+  let origin = new URL(request.url).origin;
+  if (origin.includes('localhost') || origin.includes('127.0.0.1')) origin = origin.replace('https://', 'http://');
+  return origin;
+}
+
+/** Claim the shared post before creating the user's job/access row. */
+async function claimSocialPostForMobileJob(
+  cleanUrl: string,
+  platform: 'instagram' | 'tiktok',
+  canonicalSourceKey: string,
+  userId: string,
+): Promise<{ post: any; created: boolean }> {
+  const supportsCanonicalIdentity = await DbService.supportsColumns(
+    'social_posts',
+    'canonical_source_key, merged_into_post_id'
+  );
+  const cleanUrlNoSlash = cleanUrl.endsWith('/') ? cleanUrl.slice(0, -1) : cleanUrl;
+  const cleanUrlWithSlash = `${cleanUrlNoSlash}/`;
+  let existingQuery = supabaseAdmin.from('social_posts').select('*');
+  existingQuery = supportsCanonicalIdentity
+    ? existingQuery.eq('platform', platform).eq('canonical_source_key', canonicalSourceKey).is('merged_into_post_id', null)
+    : existingQuery.in('post_url', [cleanUrlNoSlash, cleanUrlWithSlash]);
+  const { data: existingPosts, error: existingError } = await existingQuery.order('created_at', { ascending: false });
+  if (existingError) throw new Error(`Unable to read social post: ${existingError.message}`);
+  const existing = existingPosts?.find((post) => post.status === 'completed') || existingPosts?.[0];
+  if (existing) return { post: existing, created: false };
+
+  const contentId = `pending_${uuidv4()}`;
+  if (supportsCanonicalIdentity) {
+    const { data: inserted, error } = await supabaseAdmin
+      .from('social_posts')
+      .upsert({
+        post_url: cleanUrl,
+        canonical_source_key: canonicalSourceKey,
+        status: 'pending',
+        platform,
+        content_id: contentId,
+        user_id: userId,
+      }, { onConflict: 'platform,canonical_source_key', ignoreDuplicates: true })
+      .select('*');
+    if (error) throw new Error(`Failed to claim database placeholder: ${error.message}`);
+    if (inserted?.[0]) return { post: inserted[0], created: true };
+    const { data: claimed, error: claimedError } = await supabaseAdmin
+      .from('social_posts')
+      .select('*')
+      .eq('platform', platform)
+      .eq('canonical_source_key', canonicalSourceKey)
+      .is('merged_into_post_id', null)
+      .single();
+    if (claimedError || !claimed) throw new Error('Failed to read claimed database placeholder');
+    return { post: claimed, created: false };
+  }
+
+  const { data: inserted, error } = await supabaseAdmin
+    .from('social_posts')
+    .insert({ post_url: cleanUrl, status: 'pending', platform, content_id: contentId, user_id: userId })
+    .select('*')
+    .single();
+  if (error || !inserted) throw new Error(`Failed to create database placeholder: ${error?.message || 'missing post'}`);
+  return { post: inserted, created: true };
+}
+
+function jobStatusForPost(post: any, created: boolean): UrlProcessingJobStatus {
+  if (post.status === 'completed') return 'completed';
+  if (created || post.status === 'failed') return 'queued';
+  return 'waiting';
+}
 
 function processingResponse(post: any) {
   return NextResponse.json({
@@ -299,17 +377,27 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
 export async function POST(request: Request) {
   try {
     // 1. Optionally resolve user ID — process-url is PUBLIC (no auth required).
-    //    If the client sends a Clerk Bearer token, middleware header, or userId in
-    //    the body, capture it so we can attribute the post to that user.
+    //    Mobile sends clerk_user_id; a verified Clerk token can provide it instead.
     const authUser = await getAuthUser(request);
     const headerUserId = request.headers.get('x-user-id');
     const body = await request.json();
-    const { url, userId: bodyUserId } = body;
+    const {
+      url,
+      clerk_user_id: bodyClerkUserId,
+      clerkUserId: bodyClerkUserIdCamel,
+      // The internal worker passes the resolved profile UUID; mobile does not.
+      userId: bodyUserId,
+    } = body;
+    const clerkUserId = typeof bodyClerkUserId === 'string'
+      ? bodyClerkUserId
+      : typeof bodyClerkUserIdCamel === 'string'
+        ? bodyClerkUserIdCamel
+        : null;
 
-    // Resolve profile identity against public.profiles to guarantee valid profile UUID
+    // First resolves profiles.clerk_user_id, then returns the internal profile UUID.
     const finalUserId = await resolveProfileId({
-      clerkId: authUser?.clerkId,
-      userIdInput: headerUserId || bodyUserId || authUser?.id,
+      clerkId: authUser?.clerkId || clerkUserId,
+      userIdInput: headerUserId || clerkUserId || bodyUserId || authUser?.id,
       email: authUser?.email,
     });
     console.log('[process-url] profile user_id resolved:', finalUserId ?? '(anonymous)');
@@ -329,9 +417,52 @@ export async function POST(request: Request) {
     }
     const { cleanUrl, platform, key: canonicalSourceKey } = source;
 
-    let origin = new URL(request.url).origin;
-    if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
-      origin = origin.replace('https://', 'http://');
+    const origin = originFor(request);
+    const isWorker = isUrlJobWorkerRequest(request);
+
+    // Mobile submits only { url, clerk_user_id }. Claim the one shared social post
+    // first, then add one user-specific access/job row. The UUID generated by
+    // social_post_accesses is returned as jobId immediately.
+    if (!isWorker) {
+      if (!finalUserId) {
+        return NextResponse.json({ success: false, error: 'A valid clerk_user_id is required for mobile processing' }, { status: 400 });
+      }
+      const claimed = await claimSocialPostForMobileJob(cleanUrl, platform, canonicalSourceKey, finalUserId);
+      const status = jobStatusForPost(claimed.post, claimed.created);
+      const [job] = await UrlProcessingJobsService.createJobs(finalUserId, [{
+        source_url: cleanUrl,
+        canonical_source_key: canonicalSourceKey,
+        platform,
+        social_post_id: claimed.post.id,
+        status,
+        result: status === 'completed'
+          ? { socialPostId: claimed.post.id, socialPostStatus: 'completed' }
+          : null,
+      }]);
+
+      const workerScheduled = status === 'queued' && Boolean(process.env.URL_JOB_WORKER_SECRET);
+      if (workerScheduled) {
+        const workerId = `submit-${uuidv4()}`;
+        after(async () => {
+          try {
+            await UrlProcessingJobsService.drain(origin, workerId, 2);
+          } catch (error) {
+            console.error('[process-url] immediate mobile job drain failed:', error);
+          }
+        });
+      }
+      return NextResponse.json({
+        success: true,
+        jobId: job.id,
+        socialPostId: claimed.post.id,
+        status: job.status,
+        workerScheduled,
+        warning: workerScheduled || status === 'completed'
+          ? null
+          : status === 'waiting'
+            ? 'This URL is already being processed; this job will complete when the shared post completes.'
+            : 'Job is queued, but URL_JOB_WORKER_SECRET must be configured before a worker can process it.',
+      }, { status: 202 });
     }
 
     const supportsCanonicalIdentity = await DbService.supportsColumns(
@@ -459,7 +590,9 @@ export async function POST(request: Request) {
           // The cache returns normally on every later request once recovery succeeds.
         }
       } else {
-        await DbService.recordSocialPostAccess(existingPost.id, finalUserId, canonicalSourceKey, cleanUrl, 'cache_hit');
+        if (!isWorker) {
+          await DbService.recordSocialPostAccess(existingPost.id, finalUserId, canonicalSourceKey, cleanUrl, 'cache_hit');
+        }
         return NextResponse.json({
           success: true,
           partial: Boolean(partialError),
@@ -482,7 +615,7 @@ export async function POST(request: Request) {
 
     // Never run the same pending post twice. The caller can poll GET with the
     // returned socialPostId until the first request reaches completed/failed.
-    if (existingPost && ['pending', 'scraping', 'processing'].includes(existingPost.status)) {
+    if (existingPost && ['pending', 'scraping', 'processing'].includes(existingPost.status) && !isWorker) {
       await DbService.recordSocialPostAccess(existingPost.id, finalUserId, canonicalSourceKey, cleanUrl, 'joined_processing');
       return processingResponse(existingPost);
     }
@@ -516,7 +649,7 @@ export async function POST(request: Request) {
           .is('merged_into_post_id', null)
           .single()).data;
         if (!socialPost) throw new Error('Failed to claim database placeholder');
-        if (!inserted?.length && socialPost.status !== 'failed') {
+        if (!inserted?.length && socialPost.status !== 'failed' && !isWorker) {
           await DbService.recordSocialPostAccess(socialPost.id, finalUserId, canonicalSourceKey, cleanUrl, 'joined_processing');
           return processingResponse(socialPost);
         }
@@ -538,13 +671,15 @@ export async function POST(request: Request) {
       }
     }
 
-    await DbService.recordSocialPostAccess(
-      socialPostId,
-      finalUserId,
-      canonicalSourceKey,
-      cleanUrl,
-      existingPost?.status === 'failed' ? 'retry' : 'started'
-    );
+    if (!isWorker) {
+      await DbService.recordSocialPostAccess(
+        socialPostId,
+        finalUserId,
+        canonicalSourceKey,
+        cleanUrl,
+        existingPost?.status === 'failed' ? 'retry' : 'started'
+      );
+    }
 
     // Execute the pipeline synchronously and await completion
     const { finalPostId, analyzeData } = await runSynchronousPipeline(origin, cleanUrl, socialPostId, finalUserId || undefined);

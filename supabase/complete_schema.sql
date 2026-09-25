@@ -98,7 +98,6 @@ CREATE TABLE IF NOT EXISTS public.social_post_accesses (
   platform text CHECK (platform IS NULL OR platform IN ('instagram', 'tiktok')),
   -- started/retry/joined/cache_hit are audit rows; job rows are mobile jobs.
   event text NOT NULL CHECK (event IN ('started', 'retry', 'joined_processing', 'cache_hit', 'job')),
-  client_request_id text,
   status text CHECK (status IS NULL OR status IN ('queued', 'processing', 'waiting', 'completed', 'failed')),
   attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
   max_attempts integer NOT NULL DEFAULT 3 CHECK (max_attempts BETWEEN 1 AND 5),
@@ -111,14 +110,12 @@ CREATE TABLE IF NOT EXISTS public.social_post_accesses (
   updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK (
     event <> 'job'
-    OR (user_id IS NOT NULL AND client_request_id IS NOT NULL AND platform IS NOT NULL AND status IS NOT NULL)
+    OR (user_id IS NOT NULL AND platform IS NOT NULL AND status IS NOT NULL)
   )
 );
 CREATE INDEX IF NOT EXISTS idx_social_post_accesses_post_time ON public.social_post_accesses (social_post_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_social_post_accesses_user_time ON public.social_post_accesses (user_id, created_at DESC) WHERE user_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_social_post_accesses_source_time ON public.social_post_accesses (canonical_source_key, created_at DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_social_post_accesses_user_client_request
-  ON public.social_post_accesses (user_id, client_request_id) WHERE event = 'job';
 CREATE INDEX IF NOT EXISTS idx_social_post_accesses_ready_jobs
   ON public.social_post_accesses (run_after, created_at) WHERE event = 'job' AND status = 'queued';
 CREATE INDEX IF NOT EXISTS idx_social_post_accesses_job_user_time

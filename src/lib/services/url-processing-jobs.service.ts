@@ -9,7 +9,6 @@ export type UrlProcessingJob = {
   canonical_source_key: string;
   platform: 'instagram' | 'tiktok';
   social_post_id: string | null;
-  client_request_id: string;
   status: UrlProcessingJobStatus;
   attempt_count: number;
   max_attempts: number;
@@ -22,9 +21,12 @@ export type UrlProcessingJob = {
   updated_at: string;
 };
 
-type CreateJobInput = Pick<UrlProcessingJob, 'source_url' | 'canonical_source_key' | 'platform' | 'client_request_id'>;
+type CreateJobInput = Pick<UrlProcessingJob, 'source_url' | 'canonical_source_key' | 'platform' | 'social_post_id'> & {
+  status?: UrlProcessingJobStatus;
+  result?: Record<string, unknown> | null;
+};
 
-const JOB_COLUMNS = 'id, user_id, source_url, canonical_source_key, platform, social_post_id, client_request_id, status, attempt_count, max_attempts, run_after, locked_at, locked_by, last_error, result, created_at, updated_at';
+const JOB_COLUMNS = 'id, user_id, source_url, canonical_source_key, platform, social_post_id, status, attempt_count, max_attempts, run_after, locked_at, locked_by, last_error, result, created_at, updated_at';
 
 function errorMessage(value: unknown): string {
   return value instanceof Error ? value.message : String(value || 'Processing failed');
@@ -38,30 +40,14 @@ function retryAt(attempt: number): string {
 export class UrlProcessingJobsService {
   static async createJobs(userId: string, inputs: CreateJobInput[]): Promise<UrlProcessingJob[]> {
     return Promise.all(inputs.map(async (input) => {
+      const { status = 'queued', result = null, ...job } = input;
       const { data: created, error } = await supabaseAdmin
         .from('social_post_accesses')
-        .insert({ ...input, user_id: userId, event: 'job', status: 'queued' })
+        .insert({ ...job, user_id: userId, event: 'job', status, result })
         .select(JOB_COLUMNS)
         .single();
       if (!error && created) return created as UrlProcessingJob;
-      if (error?.code !== '23505') {
-        throw new Error(`Unable to create processing job: ${error?.message || 'missing job'}`);
-      }
-
-      const { data: existing, error: existingError } = await supabaseAdmin
-        .from('social_post_accesses')
-        .select(JOB_COLUMNS)
-        .eq('user_id', userId)
-        .eq('event', 'job')
-        .eq('client_request_id', input.client_request_id)
-        .single();
-      if (existingError || !existing) {
-        throw new Error(`Unable to read idempotent processing job: ${existingError?.message || 'missing job'}`);
-      }
-      if (existing.source_url !== input.source_url || existing.canonical_source_key !== input.canonical_source_key) {
-        throw new Error('clientRequestId was already used for a different URL');
-      }
-      return existing as UrlProcessingJob;
+      throw new Error(`Unable to create processing job: ${error?.message || 'missing job'}`);
     }));
   }
 
@@ -71,6 +57,18 @@ export class UrlProcessingJobsService {
       .select(JOB_COLUMNS)
       .eq('id', id)
       .eq('user_id', userId)
+      .eq('event', 'job')
+      .maybeSingle();
+    if (error) throw new Error(`Unable to read processing job: ${error.message}`);
+    return data as UrlProcessingJob | null;
+  }
+
+  /** Mobile job IDs are random server-generated UUIDs and act as the polling capability. */
+  static async getJob(id: string): Promise<UrlProcessingJob | null> {
+    const { data, error } = await supabaseAdmin
+      .from('social_post_accesses')
+      .select(JOB_COLUMNS)
+      .eq('id', id)
       .eq('event', 'job')
       .maybeSingle();
     if (error) throw new Error(`Unable to read processing job: ${error.message}`);

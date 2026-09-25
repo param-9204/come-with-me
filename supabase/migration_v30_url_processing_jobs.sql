@@ -7,7 +7,6 @@ BEGIN;
 ALTER TABLE public.social_post_accesses
   ALTER COLUMN social_post_id DROP NOT NULL,
   ADD COLUMN IF NOT EXISTS platform text,
-  ADD COLUMN IF NOT EXISTS client_request_id text,
   ADD COLUMN IF NOT EXISTS status text,
   ADD COLUMN IF NOT EXISTS attempt_count integer NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS max_attempts integer NOT NULL DEFAULT 3,
@@ -33,14 +32,9 @@ ALTER TABLE public.social_post_accesses
   ADD CONSTRAINT social_post_accesses_job_shape_check
     CHECK (
       event <> 'job'
-      OR (user_id IS NOT NULL AND client_request_id IS NOT NULL AND platform IS NOT NULL AND status IS NOT NULL)
+      OR (user_id IS NOT NULL AND platform IS NOT NULL AND status IS NOT NULL)
     );
 
--- A client retry reuses its job row. Normal access-event rows keep a NULL
--- client_request_id and are not affected by this partial unique index.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_social_post_accesses_user_client_request
-  ON public.social_post_accesses (user_id, client_request_id)
-  WHERE event = 'job';
 CREATE INDEX IF NOT EXISTS idx_social_post_accesses_ready_jobs
   ON public.social_post_accesses (run_after, created_at)
   WHERE event = 'job' AND status = 'queued';

@@ -9,7 +9,7 @@ export const maxDuration = 300;
 
 const MAX_BATCH_SIZE = 20;
 
-type RequestedJob = { url?: unknown; clientRequestId?: unknown };
+type RequestedJob = { url?: unknown };
 
 function originFor(request: Request): string {
   let origin = new URL(request.url).origin;
@@ -25,7 +25,7 @@ async function authenticatedProfileId(request: Request): Promise<string | null> 
 
 /**
  * POST /api/url-jobs
- * Body: { jobs: [{ url, clientRequestId }], userId?: ignored }
+ * Body: { jobs: [{ url }], userId?: ignored }
  * Returns immediately. The supplied userId is never trusted; identity comes
  * from the verified mobile Bearer token or web session.
  */
@@ -40,17 +40,11 @@ export async function POST(request: Request) {
       return NextResponse.json({ success: false, error: `jobs must contain 1 to ${MAX_BATCH_SIZE} URLs` }, { status: 400 });
     }
 
-    const requestIds = new Set<string>();
     const prepared = requested.map((job: RequestedJob, index: number) => {
-      if (!job || typeof job.url !== 'string' || typeof job.clientRequestId !== 'string' || !job.clientRequestId.trim()) {
-        throw new Error(`jobs[${index}] requires url and clientRequestId`);
+      if (!job || typeof job.url !== 'string' || !job.url.trim()) {
+        throw new Error(`jobs[${index}] requires url`);
       }
-      const clientRequestId = job.clientRequestId.trim();
-      if (clientRequestId.length > 128 || requestIds.has(clientRequestId)) {
-        throw new Error(`jobs[${index}] has a duplicate or invalid clientRequestId`);
-      }
-      requestIds.add(clientRequestId);
-      return { url: job.url, clientRequestId };
+      return { url: job.url };
     });
     const validated = await Promise.all(prepared.map(async (job) => {
       const source = await resolveCanonicalSocialSource(job.url);
@@ -58,7 +52,7 @@ export async function POST(request: Request) {
         source_url: source.cleanUrl,
         canonical_source_key: source.key,
         platform: source.platform,
-        client_request_id: job.clientRequestId,
+        social_post_id: null,
       };
     }));
 
@@ -84,7 +78,6 @@ export async function POST(request: Request) {
         id: job.id,
         sourceUrl: job.source_url,
         status: job.status,
-        clientRequestId: job.client_request_id,
       })),
     }, { status: 202 });
   } catch (error: any) {
