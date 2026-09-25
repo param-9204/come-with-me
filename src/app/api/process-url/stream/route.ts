@@ -4,6 +4,10 @@ import { v4 as uuidv4 } from 'uuid';
 import { after } from 'next/server';
 import { ScraperService } from '@/lib/services/scraper.service';
 import { DbService } from '@/lib/services/db.service';
+import { PipelineLog, recordPipelineOperation, withPipelineLog } from '@/lib/services/pipeline-log';
+
+// The background pipeline runs in `after()` within this invocation.
+export const maxDuration = 300;
 
 async function runBackgroundPipeline(
   origin: string,
@@ -11,262 +15,41 @@ async function runBackgroundPipeline(
   socialPostId: string,
   userId: string | null,
   contentData: any,
-  rawApifyDataObj: any
+  rawApifyDataObj: any,
+  pipelineRunId: string,
+  pipelineStartedAt: string,
 ) {
   console.log(`[Background Pipeline] Starting for: ${cleanUrl} (ID: ${socialPostId})`);
   let currentStage = 'media';
   try {
-    const contentType: string = contentData.contentType || 'reel';
-    const isVideo = !!contentData.videoUrl && (contentType === 'video' || contentType === 'reel');
-    const isCarousel =
-      contentType === 'sidecar' ||
-      (Array.isArray(contentData.images) && contentData.images.length > 1);
-
-    let whisperTranscript = '';
-    let audioUploadObj: any = null;
-    let ocrResultsList: any[] = [];
-
-    // ── BRANCH A: Video / Reel — download video ONCE, share between OCR + Whisper ──
-    if (isVideo && contentData.videoUrl) {
-      const { MediaService } = await import('@/lib/services/media.service');
-      const { VideoFrameService } = await import('@/lib/services/video-frame.service');
-      const { ApifyOcrService } = await import('@/lib/services/apify-ocr.service');
-      const { WhisperService } = await import('@/lib/services/whisper.service');
-      const { S3Service } = await import('@/lib/services/s3.service');
-      const fs = await import('fs');
-      const path = await import('path');
-
-      const duration = contentData.videoDuration || 15;
-      const maxFrames = Math.max(1, Math.round(duration));
-
-      console.log(`[Background Pipeline] Downloading video once (duration=${duration}s, maxFrames=${maxFrames})...`);
-      const tempVideoPath = await MediaService.downloadVideo(contentData.videoUrl);
-
-      try {
-        // ── Parallel: extract frames + extract audio from the same /tmp file ──
-        const [frames, tempAudioPath] = await Promise.all([
-          VideoFrameService.extractFrames(tempVideoPath, maxFrames).catch(() => []),
-          MediaService.extractAudio(tempVideoPath).catch(() => null),
-        ]);
-
-        console.log(`[Background Pipeline] Got ${frames.length} frames + audio. Running Tesseract + Whisper in parallel...`);
-
-        // ── Parallel: Tesseract OCR on frames + Whisper on audio ──────────────
-        const [ocrResults, whisperResult] = await Promise.all([
-          ApifyOcrService.extractTextFromFrames(frames, false).catch((err: any) => {
-            console.warn('[Background Pipeline] OCR failed (non-fatal):', err.message);
-            return [];
-          }),
-          tempAudioPath
-            ? WhisperService.processAudio(tempAudioPath).catch((err: any) => {
-              console.warn('[Background Pipeline] Whisper failed (non-fatal):', err.message);
-              return null;
-            })
-            : Promise.resolve(null),
-        ]);
-
-        ocrResultsList = ocrResults.filter(Boolean);
-
-        if (whisperResult) {
-          whisperTranscript = `Original Transcript:\n${whisperResult.originalTranscript}\n\nEnglish Translation:\n${whisperResult.englishTranscript}`;
-        }
-
-        // ── Upload audio to S3, register in DB ────────────────────────────────
-        if (tempAudioPath && fs.default.existsSync(tempAudioPath)) {
-          try {
-            const fileStats = fs.default.statSync(tempAudioPath);
-            const fileName = path.default.basename(tempAudioPath);
-            const audioUuid = uuidv4();
-
-            if (
-              process.env.AWS_ACCESS_KEY_ID &&
-              process.env.AWS_SECRET_ACCESS_KEY &&
-              process.env.AWS_S3_BUCKET_NAME
-            ) {
-              const fileBuffer = fs.default.readFileSync(tempAudioPath);
-              const s3Url = await S3Service.uploadFile(fileBuffer, fileName, 'audio/mpeg', "audios");
-              const { data: dbData } = await supabaseAdmin
-                .from('audio_uploads')
-                .insert({
-                  social_post_id: null,
-                  file_name: fileName,
-                  storage_path: `uploads/${fileName}`,
-                  public_url: s3Url,
-                  mime_type: 'audio/mpeg',
-                  size_bytes: fileStats.size,
-                })
-                .select('id, file_name, size_bytes, public_url')
-                .single();
-              if (dbData) {
-                audioUploadObj = { id: dbData.id, fileName: dbData.file_name, sizeBytes: dbData.size_bytes, publicUrl: dbData.public_url };
-                console.log('[Background Pipeline] Audio → S3 + DB:', dbData.id);
-              }
-            } else {
-              // Local fallback
-              const publicAudioDir = path.default.join(process.cwd(), 'public', 'audio');
-              if (!fs.default.existsSync(publicAudioDir)) fs.default.mkdirSync(publicAudioDir, { recursive: true });
-              const localFileName = `${audioUuid}.mp3`;
-              fs.default.copyFileSync(tempAudioPath, path.default.join(publicAudioDir, localFileName));
-              audioUploadObj = { id: audioUuid, fileName, sizeBytes: fileStats.size, publicUrl: `/audio/${localFileName}` };
-              console.log('[Background Pipeline] Audio saved locally:', audioUploadObj.publicUrl);
-            }
-          } catch (audioErr: any) {
-            console.warn('[Background Pipeline] Audio upload failed (non-fatal):', audioErr.message);
-          }
-        }
-
-        // ── Cleanup frames + audio AFTER both branches finish ─────────────────
-        VideoFrameService.cleanupFrames(frames);
-        MediaService.cleanupFiles(tempAudioPath ? [tempAudioPath] : []);
-      } finally {
-        // Always cleanup the shared video file last
-        MediaService.cleanupFiles([tempVideoPath]);
-      }
-
-      // ── BRANCH B: Carousel / Sidecar — support mixed carousel images + videos ──
-    } else if (isCarousel) {
-      const childPosts = (rawApifyDataObj?.childPosts || []) as any[];
-
-      if (childPosts.length > 0) {
-        console.log(`[Background Pipeline] Mixed Carousel: Processing ${Math.min(childPosts.length, 4)} slides...`);
-        const { MediaService } = await import('@/lib/services/media.service');
-        const { VideoFrameService } = await import('@/lib/services/video-frame.service');
-        const { ApifyOcrService } = await import('@/lib/services/apify-ocr.service');
-        const { WhisperService } = await import('@/lib/services/whisper.service');
-        const fs = await import('fs');
-        const crypto = await import('crypto');
-
-        const slidePromises = childPosts.slice(0, 4).map(async (child, index) => {
-          const isSlideVideo = child.type === 'Video' || !!child.videoUrl;
-
-          if (isSlideVideo && child.videoUrl) {
-            console.log(`[Background Pipeline] Carousel Slide ${index} is Video. Processing...`);
-            const tempVideoPath = await MediaService.downloadVideo(child.videoUrl).catch(() => null);
-            if (!tempVideoPath) return null;
-
-            try {
-              const [frames, tempAudioPath] = await Promise.all([
-                VideoFrameService.extractFrames(tempVideoPath, 2).catch(() => []),
-                MediaService.extractAudio(tempVideoPath).catch(() => null)
-              ]);
-
-              const [ocrResults, whisperResult] = await Promise.all([
-                ApifyOcrService.extractTextFromFrames(frames, false).catch(() => []),
-                tempAudioPath ? WhisperService.processAudio(tempAudioPath).catch(() => null) : Promise.resolve(null)
-              ]);
-
-              VideoFrameService.cleanupFrames(frames);
-              if (tempAudioPath) MediaService.cleanupFiles([tempAudioPath]);
-
-              return {
-                type: 'video',
-                ocr: ocrResults.filter(Boolean),
-                transcript: whisperResult ? `Slide ${index} Transcript:\n${whisperResult.originalTranscript}\n` : ''
-              };
-            } catch (err: any) {
-              console.warn(`[Background Pipeline] Carousel slide ${index} video processing failed:`, err.message);
-              return null;
-            } finally {
-              MediaService.cleanupFiles([tempVideoPath]);
-            }
-          } else {
-            const imgUrl = child.displayUrl || child.url;
-            if (imgUrl) {
-              console.log(`[Background Pipeline] Carousel Slide ${index} is Image. Processing...`);
-              try {
-                const filePath = await MediaService.downloadImage(imgUrl);
-                const buffer = fs.default.readFileSync(filePath);
-                const hash = crypto.default.createHash('md5').update(buffer).digest('hex');
-                const frames = [{ frameIndex: index, timestamp: 0, filePath, hash }];
-
-                const ocrResults = await ApifyOcrService.extractTextFromFrames(frames as any, false).catch(() => []);
-                MediaService.cleanupFiles([filePath]);
-
-                return {
-                  type: 'image',
-                  ocr: ocrResults.filter(Boolean),
-                  transcript: ''
-                };
-              } catch (err: any) {
-                console.warn(`[Background Pipeline] Carousel slide ${index} image processing failed:`, err.message);
-                return null;
-              }
-            }
-          }
-          return null;
-        });
-
-        const slideResults = (await Promise.all(slidePromises)).filter(Boolean);
-
-        const ocrCombined: any[] = [];
-        let mergedTranscript = '';
-        for (const res of slideResults) {
-          if (res) {
-            ocrCombined.push(...res.ocr);
-            if (res.transcript) {
-              mergedTranscript += res.transcript + '\n';
-            }
-          }
-        }
-        ocrResultsList = ocrCombined;
-        whisperTranscript = mergedTranscript.trim();
-      } else {
-        const imageUrls: string[] =
-          Array.isArray(contentData.images) && contentData.images.length > 0
-            ? contentData.images
-            : [contentData.displayUrl].filter(Boolean) as string[];
-
-        if (imageUrls.length > 0) {
-          try {
-            const { MediaService } = await import('@/lib/services/media.service');
-            const { ApifyOcrService } = await import('@/lib/services/apify-ocr.service');
-            const fs = await import('fs');
-            const crypto = await import('crypto');
-
-            console.log(`[Background Pipeline] Carousel fallback: OCR on ${Math.min(imageUrls.length, 6)} images...`);
-
-            const frames: { frameIndex: number; timestamp: number; filePath: string; hash: string }[] =
-              await Promise.all(
-                imageUrls.slice(0, 6).map(async (imageUrl: string, index: number) => {
-                  const filePath = await MediaService.downloadImage(imageUrl);
-                  const buffer = fs.default.readFileSync(filePath);
-                  const hash = crypto.default.createHash('md5').update(buffer).digest('hex');
-                  return { frameIndex: index, timestamp: 0, filePath, hash };
-                })
-              );
-
-            const ocrResults = await ApifyOcrService.extractTextFromFrames(frames as any, false).catch(() => []);
-            ocrResultsList = ocrResults.filter(Boolean);
-            MediaService.cleanupFiles(frames.map((f) => f.filePath));
-          } catch (err: any) {
-            console.warn('[Background Pipeline] Carousel OCR failed (non-fatal):', err.message);
-          }
-        }
-      }
-
-      // ── BRANCH C: Single Image Post ────────────────────────────────────────────
-    } else {
-      const imageUrl = contentData.displayUrl || contentData.videoUrl;
-      if (imageUrl) {
-        try {
-          const { MediaService } = await import('@/lib/services/media.service');
-          const { ApifyOcrService } = await import('@/lib/services/apify-ocr.service');
-          const fs = await import('fs');
-          const crypto = await import('crypto');
-
-          console.log(`[Background Pipeline] Single image: OCR...`);
-          const filePath = await MediaService.downloadImage(imageUrl);
-          const buffer = fs.default.readFileSync(filePath);
-          const hash = crypto.default.createHash('md5').update(buffer).digest('hex');
-          const frames = [{ frameIndex: 0, timestamp: 0, filePath, hash }];
-
-          const ocrResults = await ApifyOcrService.extractTextFromFrames(frames as any, false).catch(() => []);
-          ocrResultsList = ocrResults.filter(Boolean);
-          MediaService.cleanupFiles([filePath]);
-        } catch (err: any) {
-          console.warn('[Background Pipeline] Single image OCR failed (non-fatal):', err.message);
-        }
-      }
+    // One shared media pipeline (key frames → local OCR → vision fallback on
+    // hard frames; platform subtitles or Whisper). Every stage is non-fatal.
+    const { MediaEvidenceService } = await import('@/lib/services/media-evidence.service');
+    const mediaLog = new PipelineLog(String(contentData?.contentId || socialPostId), {
+      route: 'stream', socialPostId, url: cleanUrl, pipelineRunId, pipelineStartedAt,
+    });
+    mediaLog.setRunInput({
+      platform: contentData.platform,
+      inputUrl: cleanUrl,
+      socialPostId,
+      entrypoint: 'stream',
+      contentId: contentData.contentId,
+      contentType: contentData.contentType,
+      caption: contentData.caption,
+      hashtags: contentData.hashtags,
+      mentions: contentData.mentions,
+      taggedAccounts: contentData.taggedUsers,
+      metadata: { videoDuration: contentData.videoDuration, dimensions: contentData.dimensions },
+    });
+    const media = await withPipelineLog(mediaLog, () => MediaEvidenceService.collect(contentData, rawApifyDataObj));
+    mediaLog.flush();
+    await mediaLog.flushDatabase();
+    const ocrResultsList = media.ocrFrames;
+    const gptVisionResultsList = media.visionFrames;
+    const whisperTranscript = media.transcriptText;
+    const audioUploadObj = media.audioUpload;
+    for (const step of media.steps) {
+      console.log(`[Background Pipeline] ${step.name}: ${step.status} — ${step.details}`);
     }
 
     // ── GPT Analysis & DB Save ─────────────────────────────────────────────────
@@ -283,11 +66,18 @@ async function runBackgroundPipeline(
         content: contentData,
         rawApifyData: rawApifyDataObj,
         transcript: whisperTranscript,
+        transcriptSegments: media.transcript?.segments || [],
+        transcriptSource: media.transcript?.source || 'none',
+        transcriptLanguage: media.transcript?.language || null,
         apifyOcrFrames: ocrResultsList,
+        gptVisionFrames: gptVisionResultsList,
+        processingWarnings: media.warnings,
         url: cleanUrl,
         audioUploadId: audioUploadObj?.id,
         userId,
         socialPostId,
+        pipelineRunId,
+        pipelineStartedAt,
       }),
     });
 
@@ -299,6 +89,17 @@ async function runBackgroundPipeline(
     console.log(`[Background Pipeline] Finished successfully for: ${cleanUrl}`);
   } catch (err: any) {
     console.error(`[Background Pipeline] Critical failure for URL: ${cleanUrl}`, err.message);
+    const failureLog = new PipelineLog(`stream-failure-${socialPostId}`, {
+      route: 'stream', socialPostId, url: cleanUrl, pipelineRunId, pipelineStartedAt,
+    });
+    failureLog.setRunInput({
+      platform: cleanUrl.includes('tiktok.com') ? 'tiktok' : 'instagram',
+      inputUrl: cleanUrl,
+      socialPostId,
+      entrypoint: 'stream',
+    });
+    failureLog.fail(err, { failedStage: currentStage });
+    await failureLog.flushDatabase();
     const errorPayload = {
       failed_stage: currentStage,
       error_code: err.code || `${currentStage.toUpperCase()}_FAILURE`,
@@ -366,6 +167,8 @@ export async function POST(request: Request) {
       };
 
       let socialPostId: string | undefined;
+      const pipelineRunId = uuidv4();
+      const pipelineStartedAt = new Date().toISOString();
 
       try {
         // ── 0. Check for cached completed post ──────────────────────────────
@@ -459,7 +262,33 @@ export async function POST(request: Request) {
         }
         console.log(`[SSE Stream] Initiating scrape with webhookUrl: ${webhookUrl}`);
 
-        await ScraperService.initiateScrape(cleanUrl, webhookUrl, socialPostId);
+        const scrapeLog = new PipelineLog(`stream-scrape-${socialPostId}`, {
+          route: 'stream', socialPostId, url: cleanUrl, pipelineRunId, pipelineStartedAt,
+        });
+        scrapeLog.setRunInput({
+          platform,
+          inputUrl: cleanUrl,
+          socialPostId,
+          entrypoint: 'stream',
+        });
+        const scrapeStartedAt = new Date();
+        try {
+          await withPipelineLog(scrapeLog, async () => {
+            const result = await ScraperService.initiateScrape(cleanUrl, webhookUrl, socialPostId);
+            recordPipelineOperation({
+              stage: 'scrape', operation: 'start_actor_webhook', provider: 'apify', model: result.actorId,
+              startedAt: scrapeStartedAt, finishedAt: new Date(), requestSummary: { webhook: true },
+              resultSummary: { actorRunId: result.runId },
+            });
+            return result;
+          });
+        } catch (error) {
+          scrapeLog.fail(error);
+          throw error;
+        } finally {
+          scrapeLog.flush();
+          await scrapeLog.flushDatabase();
+        }
 
         // ── 4. Poll database status and stream pipeline progression ─────────
         let contentData: any = null;
@@ -526,7 +355,9 @@ export async function POST(request: Request) {
                 socialPostId!,
                 userId || null,
                 contentData,
-                rawApifyDataObj
+                rawApifyDataObj,
+                pipelineRunId,
+                pipelineStartedAt,
               );
               try {
                 after(() => bgPromise);

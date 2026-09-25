@@ -1,7 +1,117 @@
 import { ApifyClient } from 'apify-client';
-import type { SocialContent, ApifyInstagramPost, ApifyTikTokPost } from '../types/social';
+import type {
+  SocialContent, ApifyInstagramPost, ApifyTikTokPost,
+  SocialAccountRef, SocialComment, SocialLocationTag, SubtitleTrack,
+} from '../types/social';
+
+type PlaceSignals = Pick<SocialContent,
+  'locationTag' | 'comments' | 'altTexts' | 'creatorBio' | 'accounts' | 'subtitleTracks' | 'captionLanguage'>;
+
+const MAX_COMMENTS = 20;
+
+function text(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/** Instagram's generated alt text is usually only "Video by X on June 2, 2026." — no place data. */
+function isInformativeAltText(alt: string): boolean {
+  const trivial = alt.match(/^(?:Photo|Video)(?: shared)? by (.+?) on [A-Z][a-z]+ \d{1,2}, \d{4}\.?$/);
+  if (!trivial) return true;
+  // "Photo by X in Paris, France on …" carries a location.
+  return /\sin\s+\p{Lu}/u.test(trivial[1]);
+}
 
 export class ScraperService {
+  /**
+   * Extract every platform field that can identify a place. Field names were
+   * verified against real apify/instagram-scraper and clockworks/tiktok-scraper
+   * output. Pure: safe to run on stored `raw_apify_data`.
+   */
+  static extractPlaceSignals(raw: any, platform: 'instagram' | 'tiktok'): PlaceSignals {
+    if (!raw || typeof raw !== 'object') return {};
+    const accounts: SocialAccountRef[] = [];
+    const addAccount = (username: unknown, fullName: unknown, relation: SocialAccountRef['relation']) => {
+      const handle = text(username).replace(/^@/, '');
+      if (!handle || accounts.some((a) => a.username.toLowerCase() === handle.toLowerCase())) return;
+      accounts.push({ username: handle, fullName: text(fullName), relation });
+    };
+
+    if (platform === 'tiktok') {
+      const owner = text(raw.authorMeta?.name).toLowerCase();
+      for (const mention of Array.isArray(raw.detailedMentions) ? raw.detailedMentions : []) {
+        if (text(mention?.name).toLowerCase() !== owner) addAccount(mention?.name, mention?.nickName, 'mention');
+      }
+      const subtitleTracks: SubtitleTrack[] = (Array.isArray(raw.videoMeta?.subtitleLinks) ? raw.videoMeta.subtitleLinks : [])
+        .map((track: any) => ({
+          language: text(track?.language),
+          source: text(track?.source).toUpperCase(),
+          url: text(track?.downloadLink) || text(track?.tiktokLink),
+        }))
+        .filter((track: SubtitleTrack) => /^https:\/\//i.test(track.url));
+      return {
+        locationTag: null,
+        comments: [],
+        altTexts: [],
+        creatorBio: text(raw.authorMeta?.signature),
+        accounts,
+        subtitleTracks,
+        captionLanguage: text(raw.textLanguage) || null,
+      };
+    }
+
+    const ownerUsername = text(raw.ownerUsername).toLowerCase();
+    const children: any[] = Array.isArray(raw.childPosts) ? raw.childPosts : [];
+
+    for (const post of [raw, ...children]) {
+      for (const user of Array.isArray(post?.taggedUsers) ? post.taggedUsers : []) {
+        if (text(user?.username).toLowerCase() !== ownerUsername) addAccount(user?.username, user?.full_name, 'tagged');
+      }
+    }
+    for (const producer of Array.isArray(raw.coauthorProducers) ? raw.coauthorProducers : []) {
+      if (text(producer?.username).toLowerCase() !== ownerUsername) addAccount(producer?.username, producer?.full_name, 'coauthor');
+    }
+
+    const locationName = text(raw.locationName);
+    const locationTag: SocialLocationTag | null = locationName
+      ? { name: locationName, id: raw.locationId != null ? String(raw.locationId) : null }
+      : null;
+
+    const comments: SocialComment[] = [];
+    const seenComments = new Set<string>();
+    const addComment = (body: unknown, author: unknown, likes: unknown) => {
+      const value = text(body);
+      const key = value.toLowerCase();
+      if (!value || seenComments.has(key)) return;
+      seenComments.add(key);
+      const username = text(author).replace(/^@/, '');
+      comments.push({
+        text: value.slice(0, 500),
+        ownerUsername: username,
+        isCreator: !!username && username.toLowerCase() === ownerUsername,
+        likes: typeof likes === 'number' ? likes : null,
+      });
+    };
+    for (const comment of Array.isArray(raw.latestComments) ? raw.latestComments : []) {
+      addComment(comment?.text, comment?.ownerUsername || comment?.owner?.username, comment?.likesCount);
+    }
+    // `firstComment` is text only; the author is unknown.
+    addComment(raw.firstComment, '', null);
+
+    const altTexts = [...new Set([raw, ...children].map((post) => text(post?.alt)).filter(Boolean))]
+      .filter(isInformativeAltText);
+
+    return {
+      locationTag,
+      comments: comments.slice(0, MAX_COMMENTS),
+      altTexts,
+      creatorBio: '',
+      accounts,
+      subtitleTracks: [],
+      captionLanguage: null,
+    };
+  }
+
+
   private static getClient() {
     return new ApifyClient({ token: process.env.APIFY_API_TOKEN });
   }
@@ -121,6 +231,7 @@ export class ScraperService {
         should_mute_audio_reason: '',
         audio_id: raw.musicMeta.musicId || '',
       } : null,
+      ...this.extractPlaceSignals(raw, 'tiktok'),
       videoDuration: raw.videoMeta?.duration || null,
       dimensions: raw.videoMeta ? { width: raw.videoMeta.width, height: raw.videoMeta.height } : null,
       paidPartnership: raw.isSponsored || raw.isAd || false,
@@ -212,6 +323,7 @@ export class ScraperService {
       mentions: raw.mentions || [],
       taggedUsers: raw.taggedUsers || [],
       musicInfo: raw.musicInfo || null,
+      ...this.extractPlaceSignals(raw, 'instagram'),
       videoDuration: raw.videoDuration || null,
       dimensions: (raw.dimensionsWidth && raw.dimensionsHeight)
         ? { width: raw.dimensionsWidth, height: raw.dimensionsHeight }

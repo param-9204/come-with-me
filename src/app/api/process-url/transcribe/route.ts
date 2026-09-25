@@ -33,13 +33,9 @@ export async function POST(request: Request) {
       throw new Error('Failed to extract audio from video.');
     }
 
-    // 3. Transcribe and translate with Whisper
-    const whisperResult = await WhisperService.processAudio(tempAudioPath);
-    if (!whisperResult) {
-      throw new Error('Whisper transcription failed.');
-    }
-
-    const transcript = `Original Transcript:\n${whisperResult.originalTranscript}\n\nEnglish Translation:\n${whisperResult.englishTranscript}`;
+    // 3. Transcribe with timestamps; silence/music hallucinations are filtered out.
+    const whisperResult = await WhisperService.transcribe(tempAudioPath);
+    const transcript = WhisperService.formatTranscript(whisperResult);
 
     // 4. Upload Audio to AWS S3 & save to DB (similar to the original route)
     let audioUploadResultData: any = null;
@@ -112,6 +108,9 @@ export async function POST(request: Request) {
     return NextResponse.json({
       success: true,
       transcript,
+      transcriptSegments: whisperResult.segments,
+      transcriptSource: whisperResult.source,
+      transcriptLanguage: whisperResult.language,
       audioUpload: audioUploadResultData,
     });
 

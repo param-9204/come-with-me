@@ -54,6 +54,10 @@ export interface ApifyInstagramPost {
   taggedUsers: ApifyTaggedUser[];
   musicInfo: ApifyMusicInfo | null;
   isCommentsDisabled: boolean;
+  /** Present only when the creator added a location tag. */
+  locationName?: string;
+  locationId?: number | string;
+  coauthorProducers?: Array<{ username: string; full_name: string; id?: string }>;
 }
 
 /** Raw TikTok post object exactly as Apify (clockworks/tiktok-scraper) returns it */
@@ -69,7 +73,10 @@ export interface ApifyTikTokPost {
     format: string;
     originalCoverUrl: string;
     dynamicCoverUrl: string;
+    subtitleLinks?: Array<{ language: string; downloadLink?: string; tiktokLink?: string; source?: string }>;
   };
+  textLanguage?: string;
+  detailedMentions?: Array<{ id: string; name: string; nickName: string }>;
   authorMeta: {
     id: string;
     name: string;         // username
@@ -98,6 +105,39 @@ export interface ApifyTikTokPost {
   isAd: boolean;
   isPinned: boolean;
   isSponsored: boolean;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// PLACE SIGNALS (platform metadata that can identify a place)
+// ──────────────────────────────────────────────────────────────────────
+
+/** Instagram location tag (`locationName` / `locationId`). Often city-level. */
+export interface SocialLocationTag {
+  name: string;
+  id: string | null;
+}
+
+export interface SocialComment {
+  text: string;
+  ownerUsername: string;
+  /** True when the post author wrote the comment (pinned "📍 location" replies). */
+  isCreator: boolean;
+  likes: number | null;
+}
+
+/** An account linked to the post, with its display name when the platform provides one. */
+export interface SocialAccountRef {
+  username: string;
+  fullName: string;
+  relation: 'tagged' | 'coauthor' | 'mention';
+}
+
+/** Platform-provided subtitle track (TikTok `videoMeta.subtitleLinks`, WebVTT). */
+export interface SubtitleTrack {
+  language: string;
+  /** ASR = automatic speech recognition, LC = creator caption, MT = machine translation. */
+  source: string;
+  url: string;
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -135,6 +175,14 @@ export interface SocialContent {
   productType: string | null;
   publishedAt: string | null;
   rawApifyData: ApifyInstagramPost | ApifyTikTokPost | Record<string, any>;
+  // ── Place signals (optional: absent on older stored records) ──
+  locationTag?: SocialLocationTag | null;
+  comments?: SocialComment[];
+  altTexts?: string[];
+  creatorBio?: string;
+  accounts?: SocialAccountRef[];
+  subtitleTracks?: SubtitleTrack[];
+  captionLanguage?: string | null;
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -144,21 +192,35 @@ export interface SocialContent {
 export interface VideoFrame {
   frameIndex: number;
   timestamp: number;   // seconds from start of video
+  /** Frame used by local OCR (may be contrast-enhanced grayscale). */
   filePath: string;
-  hash: string;        // MD5 for deduplication
+  /** Unprocessed colour frame for vision OCR; falls back to `filePath`. */
+  colorFilePath?: string;
+  hash: string;
 }
 
-/** Result from Apify OCR actor on a single frame */
+export interface OcrLine {
+  text: string;
+  /** 0–1 */
+  confidence: number;
+}
+
+/** Result from local Tesseract OCR on a single frame (legacy name kept for stored data). */
 export interface ApifyOcrFrameResult {
   frameIndex: number;
   timestamp: number;
+  /** Lines not seen in an earlier frame (legacy consumers). */
   texts: string[];
   rawConfidence: number;
   rawResult: any;
   method: 'apify-ocr';
+  /** Every confident line in this frame, with per-line confidence. */
+  lines?: OcrLine[];
+  /** Word-level statistics used to decide whether a frame needs vision OCR. */
+  wordStats?: { total: number; confident: number; meanConfidence: number };
 }
 
-/** Result from GPT-4o Vision on a single frame */
+/** Result from a vision OCR provider on a single frame */
 export interface GptVisionFrameResult {
   frameIndex: number;
   timestamp: number;
@@ -169,7 +231,83 @@ export interface GptVisionFrameResult {
   cta: string[];
   description: string;
   confidence: number;
-  method: 'gpt-4o-vision';
+  /** The actual OCR backend; older stored rows may retain the previous mini label. */
+  method: 'gpt-4o-mini-vision' | 'gpt-4o-vision' | 'google-vision';
+  /**
+   * Strings from `texts` that are physically part of the filmed scene (shop or
+   * street signs, menus, packaging, billboards) rather than text added in
+   * editing (titles, stickers, list overlays, pins). Absent when the OCR
+   * backend cannot tell them apart (Google Vision, older stored rows).
+   */
+  sceneTexts?: string[];
+  /**
+   * Present only on one representative empty frame when Vision could not be
+   * used. Keeping it on a frame preserves the existing stored OCR schema
+   * without duplicating the same failure payload for every video frame.
+   */
+  warning?: {
+    code: 'gpt_vision_limit_exceeded';
+    message: string;
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// TRANSCRIPT TYPES
+// ──────────────────────────────────────────────────────────────────────
+
+export interface TranscriptSegment {
+  start: number;
+  end: number;
+  text: string;
+}
+
+export interface TranscriptResult {
+  text: string;
+  language: string | null;
+  segments: TranscriptSegment[];
+  source: 'platform-subtitles' | 'whisper' | 'stored' | 'none';
+  /** Segments removed as silence, music, or known speech-to-text hallucinations. */
+  droppedSegments: number;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// EVIDENCE MODEL (multi-signal place extraction)
+// ──────────────────────────────────────────────────────────────────────
+
+export type EvidenceSource =
+  | 'caption'
+  | 'hashtags'
+  | 'location_tag'
+  | 'account'
+  | 'comment_creator'
+  | 'comment'
+  | 'alt_text'
+  | 'creator_bio'
+  | 'ocr'
+  | 'vision_ocr'
+  | 'speech';
+
+export interface EvidenceItem {
+  /** Short stable id cited by the model, e.g. "C2", "O7", "S3". */
+  id: string;
+  source: EvidenceSource;
+  text: string;
+  /** Prior reliability of this item as support for a place name (0–1). */
+  weight: number;
+  /** Seconds from the start of the video where the text was seen or spoken. */
+  timestamps?: number[];
+  /** OCR only: frame indexes the line was read in (lets multi-line signs be matched per frame). */
+  frames?: number[];
+  /**
+   * OCR only: true when Vision reported this line as text physically in the
+   * scene (a street sign, a logo on a cup) every time it was read, rather than
+   * an overlay the creator added. Undefined when unknown.
+   */
+  scene?: boolean;
+  /** For account items. */
+  username?: string;
+  displayName?: string;
+  relation?: SocialAccountRef['relation'];
 }
 
 /** Aggregated OCR comparison output */
@@ -382,16 +520,36 @@ export interface PipelineStep {
   details?: string;
 }
 
+export type PlaceCategory = 'RESTAURANTS' | 'COFFEE' | 'TRAVEL' | 'ADVENTURE' | 'NATURE' | 'CITY' | 'SHOPPING' | 'NIGHTLIFE' | 'CULTURE' | 'HIDDEN GEMS' | 'BARS';
+
 export interface PlaceExtraction {
   name: string | null;
   city: string;
   neighborhood: string;
   address: string;
-  category: 'RESTAURANTS' | 'COFFEE' | 'TRAVEL' | 'ADVENTURE' | 'NATURE' | 'CITY' | 'SHOPPING' | 'NIGHTLIFE' | 'CULTURE' | 'HIDDEN GEMS' | 'BARS';
+  category: PlaceCategory;
   description: string;
   creator_handle: string;
+  /** Evidence-based score, 0–1. */
   confidence: number;
   social_post_id?: string;
+  // ── Evidence (set by the multi-signal extractor) ──
+  /** Category describing what the place is; never HIDDEN GEMS. */
+  base_category?: Exclude<PlaceCategory, 'HIDDEN GEMS'>;
+  mention_type?: 'explicit' | 'handle' | 'indirect';
+  role?: 'featured' | 'recommended';
+  /** Evidence ids that contain or identify the name. */
+  evidence_ids?: string[];
+  /** Evidence ids that support the city/neighbourhood/address. */
+  location_evidence_ids?: string[];
+  evidence_sources?: EvidenceSource[];
+  /** Human-readable reason this place was detected. */
+  explanation?: string;
+  /** The evidence lines behind the name and location (trimmed), for audit/UI. */
+  evidence_snippets?: Array<{ id: string; source: EvidenceSource; text: string; timestamps?: number[] }>;
+  /** Maps search text for indirect mentions (words taken from evidence only). */
+  search_query?: string;
+  google_place_id?: string | null;
 }
 
 // Legacy compat

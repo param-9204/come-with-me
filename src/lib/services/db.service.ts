@@ -1,22 +1,124 @@
 import { supabaseAdmin } from '../supabase';
 import { resolveProfileId } from '../auth';
-import type { SocialContent, AiAnalysisResult, ApifyOcrFrameResult, GptVisionFrameResult, PlaceExtraction } from '../types/social';
-import { LocationService } from './location.service';
+import type { SocialContent, AiAnalysisResult, ApifyOcrFrameResult, GptVisionFrameResult, PlaceExtraction, PlaceCategory } from '../types/social';
+import { LocationService, type GeocodeResult } from './location.service';
 import { AiEnrichmentService } from './ai-enrichment.service';
+import { ScraperService } from './scraper.service';
+import { googleTypeConflict, reconcileCategoryWithGoogle } from './place-evidence.service';
+import { plog } from './pipeline-log';
+import { googleMapsUrl } from '../maps-url';
 
-export interface PlaceInput {
-  name: string | null;
-  city: string;
-  neighborhood: string;
-  address: string;
-  category: string;
-  description: string;
-  creator_handle: string;
-  confidence: number;
-  social_post_id?: string;
+export type PlaceInput = Omit<PlaceExtraction, 'category'> & { category: PlaceCategory | string };
+
+const VERIFIED_BONUS = 0.1;
+const AMBIGUOUS_PENALTY = 0.1;
+
+/** Escape LIKE wildcards so names such as "100% Pizza" or "Dim_Sum" match literally. */
+export function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (char) => `\\${char}`);
+}
+
+export type Verification = {
+  verified: boolean;
+  ambiguous?: boolean;
+  /** Who verified the location: a geocoder now, or coordinates already stored for this place. */
+  provider?: 'google' | 'mapbox' | 'stored';
+};
+
+const PROVIDER_LABEL: Record<NonNullable<Verification['provider']>, string> = {
+  google: 'Google Maps',
+  mapbox: 'Mapbox',
+  stored: 'the saved map location',
+};
+
+/** Post-geocoding confidence and explanation for one post↔place link. */
+export function verifiedEvidence(
+  place: Pick<PlaceInput, 'confidence' | 'explanation'>,
+  verification: Verification
+): { confidence: number; explanation: string } {
+  let confidence = Number(place.confidence) || 0;
+  let note = '';
+  if (verification.verified) {
+    const label = PROVIDER_LABEL[verification.provider || 'google'];
+    confidence += VERIFIED_BONUS;
+    note = verification.ambiguous
+      ? ` Matched on ${label}; several branches share this name, so the closest name match was used.`
+      : verification.provider === 'stored' ? ' Matches a place already on the map.' : ` Verified on ${label}.`;
+    if (verification.ambiguous) confidence -= AMBIGUOUS_PENALTY;
+  }
+  return {
+    confidence: Math.round(Math.max(0, Math.min(0.99, confidence)) * 100) / 100,
+    explanation: `${place.explanation || ''}${note}`.trim(),
+  };
 }
 
 export class DbService {
+  private static columnSupport = new Map<string, boolean>();
+
+  /**
+   * Whether optional columns from migration v25 exist. Cached per process so
+   * the pipeline works before and after the migration is applied.
+   */
+  static async supportsColumns(table: string, columns: string): Promise<boolean> {
+    const key = `${table}:${columns}`;
+    const cached = this.columnSupport.get(key);
+    if (cached !== undefined) return cached;
+    const { error } = await supabaseAdmin.from(table).select(columns).limit(1);
+    if (!error) {
+      this.columnSupport.set(key, true);
+      return true;
+    }
+    const missingColumn = error.code === '42703' || error.code === 'PGRST204' || /column .* does not exist|schema cache/i.test(error.message || '');
+    if (missingColumn) {
+      this.columnSupport.set(key, false);
+      plog('db', `${table}.(${columns}) not found — apply supabase/migration_v25_place_evidence.sql to enable it`, undefined, 'warn');
+    }
+    return false;
+  }
+
+  /** Link one place to a post, storing why it was detected when the columns exist. */
+  static async linkPlaceWithEvidence(
+    socialPostId: string | undefined,
+    placeId: string,
+    place: PlaceInput,
+    verification: Verification
+  ): Promise<void> {
+    if (!socialPostId) return;
+    if (!(await this.supportsColumns('social_post_places', 'confidence, explanation, evidence'))) {
+      await this.linkPlacesToSocialPost(socialPostId, [placeId]);
+      return;
+    }
+    const { confidence, explanation } = verifiedEvidence(place, verification);
+    const { error } = await supabaseAdmin
+      .from('social_post_places')
+      .upsert({
+        social_post_id: socialPostId,
+        place_id: placeId,
+        confidence,
+        explanation,
+        evidence: {
+          ids: place.evidence_ids || [],
+          location_ids: place.location_evidence_ids || [],
+          sources: place.evidence_sources || [],
+          mention_type: place.mention_type || null,
+          snippets: place.evidence_snippets || [],
+          verified: verification.verified,
+          provider: verification.provider || null,
+          ambiguous: !!verification.ambiguous,
+        },
+      }, { onConflict: 'social_post_id, place_id' });
+    if (error) {
+      plog('db', 'Failed to store place evidence; linked without it', { error: error.message }, 'warn');
+      await this.linkPlacesToSocialPost(socialPostId, [placeId]);
+    }
+  }
+
+  private static async findPlaceByGoogleId(placeId: string | null | undefined): Promise<string | null> {
+    if (!placeId || !(await this.supportsColumns('places', 'google_place_id'))) return null;
+    const { data } = await supabaseAdmin.from('places').select('id').eq('google_place_id', placeId).limit(1);
+    return data?.[0]?.id || null;
+  }
+
   // ──────────────────────────────────────────────────────────────────
   // Save / upsert a place (Come With Me map entity)
   // ──────────────────────────────────────────────────────────────────
@@ -30,7 +132,7 @@ export class DbService {
     authorUsername?: string
   ): Promise<string | null> {
     if (!placeData.name) {
-      console.warn('[DB] Place name is null — skipping insert.');
+      plog('db', 'Place has no name; not saved', undefined, 'warn');
       return null;
     }
 
@@ -41,22 +143,42 @@ export class DbService {
       creatorHandle = `@${creatorHandle}`;
     }
 
-    // Idempotent: skip geocoding and insertion if place already exists
-    const { data: existing } = await supabaseAdmin
+    const supportsGoogleId = await DbService.supportsColumns('places', 'google_place_id');
+    const link = (placeId: string, verification: Verification) =>
+      DbService.linkPlaceWithEvidence(socialPostId, placeId, placeData, verification);
+
+    // Idempotent: skip geocoding and insertion if place already exists.
+    // `.limit()` instead of `.maybeSingle()`: maybeSingle errors (data=null)
+    // when several rows match, which used to create yet another duplicate.
+    const { data: existingRows } = await supabaseAdmin
       .from('places')
       .select('id, latitude, longitude, address, city, neighborhood')
-      .ilike('name', placeData.name.trim())
-      .ilike('city', (placeData.city || '').trim())
-      .maybeSingle();
+      .ilike('name', escapeLike(placeData.name.trim()))
+      .ilike('city', escapeLike((placeData.city || '').trim()))
+      .order('created_at', { ascending: true })
+      .limit(5);
+    const existing = (existingRows || []).find((row) => row.latitude !== null && row.longitude !== null)
+      || (existingRows || [])[0]
+      || null;
 
     if (existing) {
-      console.log(`[DB] Place already exists: ${existing.id}`);
-      if (existing.latitude === null || existing.longitude === null) {
+      plog('db', `"${placeData.name}" already in database (name + city)`, { placeId: existing.id, hasCoordinates: existing.latitude !== null });
+      const suppliedAddress = LocationService.sanitizeSourceAddress(placeData.address);
+      const storedAddress = LocationService.sanitizeSourceAddress(existing.address);
+      const hasInvalidStoredAddress = Boolean(existing.address && !storedAddress);
+      let verified = existing.latitude !== null && existing.longitude !== null;
+      let ambiguous = false;
+      let provider: Verification['provider'] = verified ? 'stored' : undefined;
+      let invalidAddressReplaced = false;
+      // Repair legacy extraction artifacts such as `2017 by Street` by first
+      // resolving the venue by its exact name and city. This preserves a real
+      // provider address when one is available instead of simply blanking it.
+      if (!verified || hasInvalidStoredAddress) {
         try {
           const coords = await LocationService.geocodePlace(
             placeData.name,
             existing.city || placeData.city || '',
-            placeData.address || existing.address || '',
+            suppliedAddress || storedAddress,
             placeData.neighborhood || existing.neighborhood || ''
           );
 
@@ -68,40 +190,78 @@ export class DbService {
             if (coords.formattedAddress) verifiedUpdate.address = coords.formattedAddress;
             if (coords.city) verifiedUpdate.city = coords.city;
             if (coords.neighborhood) verifiedUpdate.neighborhood = coords.neighborhood;
+            if (supportsGoogleId && coords.placeId && !(await DbService.findPlaceByGoogleId(coords.placeId))) {
+              verifiedUpdate.google_place_id = coords.placeId;
+            }
 
             const { error: updateError } = await supabaseAdmin
               .from('places')
               .update(verifiedUpdate)
               .eq('id', existing.id);
             if (updateError) {
-              console.warn(`[DB] Failed to refresh coordinates for ${existing.id}:`, updateError.message);
+              plog('db', 'Failed to refresh coordinates', { placeId: existing.id, error: updateError.message }, 'warn');
             } else {
-              console.log(`[DB] Refreshed provider-verified coordinates for ${existing.id}`);
+              verified = true;
+              ambiguous = !!coords.ambiguous;
+              provider = coords.provider;
+              invalidAddressReplaced = !hasInvalidStoredAddress || Boolean(coords.formattedAddress);
+              plog('db', 'Added verified coordinates to existing place', { placeId: existing.id, lat: coords.lat, lng: coords.lng, provider: coords.provider });
             }
           }
         } catch (geoErr: any) {
-          console.warn(`[DB] Failed to refresh coordinates for ${existing.id}:`, geoErr.message);
+          plog('db', 'Failed to refresh coordinates', { placeId: existing.id, error: geoErr.message }, 'warn');
         }
       }
-      if (socialPostId) {
-        await DbService.linkPlacesToSocialPost(socialPostId, [existing.id]);
+      if (hasInvalidStoredAddress && !invalidAddressReplaced) {
+        const { error: clearAddressError } = await supabaseAdmin
+          .from('places')
+          .update({ address: '' })
+          .eq('id', existing.id);
+        if (clearAddressError) {
+          plog('db', 'Failed to clear invalid stored address', { placeId: existing.id, error: clearAddressError.message }, 'warn');
+        } else {
+          plog('db', 'Cleared invalid stored address', { placeId: existing.id, address: existing.address }, 'warn');
+        }
       }
+      await link(existing.id, { verified, ambiguous, provider });
       return existing.id;
     }
 
     let lat: number | null = null;
     let lng: number | null = null;
     let neighborhood = placeData.neighborhood;
-    let address = placeData.address;
+    let address = LocationService.sanitizeSourceAddress(placeData.address);
     let city = LocationService.cleanCityName(placeData.city);
+    let geocode: GeocodeResult | null = null;
 
     try {
-      const coords = await LocationService.geocodePlace(
+      let coords = await LocationService.geocodePlace(
         placeData.name,
         city || '',
         address,
         neighborhood
       );
+      // A fuzzy name match of a different kind of venue is the wrong entity
+      // (e.g. poster text "La Dolce Vita" → a shoe store called "Dolce Vita").
+      // A verified source address identifies the same physical venue even when
+      // a creator uses a descriptive name and the provider uses its canonical
+      // name. Category disagreement must only reject a fuzzy identity match;
+      // otherwise it discards valid coordinates after the geocoder succeeded.
+      const strongIdentity = coords.identity === 'exact_name' || coords.identity === 'source_address'
+        || (!!coords.matchedName && LocationService.nameSimilarity(placeData.name, coords.matchedName) === 1);
+      const conflict = coords.lat !== null && !strongIdentity
+        ? googleTypeConflict(placeData.base_category || (placeData.category as PlaceCategory), coords.primaryType, coords.types)
+        : null;
+      if (conflict) {
+        plog('db', `Rejected Google match for "${placeData.name}": different kind of venue`, {
+          googleName: coords.matchedName,
+          googleType: coords.primaryType,
+          extractedAs: placeData.base_category || placeData.category,
+          googleCategory: conflict,
+        }, 'warn');
+        coords = { lat: null, lng: null, formattedAddress: null, neighborhood: null, city: null };
+      }
+      geocode = coords;
       lat = coords.lat;
       lng = coords.lng;
       if (coords.formattedAddress) {
@@ -109,48 +269,55 @@ export class DbService {
       }
       if (coords.city) {
         city = coords.city;
-        console.log(`[DB] City from verified geocode: ${city}`);
       }
       // Use neighborhood from forward geocode context if not already known
       if (!neighborhood && coords.neighborhood) {
         neighborhood = coords.neighborhood;
-        console.log(`[DB] Neighborhood from forward geocode: ${neighborhood}`);
       }
 
       // Only call reverse geocode if neighborhood is STILL missing
       if (!neighborhood && lat !== null && lng !== null) {
-        console.log(`[DB] Neighborhood not in forward geocode — falling back to reverse geocode...`);
         try {
           neighborhood = await LocationService.getNeighborhood(lat, lng);
         } catch (revErr: any) {
-          console.warn('[DB] Reverse geocoding failed (non-fatal):', revErr.message);
+          plog('db', 'Reverse neighbourhood lookup failed (non-fatal)', { error: revErr.message }, 'warn');
         }
       }
     } catch (geoErr: any) {
-      console.warn(`[DB] Forward geocoding failed (non-fatal) for place "${placeData.name}":`, geoErr.message);
+      plog('db', `Geocoding failed for "${placeData.name}" (non-fatal)`, { error: geoErr.message }, 'warn');
+    }
+
+    const verified = lat !== null && lng !== null;
+    const ambiguous = !!geocode?.ambiguous;
+
+    // Same Google place already saved (possibly under another spelling).
+    const existingByGoogleId = await DbService.findPlaceByGoogleId(geocode?.placeId);
+    if (existingByGoogleId) {
+      plog('db', `"${placeData.name}" already in database (same Google place)`, { placeId: existingByGoogleId, googlePlaceId: geocode?.placeId });
+      await link(existingByGoogleId, { verified, ambiguous, provider: geocode?.provider });
+      return existingByGoogleId;
     }
 
     // GATE: Do not save places with no resolved address
     if (!address || !address.trim()) {
-      console.warn(`[DB] Skipping place "${placeData.name}" — no address resolved (AI or geocoding).`);
+      plog('db', `Not saved: "${placeData.name}" has no verified location`, { reason: 'no Google match and no address in the evidence' }, 'warn');
       return null;
     }
 
-    // A source post may omit the city. Once Mapbox verifies it, check the
+    // A source post may omit the city. Once Google Maps verifies it, check the
     // canonical name/city pair before creating a duplicate record.
     if (city.trim() && city.trim().toLowerCase() !== (placeData.city || '').trim().toLowerCase()) {
-      const { data: existingWithResolvedCity } = await supabaseAdmin
+      const { data: resolvedCityRows } = await supabaseAdmin
         .from('places')
         .select('id')
-        .ilike('name', placeData.name.trim())
-        .ilike('city', city.trim())
-        .maybeSingle();
+        .ilike('name', escapeLike(placeData.name.trim()))
+        .ilike('city', escapeLike(city.trim()))
+        .limit(1);
+      const existingWithResolvedCity = resolvedCityRows?.[0];
 
       if (existingWithResolvedCity) {
-        console.log(`[DB] Place already exists after geocoding: ${existingWithResolvedCity.id}`);
-        if (socialPostId) {
-          await DbService.linkPlacesToSocialPost(socialPostId, [existingWithResolvedCity.id]);
-        }
+        plog('db', `"${placeData.name}" already in database (Google-resolved city)`, { placeId: existingWithResolvedCity.id, city });
+        await link(existingWithResolvedCity.id, { verified, ambiguous, provider: geocode?.provider });
         return existingWithResolvedCity.id;
       }
     }
@@ -173,10 +340,8 @@ export class DbService {
       );
 
       if (samePlaceAtCoordinates) {
-        console.log(`[DB] Place already exists at coordinates (${lat}, ${lng}): "${samePlaceAtCoordinates.name}" (ID: ${samePlaceAtCoordinates.id}). Skipping insertion of "${placeData.name}".`);
-        if (socialPostId) {
-          await DbService.linkPlacesToSocialPost(socialPostId, [samePlaceAtCoordinates.id]);
-        }
+        plog('db', `"${placeData.name}" already in database (same coordinates)`, { placeId: samePlaceAtCoordinates.id, lat, lng });
+        await link(samePlaceAtCoordinates.id, { verified, ambiguous, provider: geocode?.provider });
         return samePlaceAtCoordinates.id;
       }
     }
@@ -202,7 +367,7 @@ export class DbService {
               cityLng = cityCoords.lng;
             }
           } catch (geoErr) {
-            console.warn('[DB] Failed to geocode city center coordinates:', geoErr);
+            plog('db', 'Failed to look up city centre (non-fatal)', { city: cityName, error: String(geoErr) }, 'warn');
           }
 
           await supabaseAdmin
@@ -213,40 +378,63 @@ export class DbService {
               longitude: cityLng
             }, { onConflict: 'name' });
         } else {
-          console.log(`[DB] City "${cityName}" already exists in the cities cache.`);
         }
       } catch (err) {
-        console.error('[DB] Failed to upsert city:', err);
+        plog('db', 'Failed to save city (non-fatal)', { city: cityName, error: String(err) }, 'warn');
       }
     }
+
+    // Google's place type decides what a venue is (bar vs cafe); experience
+    // categories and HIDDEN GEMS stay as extracted.
+    const category = reconcileCategoryWithGoogle(
+      (placeData.category || placeData.base_category || 'CITY') as PlaceCategory,
+      geocode?.primaryType,
+      geocode?.types
+    );
+    if (category !== placeData.category) {
+      plog('db', `Category for "${placeData.name}" set from Google type`, { extracted: placeData.category, saved: category, googleType: geocode?.primaryType });
+    }
+
+    // Google's listing gives the canonical spelling ("LUCALI" → "Lucali",
+    // "Joes Pizza" → "Joe's Pizza") — used only when it is the same name.
+    const displayName = geocode?.matchedName && LocationService.nameSimilarity(placeData.name, geocode.matchedName) === 1
+      ? geocode.matchedName
+      : placeData.name.trim();
 
     const { data: newPlace, error } = await supabaseAdmin
       .from('places')
       .insert({
-        name: placeData.name.trim(),
+        name: displayName,
         address: address || '',
         city: LocationService.cleanCityName(city),
         neighborhood,
-        category: placeData.category || 'RESTAURANTS',
+        category,
         description: placeData.description || '',
         source: sourcePlatform,
         source_url: sourceUrl || '',
         audio_transcript: audioTranscript || '',
         latitude: lat,
         longitude: lng,
+        ...(supportsGoogleId && geocode?.placeId ? { google_place_id: geocode.placeId } : {}),
       })
       .select('id')
       .single();
 
     if (error) {
-      console.error('[DB] Place insert error:', error);
+      // A parallel save of the same Google place won the unique index race.
+      if (error.code === '23505' && geocode?.placeId) {
+        const winner = await DbService.findPlaceByGoogleId(geocode.placeId);
+        if (winner) {
+          await link(winner, { verified, ambiguous, provider: geocode?.provider });
+          return winner;
+        }
+      }
+      plog('db', `Insert failed for "${placeData.name}"`, { error: error.message, code: error.code }, 'error');
       throw new Error(`Failed to save place: ${error.message}`);
     }
 
-    console.log(`[DB] New place saved: ${placeData.name} (${newPlace.id})`);
-    if (socialPostId) {
-      await DbService.linkPlacesToSocialPost(socialPostId, [newPlace.id]);
-    }
+    plog('db', `Saved new place "${displayName}"`, { placeId: newPlace.id, lat, lng, address, category, googlePlaceId: geocode?.placeId || null, verified });
+    await link(newPlace.id, { verified, ambiguous, provider: geocode?.provider });
     return newPlace.id;
   }
   // ──────────────────────────────────────────────────────────────────
@@ -261,7 +449,7 @@ export class DbService {
       .upsert(rows, { onConflict: 'social_post_id, place_id' });
 
     if (error) {
-      console.warn('[DB] Failed to upsert social_post_places:', error.message);
+      plog('db', 'Failed to link places to post', { error: error.message }, 'warn');
     }
   }
 
@@ -274,12 +462,19 @@ export class DbService {
     let places: any[] = [];
 
     // Fetch ONLY via social_post_places junction table (scoped to current post)
+    const withEvidence = await DbService.supportsColumns('social_post_places', 'confidence, explanation, evidence');
     const { data: junctionRows } = await supabaseAdmin
       .from('social_post_places')
-      .select('place_id')
+      .select(withEvidence ? 'place_id, confidence, explanation, evidence' : 'place_id')
       .eq('social_post_id', socialPostId);
 
-    const junctionPlaceIds = junctionRows?.map((r) => r.place_id).filter(Boolean) || [];
+    const evidenceByPlace = new Map<string, { confidence: number | null; explanation: string | null; evidence: any }>();
+    for (const row of (junctionRows || []) as any[]) {
+      if (withEvidence && row.place_id) {
+        evidenceByPlace.set(row.place_id, { confidence: row.confidence, explanation: row.explanation, evidence: row.evidence });
+      }
+    }
+    const junctionPlaceIds = (junctionRows as any[] | null)?.map((r) => r.place_id).filter(Boolean) || [];
 
     if (junctionPlaceIds.length > 0) {
       const { data: junctionPlaces } = await supabaseAdmin
@@ -361,11 +556,19 @@ export class DbService {
         }
       }
 
+      const evidence = evidenceByPlace.get(p.id);
       return {
         ...p,
+        map_url: googleMapsUrl(p),
         author_username: effectiveAuthor,
         creator_handle: effectiveHandle,
         creators: finalCreators,
+        ...(evidence ? {
+          confidence: evidence.confidence !== null ? Number(evidence.confidence) : undefined,
+          explanation: evidence.explanation || undefined,
+          evidence_sources: evidence.evidence?.sources || undefined,
+          evidence_snippets: evidence.evidence?.snippets || undefined,
+        } : {}),
       };
     });
   }
@@ -579,19 +782,17 @@ export class DbService {
         return [];
       }
 
-      // 1. Gather OCR texts from stored DB columns
-      const ocrTexts: string[] = [];
-      if (post.ocr_combined_text) {
-        ocrTexts.push(post.ocr_combined_text);
-      }
-      if (Array.isArray(post.ocr_frames_apify)) {
-        for (const frame of post.ocr_frames_apify) {
-          if (frame?.text) ocrTexts.push(frame.text);
-        }
-      }
+      // 1. Stored OCR frames keep per-line confidence and timestamps; older
+      //    rows only have the combined text.
+      const ocrFrames: ApifyOcrFrameResult[] = Array.isArray(post.ocr_frames_apify) ? post.ocr_frames_apify : [];
+      const visionFrames: GptVisionFrameResult[] = Array.isArray(post.ocr_frames_gpt) ? post.ocr_frames_gpt : [];
+      const ocrTexts = ocrFrames.length === 0 && visionFrames.length === 0 && post.ocr_combined_text
+        ? [post.ocr_combined_text]
+        : [];
 
       // 2. Build SocialContent structure from DB row
       const rawApify = post.raw_apify_data || {};
+      const platform = post.platform === 'tiktok' ? 'tiktok' : 'instagram';
       const content: SocialContent = {
         platform: (post.platform as any) || 'instagram',
         contentId: post.content_id || '',
@@ -623,13 +824,20 @@ export class DbService {
           saves: 0,
         },
         rawApifyData: rawApify,
+        ...ScraperService.extractPlaceSignals(rawApify, platform),
       };
 
       const transcript = post.whisper_transcript || '';
+      const { WhisperService } = await import('./whisper.service');
 
-      // 3. Execute OpenAI place extraction using stored text context
+      // 3. Execute place extraction using stored evidence
       console.log(`[DB] Re-extracting places using stored data for post ID: ${socialPostId}...`);
-      const extractedPlaces = await AiEnrichmentService.extractPlace(content, transcript, ocrTexts);
+      const { places: extractedPlaces } = await AiEnrichmentService.extractPlaces(content, {
+        ocrFrames,
+        visionFrames,
+        ocrTexts,
+        transcript: WhisperService.fromStoredText(transcript),
+      });
 
       let placeIds: string[] = [];
       if (extractedPlaces && extractedPlaces.length > 0) {

@@ -160,7 +160,7 @@ function OcrComparisonDemo({ ocr }: { ocr: OcrComparisonResult }) {
                   : "text-zinc-500 border-transparent hover:text-zinc-300"
               }`}
             >
-              {id === "gpt" ? "GPT-4o Vision" : "Apify OCR (Tesseract)"}
+              {id === "gpt" ? "GPT-4o mini Vision" : "Apify OCR (Tesseract)"}
             </button>
           ))}
         </div>
@@ -181,7 +181,7 @@ function OcrComparisonDemo({ ocr }: { ocr: OcrComparisonResult }) {
         >
           <div className="flex items-center gap-2 mb-3">
             <div className="w-1.5 h-1.5 rounded-full bg-indigo-400 shrink-0" />
-            <span className="text-xs font-semibold text-zinc-300">GPT-4o Vision</span>
+            <span className="text-xs font-semibold text-zinc-300">GPT-4o mini Vision</span>
           </div>
           <div className="grid grid-cols-2 gap-2">
             {[
@@ -360,6 +360,157 @@ const IconArrow     = () => <svg className="w-4 h-4" fill="none" viewBox="0 0 24
 const IconSpinner   = () => <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" /></svg>;
 const IconChevron   = ({ up }: { up?: boolean }) => <svg className={`w-4 h-4 transition-transform ${up ? "" : "rotate-180"}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" /></svg>;
 
+// ─── Places Found ──────────────────────────────────────────────────────────────
+type FoundPlace = {
+  id?: string;
+  place_id?: string;
+  name: string;
+  city?: string;
+  neighborhood?: string;
+  address?: string;
+  category?: string;
+  confidence?: number;
+  explanation?: string;
+  latitude?: number | null;
+  longitude?: number | null;
+  map_url?: string | null;
+};
+
+function PlacesFound({ places }: { places: FoundPlace[] }) {
+  return (
+    <div className="space-y-3">
+      {places.map((p, index) => {
+        const hasCoords = typeof p.latitude === "number" && typeof p.longitude === "number";
+        return (
+          <div
+            key={p.id || p.place_id || `${p.name}-${index}`}
+            className="bg-zinc-800/60 rounded-md px-3 py-3 space-y-2 border border-zinc-700/50"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-zinc-100">{p.name}</h3>
+                {(p.neighborhood || p.city) && (
+                  <p className="text-xs text-zinc-400 mt-0.5">{[p.neighborhood, p.city].filter(Boolean).join(", ")}</p>
+                )}
+                {p.address && <p className="text-xs text-zinc-500 mt-0.5">{p.address}</p>}
+              </div>
+              {p.category && <Badge label={p.category} variant="success" />}
+            </div>
+
+            {hasCoords && p.map_url ? (
+              <a
+                href={p.map_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                title="Open this location in Google Maps (new tab)"
+                className="inline-flex items-center gap-1.5 text-xs font-mono text-indigo-400 hover:text-indigo-300 hover:underline"
+              >
+                <IconMapPin />
+                {p.latitude!.toFixed(5)}, {p.longitude!.toFixed(5)}
+                <span aria-hidden>↗</span>
+              </a>
+            ) : (
+              <p className="text-xs text-amber-400/80">No coordinates: not verified on Google Maps, so not saved to the map.</p>
+            )}
+
+            {p.explanation && <p className="text-xs text-zinc-400 leading-relaxed">{p.explanation}</p>}
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-zinc-600">Confidence</span>
+              <div className="flex-1">
+                <ConfBar v={p.confidence || 0} />
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Pipeline Log ──────────────────────────────────────────────────────────────
+type LogEvent = {
+  at: string;
+  ms: number;
+  stage: string;
+  level: "info" | "warn" | "error";
+  message: string;
+  data?: Record<string, unknown>;
+};
+type LogPhase = { phase: string; events: LogEvent[] };
+
+const LEVEL_STYLE: Record<LogEvent["level"], string> = {
+  info: "text-zinc-300",
+  warn: "text-amber-400",
+  error: "text-red-400",
+};
+
+function PipelineLogView({ phases }: { phases: LogPhase[] }) {
+  const [onlyProblems, setOnlyProblems] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const total = phases.reduce((sum, p) => sum + p.events.length, 0);
+  const problems = phases.reduce((sum, p) => sum + p.events.filter((e) => e.level !== "info").length, 0);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(phases, null, 2));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setCopied(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <button
+          onClick={() => setOnlyProblems(false)}
+          className={`px-2 py-1 rounded-md border ${!onlyProblems ? "border-indigo-500 text-zinc-100" : "border-zinc-700 text-zinc-500"}`}
+        >
+          All ({total})
+        </button>
+        <button
+          onClick={() => setOnlyProblems(true)}
+          className={`px-2 py-1 rounded-md border ${onlyProblems ? "border-amber-500 text-zinc-100" : "border-zinc-700 text-zinc-500"}`}
+        >
+          Warnings &amp; errors ({problems})
+        </button>
+        <button onClick={copy} className="ml-auto px-2 py-1 rounded-md border border-zinc-700 text-zinc-400 hover:text-zinc-200">
+          {copied ? "Copied" : "Copy JSON"}
+        </button>
+      </div>
+
+      {phases.map(({ phase, events }) => {
+        const shown = onlyProblems ? events.filter((e) => e.level !== "info") : events;
+        return (
+          <div key={phase}>
+            <p className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider mb-1">{phase}</p>
+            {shown.length === 0 ? (
+              <p className="text-xs text-zinc-600">No {onlyProblems ? "warnings or errors" : "events"}.</p>
+            ) : (
+              <div className="max-h-[480px] overflow-y-auto divide-y divide-zinc-800 font-mono text-[11px] border border-zinc-800 rounded-md">
+                {shown.map((event, index) => (
+                  <details key={index} className="px-2 py-1.5 group">
+                    <summary className="cursor-pointer list-none flex items-baseline gap-2">
+                      <span className="text-zinc-600 w-12 shrink-0 text-right tabular-nums">{(event.ms / 1000).toFixed(2)}s</span>
+                      <span className="text-indigo-400/80 w-20 shrink-0">{event.stage}</span>
+                      <span className={`${LEVEL_STYLE[event.level]} break-words`}>{event.message}</span>
+                      {event.data && <span className="text-zinc-600 ml-auto shrink-0 group-open:hidden">▸</span>}
+                    </summary>
+                    {event.data && (
+                      <pre className="mt-1 ml-14 text-zinc-500 whitespace-pre-wrap break-all">{JSON.stringify(event.data, null, 2)}</pre>
+                    )}
+                  </details>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // ─── Main Page ─────────────────────────────────────────────────────────────────
 export default function Page() {
   const [url, setUrl] = useState("");
@@ -374,7 +525,8 @@ export default function Page() {
   const [aiAnalysis, setAiAnalysis]         = useState<AiAnalysisResult | null>(null);
   const [ocrComparison, setOcrComparison]   = useState<OcrComparisonResult | null>(null);
   const [transcript, setTranscript]         = useState<string>("");
-  const [place, setPlace]                   = useState<any>(null);
+  const [places, setPlaces]                 = useState<FoundPlace[]>([]);
+  const [pipelineLog, setPipelineLog]       = useState<LogPhase[]>([]);
   const [pipelineSteps, setPipelineSteps]   = useState<PipelineStep[]>([]);
   const [socialPostId, setSocialPostId]     = useState<string | null>(null);
 
@@ -400,7 +552,8 @@ export default function Page() {
     setAiAnalysis(null);
     setOcrComparison(null);
     setTranscript("");
-    setPlace(null);
+    setPlaces([]);
+    setPipelineLog([]);
     setPipelineSteps([]);
     setSocialPostId(null);
     setUploadedAudio(null);
@@ -422,8 +575,11 @@ export default function Page() {
     let rawApifyDataObj: any = null;
     let whisperTranscript = '';
     let ocrResultsList: any[] = [];
+    let gptVisionResultsList: any[] = [];
     let audioUploadObj: any = null;
     let isDescriptionOnlyPartial = false;
+    const pipelineRunId = crypto.randomUUID();
+    const pipelineStartedAt = new Date().toISOString();
 
     try {
       // ── STEP 1: Initiate Apify Scrape ──
@@ -432,7 +588,7 @@ export default function Page() {
       const initRes = await fetch("/api/process-url/scrape/initiate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ url, pipelineRunId, pipelineStartedAt }),
       });
       const initData = await initRes.json();
       if (!initRes.ok || !initData.success) {
@@ -447,7 +603,7 @@ export default function Page() {
         pollCount++;
         await new Promise(resolve => setTimeout(resolve, 2000));
         
-        const statusRes = await fetch(`/api/process-url/scrape/status?runId=${runId}&actorId=${actorId}`);
+        const statusRes = await fetch(`/api/process-url/scrape/status?runId=${encodeURIComponent(runId)}&actorId=${encodeURIComponent(actorId)}&pipelineRunId=${encodeURIComponent(pipelineRunId)}&pipelineStartedAt=${encodeURIComponent(pipelineStartedAt)}&url=${encodeURIComponent(url)}`);
         const statusData = await statusRes.json();
         
         if (!statusRes.ok || !statusData.success) {
@@ -486,162 +642,59 @@ export default function Page() {
 
       const isVideo = !isDescriptionOnlyPartial && !!contentData.videoUrl && (contentData.contentType === 'video' || contentData.contentType === 'reel');
 
-      // ── STEP 2 & 3: Transcribe and OCR in Parallel ──
-      const mediaProcessingStart = Date.now();
-
-      // Define transcription task
-      const transcriptionPromise = (async () => {
-        const transcribeStart = Date.now();
-        if (isDescriptionOnlyPartial) {
-          addOrUpdateStep(2, 'Whisper Transcription', 'skipped', 0, 'Restricted page — description-only extraction');
-        } else if (isVideo) {
-          addOrUpdateStep(2, 'Whisper Transcription', 'pending', 0, 'Downloading media and transcribing...');
-          try {
-            const transcribeRes = await fetch("/api/process-url/transcribe", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ videoUrl: contentData.videoUrl }),
-            });
-            const transcribeData = await transcribeRes.json();
-            
-            if (transcribeRes.ok && transcribeData.success) {
-              whisperTranscript = transcribeData.transcript;
-              audioUploadObj = transcribeData.audioUpload;
-              setTranscript(whisperTranscript);
-              if (audioUploadObj) setUploadedAudio(audioUploadObj);
-              addOrUpdateStep(2, 'Whisper Transcription', 'success', Date.now() - transcribeStart, 'Completed successfully');
-            } else {
-              throw new Error(transcribeData.error || 'Unknown transcription error');
-            }
-          } catch (err: any) {
-            console.warn('[Client Transcription] Failed, proceeding without transcript:', err.message);
-            addOrUpdateStep(2, 'Whisper Transcription', 'skipped', Date.now() - transcribeStart, `Failed: ${err.message}`);
-          }
-        } else {
-          addOrUpdateStep(2, 'Whisper Transcription', 'skipped', 0, 'Image post - skipped');
-        }
-      })();
-
-      // Define OCR task
-      const ocrPromise = (async () => {
-        const ocrStart = Date.now();
-        if (isDescriptionOnlyPartial) {
-          addOrUpdateStep(3, 'Frame OCR', 'skipped', 0, 'Restricted page — description-only extraction');
-        } else if (isVideo) {
-          addOrUpdateStep(3, 'Frame OCR (Extract & Tesseract)', 'pending', 0, 'Starting frame extraction and OCR...');
-          const duration = contentData.videoDuration || 15;
-          const numFrames = Math.max(1, Math.round(duration));
-          const timestamps: { index: number; timestamp: number }[] = [];
-          for (let i = 0; i < numFrames; i++) {
-            timestamps.push({ index: i, timestamp: i });
-          }
-
-          addOrUpdateStep(3, `Frame OCR (Processing ${timestamps.length} frames)`, 'pending', 0, 'Extracting and processing frames...');
-
-          const runWithConcurrency = async <T, R>(
-            items: T[],
-            limit: number,
-            fn: (item: T, idx: number) => Promise<R>
-          ): Promise<R[]> => {
-            const results: R[] = new Array(items.length);
-            let idx = 0;
-            async function worker() {
-              while (idx < items.length) {
-                const current = idx++;
-                results[current] = await fn(items[current], current);
-              }
-            }
-            const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
-            await Promise.all(workers);
-            return results;
-          };
-
-          const ocrResultsRaw = await runWithConcurrency(timestamps, 10, async (item) => {
-            try {
-              const res = await fetch("/api/process-url/ocr-frame", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  videoUrl: contentData.videoUrl,
-                  frameIndex: item.index,
-                  timestamp: item.timestamp,
-                  isVideo: true,
-                }),
-              });
-              const resData = await res.json();
-              if (res.ok && resData.success && resData.ocrFrameResult) {
-                return resData.ocrFrameResult;
-              }
-            } catch (e) {
-              console.error(`Frame OCR error for index ${item.index}:`, e);
-            }
-            return null;
+      // ── STEP 2 & 3: Media evidence (one server call) ──
+      // The server downloads the media once, picks key frames, runs local OCR
+      // (vision OCR only for frames it cannot read), and uses platform
+      // subtitles or Whisper for speech.
+      let transcriptSegments: any[] = [];
+      let transcriptSource = 'none';
+      let transcriptLanguage: string | null = null;
+      let processingWarnings: string[] = [];
+      if (isDescriptionOnlyPartial) {
+        addOrUpdateStep(2, 'Transcript', 'skipped', 0, 'Restricted page — description-only extraction');
+        addOrUpdateStep(3, 'Frame OCR', 'skipped', 0, 'Restricted page — description-only extraction');
+      } else {
+        const mediaStart = Date.now();
+        addOrUpdateStep(2, 'Transcript', 'pending', 0, isVideo ? 'Downloading media…' : 'Image post');
+        addOrUpdateStep(3, 'Frame OCR', 'pending', 0, 'Selecting key frames and reading on-screen text…');
+        try {
+          const mediaRes = await fetch("/api/process-url/media", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ content: contentData, rawApifyData: rawApifyDataObj, url, pipelineRunId, pipelineStartedAt }),
           });
-
-          ocrResultsList = ocrResultsRaw.filter(Boolean);
-          addOrUpdateStep(3, 'Frame OCR', 'success', Date.now() - ocrStart, `Processed ${ocrResultsList.length}/${timestamps.length} frames`);
-        } else {
-          // Image carousel OCR
-          const imageUrls = (contentData.images && contentData.images.length > 0)
-            ? contentData.images
-            : [contentData.displayUrl || contentData.videoUrl].filter(Boolean) as string[];
-
-          if (imageUrls.length > 0) {
-            addOrUpdateStep(3, `Image OCR (Processing ${imageUrls.length} images)`, 'pending', 0, 'Running OCR on images...');
-
-            const runWithConcurrency = async <T, R>(
-              items: T[],
-              limit: number,
-              fn: (item: T, idx: number) => Promise<R>
-            ): Promise<R[]> => {
-              const results: R[] = new Array(items.length);
-              let idx = 0;
-              async function worker() {
-                while (idx < items.length) {
-                  const current = idx++;
-                  results[current] = await fn(items[current], current);
-                }
-              }
-              const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
-              await Promise.all(workers);
-              return results;
-            };
-
-            const ocrResultsRaw = await runWithConcurrency(imageUrls, 10, async (imageUrl: string, index: number) => {
-              try {
-                const res = await fetch("/api/process-url/ocr-frame", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    imageUrl,
-                    frameIndex: index,
-                    isVideo: false
-                  }),
-              });
-              const resData = await res.json();
-              if (res.ok && resData.success && resData.ocrFrameResult) {
-                return resData.ocrFrameResult;
-                }
-              } catch (e) {
-                console.error(`Image OCR error for index ${index}:`, e);
-              }
-              return null;
-            });
-
-            ocrResultsList = ocrResultsRaw.filter(Boolean);
-            addOrUpdateStep(3, 'Image OCR', 'success', Date.now() - ocrStart, `Processed ${ocrResultsList.length}/${imageUrls.length} images`);
-          } else {
-            addOrUpdateStep(3, 'Frame OCR', 'skipped', 0, 'No media to OCR - skipped');
+          const mediaData = await mediaRes.json();
+          if (Array.isArray(mediaData.log)) setPipelineLog((prev) => [...prev, { phase: "Media", events: mediaData.log }]);
+          if (!mediaRes.ok || !mediaData.success) {
+            throw new Error(mediaData.error || 'Media processing failed');
           }
+          whisperTranscript = mediaData.transcript || '';
+          transcriptSegments = mediaData.transcriptSegments || [];
+          transcriptSource = mediaData.transcriptSource || 'none';
+          transcriptLanguage = mediaData.transcriptLanguage || null;
+          ocrResultsList = mediaData.ocrFrames || [];
+          gptVisionResultsList = mediaData.visionFrames || [];
+          audioUploadObj = mediaData.audioUpload || null;
+          const mediaWarnings = Array.isArray(mediaData.warnings)
+            ? mediaData.warnings.filter((warning: unknown): warning is string => typeof warning === 'string' && warning.trim().length > 0)
+            : [];
+          processingWarnings = mediaWarnings;
+          if (mediaWarnings.length > 0) setPartialWarning(mediaWarnings.join(' '));
+          if (whisperTranscript) setTranscript(whisperTranscript);
+          if (audioUploadObj) setUploadedAudio(audioUploadObj);
+          for (const step of (mediaData.steps || []) as PipelineStep[]) {
+            addOrUpdateStep(step.step, step.name, step.status as any, step.durationMs, step.details || '');
+          }
+        } catch (err: any) {
+          console.warn('[Client Media] Failed, proceeding with metadata only:', err.message);
+          addOrUpdateStep(2, 'Transcript', 'skipped', Date.now() - mediaStart, `Failed: ${err.message}`);
+          addOrUpdateStep(3, 'Frame OCR', 'skipped', Date.now() - mediaStart, `Failed: ${err.message}`);
         }
-      })();
-
-      // Run Whisper and OCR concurrently!
-      await Promise.all([transcriptionPromise, ocrPromise]);
+      }
 
       // ── STEP 4: AI Analysis & Save ──
       const analyzeStart = Date.now();
-      addOrUpdateStep(4, 'AI Analysis & Save', 'pending', 0, 'Running GPT-4o analysis and place extraction...');
+      addOrUpdateStep(4, 'AI Analysis & Save', 'pending', 0, 'Running GPT-4o mini analysis and place extraction...');
       
       const analyzeRes = await fetch("/api/process-url/analyze", {
         method: "POST",
@@ -650,13 +703,21 @@ export default function Page() {
           content: contentData,
           rawApifyData: rawApifyDataObj,
           transcript: whisperTranscript,
+          transcriptSegments,
+          transcriptSource,
+          transcriptLanguage,
           apifyOcrFrames: ocrResultsList,
+          gptVisionFrames: gptVisionResultsList,
+          processingWarnings,
           url,
-          audioUploadId: audioUploadObj?.id
+          audioUploadId: audioUploadObj?.id,
+          pipelineRunId,
+          pipelineStartedAt,
         }),
       });
 
       const analyzeData = await analyzeRes.json();
+      if (Array.isArray(analyzeData.log)) setPipelineLog((prev) => [...prev, { phase: "Analysis", events: analyzeData.log }]);
       if (!analyzeRes.ok || !analyzeData.success) {
         throw new Error(analyzeData.error || "Failed to complete AI analysis and database saves.");
       }
@@ -664,7 +725,7 @@ export default function Page() {
       // Populate states with returned data
       if (analyzeData.aiAnalysis)    setAiAnalysis(analyzeData.aiAnalysis);
       if (analyzeData.ocrComparison) setOcrComparison(analyzeData.ocrComparison);
-      if (analyzeData.place)         setPlace(analyzeData.place);
+      if (Array.isArray(analyzeData.places)) setPlaces(analyzeData.places);
       if (analyzeData.socialPostId)  setSocialPostId(analyzeData.socialPostId);
       if (analyzeData.audioUpload)   setUploadedAudio(analyzeData.audioUpload);
       if (analyzeData.partial && analyzeData.error) setPartialWarning(analyzeData.error);
@@ -713,7 +774,7 @@ export default function Page() {
   const toggleSection = (id: string) =>
     setCollapsedSections((prev) => ({ ...prev, [id]: !prev[id] }));
 
-  const hasResults = !!(scrapedData || aiAnalysis || ocrComparison || place);
+  const hasResults = !!(scrapedData || aiAnalysis || ocrComparison || places.length);
 
   const navSections = [
     { id: "summary", label: "Summary" },
@@ -789,7 +850,7 @@ export default function Page() {
             <div>
               <p className="text-sm font-medium text-amber-300">Restricted Access</p>
               <p className="text-xs text-amber-200/80 mt-0.5">{partialWarning}</p>
-              <p className="text-xs text-zinc-500 mt-1">Any places shown were extracted only from the available description.</p>
+              <p className="text-xs text-zinc-500 mt-1">Only verified scraped text, OCR, and transcript evidence is shown.</p>
             </div>
           </div>
         )}
@@ -1010,36 +1071,14 @@ export default function Page() {
                     </Card>
                   )}
 
-                  {/* Identified Location */}
-                  {place && (
+                  {/* Places Found */}
+                  {places.length > 0 && (
                     <Card
-                      title="Identified Location"
+                      title={`Places Found (${places.length})`}
                       icon={<IconMapPin />}
-                      right={place.category ? <Badge label={place.category} variant="success" /> : undefined}
+                      right={<Badge label={`${places.filter((p) => typeof p.latitude === "number").length} on map`} variant="accent" />}
                     >
-                      <div className="space-y-3">
-                        <div className="bg-zinc-800/60 rounded-md px-3 py-3">
-                          <h3 className="text-base font-semibold text-zinc-100">{place.name}</h3>
-                          <p className="text-sm text-zinc-400 mt-0.5">
-                            {place.city}{place.neighborhood ? `, ${place.neighborhood}` : ""}
-                          </p>
-                          {place.address && (
-                            <p className="text-xs text-zinc-600 mt-1">{place.address}</p>
-                          )}
-                        </div>
-                        {place.description && (
-                          <div className="bg-zinc-800/60 rounded-md px-3 py-2.5">
-                            <p className="text-[11px] text-zinc-500 mb-1">Why It&apos;s Worth Going</p>
-                            <p className="text-sm text-zinc-300 leading-relaxed">{place.description}</p>
-                          </div>
-                        )}
-                        <div className="flex items-center gap-2">
-                          <span className="text-[11px] text-zinc-600">Confidence</span>
-                          <div className="flex-1">
-                            <ConfBar v={place.confidence || 0} />
-                          </div>
-                        </div>
-                      </div>
+                      <PlacesFound places={places} />
                     </Card>
                   )}
 
@@ -1152,7 +1191,7 @@ export default function Page() {
               </div>
               {!collapsedSections.ocr && (
                 <Card
-                  title="Apify Tesseract vs GPT-4o Vision"
+                  title="Apify Tesseract vs GPT-4o mini Vision"
                   icon={<IconEye />}
                 >
                   {ocrComparison ? (
@@ -1166,7 +1205,25 @@ export default function Page() {
               )}
             </div>
 
-
+            {/* ── PIPELINE LOG ── */}
+            {pipelineLog.length > 0 && (
+              <div id="sec-log" className="space-y-4 scroll-mt-16">
+                <div className="flex items-center justify-between">
+                  <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">Pipeline Log</p>
+                  <button
+                    onClick={() => toggleSection("log")}
+                    className="text-xs text-zinc-500 hover:text-zinc-300 flex items-center gap-1 transition-colors"
+                  >
+                    <IconChevron up={!collapsedSections.log} />
+                  </button>
+                </div>
+                {!collapsedSections.log && (
+                  <Card title="Every step of this run" icon={<IconClipboard />}>
+                    <PipelineLogView phases={pipelineLog} />
+                  </Card>
+                )}
+              </div>
+            )}
           </>
         )}
 

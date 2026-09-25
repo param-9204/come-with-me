@@ -4,15 +4,17 @@ import crypto from 'crypto';
 import { MediaService } from '@/lib/services/media.service';
 import { VideoFrameService } from '@/lib/services/video-frame.service';
 import { ApifyOcrService } from '@/lib/services/apify-ocr.service';
+import { GptVisionOcrService } from '@/lib/services/gpt-vision-ocr.service';
 import type { VideoFrame } from '@/lib/types/social';
 
 export async function POST(request: Request) {
   let tempMediaPath = '';
   let tempFramePath = '';
+  let tempVisionPath = '';
 
   try {
     const body = await request.json();
-    const { videoUrl, imageUrl, frameIndex, timestamp, isVideo } = body;
+    const { videoUrl, imageUrl, frameIndex, timestamp, isVideo, platform } = body;
 
     const idx = typeof frameIndex === 'number' ? frameIndex : 0;
     const ts = typeof timestamp === 'number' ? timestamp : 0;
@@ -48,7 +50,11 @@ export async function POST(request: Request) {
       localFramePath = tempMediaPath;
     }
 
-    // 3. Create virtual VideoFrame object
+    // 3. Keep the original for Tesseract, but send a bounded colour copy to
+    // paid Vision OCR so large source images do not inflate Vision tokens.
+    tempVisionPath = await VideoFrameService.createVisionCopy(localFramePath).catch(() => '');
+
+    // 4. Create virtual VideoFrame object
     const buffer = fs.readFileSync(/*turbopackIgnore: true*/ localFramePath);
     const hash = crypto.createHash('md5').update(buffer).digest('hex');
 
@@ -56,20 +62,28 @@ export async function POST(request: Request) {
       frameIndex: idx,
       timestamp: ts,
       filePath: localFramePath,
+      colorFilePath: tempVisionPath || localFramePath,
       hash,
     };
 
-    // 4. Run local Apify/Tesseract OCR on the single frame.
-    const ocrResults = await ApifyOcrService.extractTextFromFrames([virtualFrame], false);
+    // TikTok uses both OCR engines on the same temporary frame. Instagram
+    // remains local-OCR only, so vision calls cannot affect that platform.
+    const [ocrResults, gptVisionResults] = await Promise.all([
+      ApifyOcrService.extractTextFromFrames([virtualFrame], false),
+      platform === 'tiktok'
+        ? GptVisionOcrService.extractTextFromFrames([virtualFrame])
+        : Promise.resolve([]),
+    ]);
     
     // 5. Clean up local files immediately
-    MediaService.cleanupFiles([tempMediaPath, tempFramePath].filter(Boolean));
+    MediaService.cleanupFiles([tempMediaPath, tempFramePath, tempVisionPath].filter(Boolean));
 
     const result = ocrResults.length > 0 ? ocrResults[0] : null;
 
     return NextResponse.json({
       success: true,
       ocrFrameResult: result,
+      gptVisionFrameResult: gptVisionResults[0] || null,
     });
 
   } catch (error: any) {
@@ -77,7 +91,7 @@ export async function POST(request: Request) {
 
     // Attempt cleanup on error
     try {
-      MediaService.cleanupFiles([tempMediaPath, tempFramePath].filter(Boolean));
+      MediaService.cleanupFiles([tempMediaPath, tempFramePath, tempVisionPath].filter(Boolean));
     } catch (cleanupErr) {
       console.error('[API OCR-Frame] Cleanup error:', cleanupErr);
     }

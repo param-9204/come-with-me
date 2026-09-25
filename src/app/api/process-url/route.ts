@@ -3,8 +3,13 @@ import { supabaseAdmin } from '@/lib/supabase';
 import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { DbService } from '@/lib/services/db.service';
 import { AiEnrichmentService } from '@/lib/services/ai-enrichment.service';
+import { MediaEvidenceService } from '@/lib/services/media-evidence.service';
+import { PipelineLog, withPipelineLog } from '@/lib/services/pipeline-log';
+import { ScraperService } from '@/lib/services/scraper.service';
 import type { SocialContent } from '@/lib/types/social';
 import { v4 as uuidv4 } from 'uuid';
+
+export const maxDuration = 300;
 
 function restrictedAccessMessage(rawApifyData: any): string | null {
   const accessFailure = [rawApifyData?.error, rawApifyData?.http_error_reason, rawApifyData?.errorDescription]
@@ -126,11 +131,14 @@ function contentFromStoredPost(post: any): SocialContent {
     productType: post?.product_type || null,
     publishedAt: null,
     rawApifyData: raw,
+    ...ScraperService.extractPlaceSignals(raw, platform),
   };
 }
 
 async function runSynchronousPipeline(origin: string, url: string, socialPostId: string, userId?: string): Promise<{ finalPostId: string; analyzeData: any }> {
   console.log(`[Synchronous Pipeline] Starting process-url for: ${url} (origin: ${origin})`);
+  const pipelineRunId = uuidv4();
+  const pipelineStartedAt = new Date().toISOString();
   try {
     // Update status to scraping
     await supabaseAdmin
@@ -142,7 +150,7 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
     const initRes = await fetch(`${origin}/api/process-url/scrape/initiate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ url, pipelineRunId, pipelineStartedAt }),
     });
     const initData = await initRes.json();
     if (!initRes.ok || !initData.success) {
@@ -158,7 +166,7 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
       pollCount++;
       await new Promise((resolve) => setTimeout(resolve, 2000));
       const statusRes = await fetch(
-        `${origin}/api/process-url/scrape/status?runId=${runId}&actorId=${actorId}`
+        `${origin}/api/process-url/scrape/status?runId=${encodeURIComponent(runId)}&actorId=${encodeURIComponent(actorId)}&pipelineRunId=${encodeURIComponent(pipelineRunId)}&pipelineStartedAt=${encodeURIComponent(pipelineStartedAt)}&url=${encodeURIComponent(url)}`
       );
       const statusData = await statusRes.json();
       if (!statusRes.ok || !statusData.success) {
@@ -186,119 +194,31 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
       .update({ status: 'processing' })
       .eq('id', socialPostId);
 
-    const isVideo =
-      !!contentData.videoUrl &&
-      (contentData.contentType === 'video' ||
-        contentData.contentType === 'reel');
-
-    let whisperTranscript = '';
-    let audioUploadObj: any = null;
-    let ocrResultsList: any[] = [];
-
-    // 2. Transcribe (if video) and OCR in parallel
-    const transcriptionPromise = (async () => {
-      if (isVideo) {
-        try {
-          const transcribeRes = await fetch(`${origin}/api/process-url/transcribe`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ videoUrl: contentData.videoUrl }),
-          });
-          const transcribeData = await transcribeRes.json();
-          if (transcribeRes.ok && transcribeData.success) {
-            whisperTranscript = transcribeData.transcript;
-            audioUploadObj = transcribeData.audioUpload;
-          }
-        } catch (err: any) {
-          console.warn('[Synchronous Pipeline] Transcription failed, proceeding:', err.message);
-        }
-      }
-    })();
-
-    const ocrPromise = (async () => {
-      const runWithConcurrency = async <T, R>(
-        items: T[],
-        limit: number,
-        fn: (item: T, idx: number) => Promise<R>
-      ): Promise<R[]> => {
-        const results: R[] = new Array(items.length);
-        let idx = 0;
-        async function worker() {
-          while (idx < items.length) {
-            const current = idx++;
-            results[current] = await fn(items[current], current);
-          }
-        }
-        const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
-        await Promise.all(workers);
-        return results;
-      };
-
-      if (isVideo) {
-        const duration = contentData.videoDuration || 15;
-        const numFrames = Math.max(1, Math.round(duration));
-        const timestamps: { index: number; timestamp: number }[] = [];
-        for (let i = 0; i < numFrames; i++) {
-          timestamps.push({ index: i, timestamp: i });
-        }
-
-        const rawOcr = await runWithConcurrency(timestamps, 10, async (item) => {
-          try {
-            const res = await fetch(`${origin}/api/process-url/ocr-frame`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                videoUrl: contentData.videoUrl,
-                frameIndex: item.index,
-                timestamp: item.timestamp,
-                isVideo: true,
-              }),
-            });
-            const resData = await res.json();
-            if (res.ok && resData.success && resData.ocrFrameResult) {
-              return resData.ocrFrameResult;
-            }
-          } catch (e) {
-            console.error(`Frame OCR error for index ${item.index}:`, e);
-          }
-          return null;
-        });
-        ocrResultsList = rawOcr.filter(Boolean);
-      } else {
-        const imageUrls =
-          contentData.images && contentData.images.length > 0
-            ? contentData.images
-            : [contentData.displayUrl || contentData.videoUrl].filter(
-              Boolean
-            ) as string[];
-
-        if (imageUrls.length > 0) {
-          const rawOcr = await runWithConcurrency(imageUrls, 10, async (imageUrl, index) => {
-            try {
-              const res = await fetch(`${origin}/api/process-url/ocr-frame`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  imageUrl,
-                  frameIndex: index,
-                  isVideo: false,
-                }),
-              });
-              const resData = await res.json();
-              if (res.ok && resData.success && resData.ocrFrameResult) {
-                return resData.ocrFrameResult;
-              }
-            } catch (e) {
-              console.error(`Image OCR error for index ${index}:`, e);
-            }
-            return null;
-          });
-          ocrResultsList = rawOcr.filter(Boolean);
-        }
-      }
-    })();
-
-    await Promise.all([transcriptionPromise, ocrPromise]);
+    // 2. Media evidence in-process: one download, key frames, local OCR,
+    // vision fallback only for hard frames, platform subtitles or Whisper.
+    const mediaLog = new PipelineLog(String(contentData?.contentId || socialPostId), {
+      route: 'process-url', socialPostId, url, pipelineRunId, pipelineStartedAt,
+    });
+    mediaLog.setRunInput({
+      platform: contentData.platform,
+      inputUrl: url,
+      socialPostId,
+      entrypoint: 'process-url',
+      contentId: contentData.contentId,
+      contentType: contentData.contentType,
+      caption: contentData.caption,
+      hashtags: contentData.hashtags,
+      mentions: contentData.mentions,
+      taggedAccounts: contentData.taggedUsers,
+      metadata: { videoDuration: contentData.videoDuration, dimensions: contentData.dimensions },
+    });
+    const media = await withPipelineLog(mediaLog, () => MediaEvidenceService.collect(contentData, rawApifyDataObj));
+    mediaLog.flush();
+    await mediaLog.flushDatabase();
+    const whisperTranscript = media.transcriptText;
+    const audioUploadObj = media.audioUpload;
+    const ocrResultsList = media.ocrFrames;
+    const gptVisionResultsList = media.visionFrames;
 
     // 4. Final synthesis and analysis
     const analyzeRes = await fetch(`${origin}/api/process-url/analyze`, {
@@ -308,11 +228,18 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
         content: contentData,
         rawApifyData: rawApifyDataObj,
         transcript: whisperTranscript,
+        transcriptSegments: media.transcript?.segments || [],
+        transcriptSource: media.transcript?.source || 'none',
+        transcriptLanguage: media.transcript?.language || null,
         apifyOcrFrames: ocrResultsList,
+        gptVisionFrames: gptVisionResultsList,
+        processingWarnings: media.warnings,
         url,
         audioUploadId: audioUploadObj?.id,
         userId: userId || null,
-        socialPostId: socialPostId
+        socialPostId: socialPostId,
+        pipelineRunId,
+        pipelineStartedAt,
       }),
     });
 
@@ -328,6 +255,17 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
     };
   } catch (err: any) {
     console.error(`[Synchronous Pipeline] Error processing: ${url}`, err.message);
+    const failureLog = new PipelineLog(`process-url-failure-${socialPostId}`, {
+      route: 'process-url', socialPostId, url, pipelineRunId, pipelineStartedAt,
+    });
+    failureLog.setRunInput({
+      platform: url.includes('tiktok.com') ? 'tiktok' : 'instagram',
+      inputUrl: url,
+      socialPostId,
+      entrypoint: 'process-url',
+    });
+    failureLog.fail(err, { failedStage: 'process-url' });
+    await failureLog.flushDatabase();
     try {
       await supabaseAdmin
         .from('social_posts')
@@ -462,23 +400,57 @@ export async function POST(request: Request) {
         mentions: cachedContent.mentions,
       };
 
-      return NextResponse.json({
-        success: true,
-        partial: Boolean(partialError),
-        error: partialError ? partialResultMessage(places.length) : null,
-        socialPostId: existingPost.id,
-        data: responseData,
-        rawApifyData: existingPost.raw_apify_data || null,
-        places,
-        place: firstPlace,
-        place_id: firstPlace?.id || firstPlace?.place_id || null,
-        placeIds: responsePlaceIds(places),
-        aiAnalysis: existingPost.ai_analysis || null,
-        transcript: existingPost.whisper_transcript || null,
-        scrapedData: cachedContent,
-        ocrComparison: ocrComparisonFromStoredPost(existingPost),
-        audioUpload: null,
-      });
+      // Re-run only legacy video records that completed before GPT Vision
+      // evidence was stored and still contain an unresolved saved place. This
+      // repairs historical partial results once without reprocessing healthy
+      // cached posts on every request.
+      const hasNoStoredVisionFrames = !Array.isArray(existingPost.ocr_frames_gpt) || existingPost.ocr_frames_gpt.length === 0;
+      const hasUnresolvedSavedPlace = savedPlaces.length === 0 || savedPlaces.some((place: any) =>
+        place.latitude === null || place.longitude === null || !String(place.address || '').trim()
+      );
+      const storedOcrTexts = Array.isArray(existingPost.ocr_frames_apify)
+        ? existingPost.ocr_frames_apify.flatMap((frame: any) => Array.isArray(frame?.texts) ? frame.texts : [])
+        : [];
+      const sourceAddressCount = AiEnrichmentService.countDistinctSourceAddresses(storedOcrTexts);
+      const hasIncompleteAddressBackedList = sourceAddressCount >= 2 && savedPlaces.length < sourceAddressCount;
+      const needsLegacyVideoRecovery =
+        (cachedContent.contentType === 'video' && hasNoStoredVisionFrames && hasUnresolvedSavedPlace) ||
+        hasIncompleteAddressBackedList;
+
+      if (needsLegacyVideoRecovery) {
+        console.warn(
+          `[process-url] Reprocessing incomplete cached post ${existingPost.id} ` +
+          `(saved=${savedPlaces.length}, source-addresses=${sourceAddressCount}).`
+        );
+        const { error: retryError } = await supabaseAdmin
+          .from('social_posts')
+          .update({ status: 'pending', error_message: null })
+          .eq('id', existingPost.id);
+        if (retryError) {
+          console.warn('[process-url] Unable to mark legacy post for recovery:', retryError.message);
+        } else {
+          // Fall through to the normal pipeline using the existing post ID.
+          // The cache returns normally on every later request once recovery succeeds.
+        }
+      } else {
+        return NextResponse.json({
+          success: true,
+          partial: Boolean(partialError),
+          error: partialError ? partialResultMessage(places.length) : null,
+          socialPostId: existingPost.id,
+          data: responseData,
+          rawApifyData: existingPost.raw_apify_data || null,
+          places,
+          place: firstPlace,
+          place_id: firstPlace?.id || firstPlace?.place_id || null,
+          placeIds: responsePlaceIds(places),
+          aiAnalysis: existingPost.ai_analysis || null,
+          transcript: existingPost.whisper_transcript || null,
+          scrapedData: cachedContent,
+          ocrComparison: ocrComparisonFromStoredPost(existingPost),
+          audioUpload: null,
+        });
+      }
     }
 
     // Setup temporary placeholder
@@ -543,6 +515,7 @@ export async function POST(request: Request) {
       success: true,
       partial: Boolean(analyzeData?.partial),
       error: analyzeData?.partial ? analyzeData.error : null,
+      warnings: Array.isArray(analyzeData?.warnings) ? analyzeData.warnings : [],
       socialPostId: completedPost.id,
       data: completedPost,
       rawApifyData: analyzeData?.rawApifyData || completedPost.raw_apify_data || null,
