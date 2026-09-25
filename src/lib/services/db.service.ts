@@ -25,8 +25,6 @@ export type Verification = {
   provider?: 'google' | 'mapbox' | 'stored';
 };
 
-export type SocialPostAccessEvent = 'started' | 'retry' | 'joined_processing' | 'cache_hit';
-
 const PROVIDER_LABEL: Record<NonNullable<Verification['provider']>, string> = {
   google: 'Google Maps',
   mapbox: 'Mapbox',
@@ -76,28 +74,6 @@ export class DbService {
       plog('db', `${table}.(${columns}) not found — apply supabase/migration_v25_place_evidence.sql to enable it`, undefined, 'warn');
     }
     return false;
-  }
-
-  /** Record a URL submission separately from the shared social post. */
-  static async recordSocialPostAccess(
-    socialPostId: string | undefined | null,
-    userId: string | undefined | null,
-    canonicalSourceKey: string,
-    sourceUrl: string,
-    event: SocialPostAccessEvent
-  ): Promise<void> {
-    if (!socialPostId) return;
-    if (!(await this.supportsColumns('social_post_accesses', 'social_post_id, user_id, canonical_source_key, source_url, event'))) return;
-    const { error } = await supabaseAdmin
-      .from('social_post_accesses')
-      .insert({
-        social_post_id: socialPostId,
-        user_id: userId || null,
-        canonical_source_key: canonicalSourceKey,
-        source_url: sourceUrl,
-        event,
-      });
-    if (error) plog('db', 'Failed to record social post access', { socialPostId, event, error: error.message }, 'warn');
   }
 
   /** Link one place to a post, storing why it was detected when the columns exist. */
@@ -795,15 +771,13 @@ export class DbService {
             .update(finalPayload)
             .eq('id', existingPost.id);
 
-          // This was a second placeholder for a post already resolved by a
-          // different request or URL form. Keep it as an audit pointer, never
-          // as another completed post with a random pending_* content id.
+          // Update the placeholder row to completed so the client gets status success
           await supabaseAdmin
             .from('social_posts')
             .update({
-              status: 'merged',
-              merged_into_post_id: existingPost.id,
-              canonical_source_key: null,
+              status: 'completed',
+              ai_analysis: aiAnalysis,
+              whisper_transcript: transcript || null,
             })
             .eq('id', socialPostId);
 
