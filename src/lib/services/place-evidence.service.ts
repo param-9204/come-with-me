@@ -423,7 +423,7 @@ function isOcrVariant(a: string, b: string): boolean {
   return editDistanceWithin(a, b, length >= 12 ? 2 : 1);
 }
 
-function groupOcrLines(entries: OcrEntry[]): OcrGroup[] {
+function groupOcrLines(entries: OcrEntry[], preferComplete = false): OcrGroup[] {
   const groups: OcrGroup[] = [];
   for (const entry of entries) {
     const key = normalizeForMatch(entry.text);
@@ -437,9 +437,13 @@ function groupOcrLines(entries: OcrEntry[]): OcrGroup[] {
       existing.overlayVotes += overlayVote;
       if (entry.timestamp !== undefined && !existing.timestamps.includes(entry.timestamp)) existing.timestamps.push(entry.timestamp);
       if (entry.frame !== undefined && !existing.frameIndexes.includes(entry.frame)) existing.frameIndexes.push(entry.frame);
-      if (entry.confidence > existing.confidence) {
+      // Overlays animate in and get cut at the frame edge: Vision read "Bar Olive"
+      // Tesseract, whose longer readings are trailing junk ("Thali Hi").
+      const completes = preferComplete && key.length > existing.key.length && key.startsWith(existing.key);
+      if (entry.confidence > existing.confidence || (completes && entry.confidence === existing.confidence)) {
         existing.confidence = entry.confidence;
         existing.text = entry.text;
+        if (completes) existing.key = key;
       }
     } else {
       groups.push({
@@ -545,7 +549,7 @@ export function buildEvidence(content: SocialContent, media: MediaEvidenceInput 
     line.length <= MAX_OCR_LINE_CHARS &&
     line.trim().split(/\s+/).length <= MAX_OCR_LINE_WORDS &&
     !isUiChrome(line, creatorUsername);
-  const visionGroups = groupOcrLines(visionEntries.filter((entry) => usable(entry.text)));
+  const visionGroups = groupOcrLines(visionEntries.filter((entry) => usable(entry.text)), true);
   const visionKeys = new Set(visionGroups.map((group) => group.key));
   const ocrGroups = groupOcrLines(
     ocrEntries.filter((entry) => usable(entry.text) && entry.confidence >= OCR_MIN_LINE_CONFIDENCE)
