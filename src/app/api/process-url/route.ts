@@ -180,6 +180,28 @@ function responsePlaceIds(places: any[]): string[] {
   return places.map((place) => place?.id || place?.place_id).filter(Boolean);
 }
 
+/**
+ * Instagram's shortcode identifies the post independently of URL spelling
+ * (`www`, a trailing slash, and query parameters must not create a new run).
+ * Do not infer an identifier for other platforms here: their URL formats are
+ * less stable and an incorrect cache hit would return the wrong post.
+ */
+function instagramShortCodeFromUrl(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+    if (hostname !== 'instagram.com') return null;
+
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    if (!['p', 'reel', 'reels', 'tv'].includes(segments[0]?.toLowerCase())) return null;
+
+    const shortCode = segments[1]?.trim() || '';
+    return /^[A-Za-z0-9_-]+$/.test(shortCode) ? shortCode : null;
+  } catch {
+    return null;
+  }
+}
+
 function ocrComparisonFromStoredPost(post: any) {
   const apifyFrames = Array.isArray(post?.ocr_frames_apify) ? post.ocr_frames_apify : [];
   const gptFrames = Array.isArray(post?.ocr_frames_gpt) ? post.ocr_frames_gpt : [];
@@ -490,79 +512,56 @@ export async function POST(request: Request) {
     );
     const cleanUrlNoSlash = cleanUrl.endsWith('/') ? cleanUrl.slice(0, -1) : cleanUrl;
     const cleanUrlWithSlash = cleanUrlNoSlash + '/';
-    let existingQuery = supabaseAdmin.from('social_posts').select('*');
+    const shortCode = platform === 'instagram' ? instagramShortCodeFromUrl(cleanUrl) : null;
+
+    // Prefer the canonical key for all new records, but keep the immutable
+    // Instagram shortcode and URL fallbacks so pre-migration rows are still
+    // found rather than scraped again.
+    let existingPosts: any[] | null = null;
     if (supportsCanonicalIdentity) {
-      existingQuery = existingQuery
+      const { data, error } = await supabaseAdmin
+        .from('social_posts')
+        .select('*')
         .eq('platform', platform)
         .eq('canonical_source_key', canonicalSourceKey)
-        .is('merged_into_post_id', null);
-    } else {
-      // Compatibility while the migration is being deployed.
-      existingQuery = existingQuery.in('post_url', [cleanUrlNoSlash, cleanUrlWithSlash]);
+        .is('merged_into_post_id', null)
+        .order('created_at', { ascending: false });
+      if (error) throw new Error(`Failed to look up canonical post: ${error.message}`);
+      existingPosts = data;
     }
-    const { data: existingPosts } = await existingQuery.order('created_at', { ascending: false });
+
+    if (!existingPosts?.length && shortCode) {
+      const { data, error } = await supabaseAdmin
+        .from('social_posts')
+        .select('*')
+        .eq('platform', 'instagram')
+        .eq('short_code', shortCode)
+        .order('created_at', { ascending: false });
+      if (error) throw new Error(`Failed to look up Instagram shortcode: ${error.message}`);
+      existingPosts = data;
+    }
+
+    if (!existingPosts?.length) {
+      const { data, error } = await supabaseAdmin
+        .from('social_posts')
+        .select('*')
+        .in('post_url', [cleanUrlNoSlash, cleanUrlWithSlash])
+        .order('created_at', { ascending: false });
+      if (error) throw new Error(`Failed to look up processed URL: ${error.message}`);
+      existingPosts = data;
+    }
 
     const foundCompletedPost = existingPosts?.find(p => p.status === 'completed');
     const existingPost = foundCompletedPost || (existingPosts && existingPosts.length > 0 ? existingPosts[0] : null);
 
     if (existingPost && existingPost.status === 'completed') {
-      let savedPlaces = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
+      const savedPlaces = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
       const partialError = restrictedAccessMessage(existingPost.raw_apify_data);
-      let responseOnlyPlaces: any[] = [];
       const cachedContent = contentFromStoredPost(existingPost);
 
-      // Restricted records saved by older versions may contain only the raw
-      // Apify payload. Repair the source-backed post fields before returning
-      // it so creator metadata is never reported as "unknown".
-      if (partialError && (existingPost.author_username !== cachedContent.authorUsername || existingPost.caption !== cachedContent.caption)) {
-        const { error: postRepairError } = await supabaseAdmin
-          .from('social_posts')
-          .update({
-            author_username: cachedContent.authorUsername,
-            caption: cachedContent.caption,
-            hashtags: cachedContent.hashtags,
-            mentions: cachedContent.mentions,
-          })
-          .eq('id', existingPost.id);
-        if (postRepairError) {
-          console.warn('[process-url] Failed to repair cached restricted post fields:', postRepairError.message);
-        }
-      }
-
-      if (partialError && savedPlaces.length === 0 && (existingPost.caption || existingPost.raw_apify_data?.description)) {
-        try {
-          responseOnlyPlaces = await AiEnrichmentService.extractPlace(
-            cachedContent,
-            existingPost.whisper_transcript || '',
-            []
-          );
-          const savedIds = await Promise.all(responseOnlyPlaces.map((place) =>
-            DbService.savePlace(
-              place,
-              existingPost.post_url,
-              cachedContent.platform,
-              existingPost.whisper_transcript || '',
-              undefined,
-              existingPost.id,
-              cachedContent.authorUsername
-            )
-          ));
-          if (savedIds.some(Boolean)) {
-            savedPlaces = await DbService.getPlacesForSocialPost(existingPost.id, existingPost.post_url);
-            const savedPlaceKeys = new Set(savedPlaces.map((place: any) =>
-              `${String(place.name || '').trim().toLowerCase()}|${String(place.city || '').trim().toLowerCase()}`
-            ));
-            responseOnlyPlaces = responseOnlyPlaces.filter((place) =>
-              !savedPlaceKeys.has(`${String(place.name || '').trim().toLowerCase()}|${String(place.city || '').trim().toLowerCase()}`)
-            );
-          }
-          console.log(`[process-url] Recovered ${responseOnlyPlaces.length} place(s) from cached restricted post ${existingPost.id}.`);
-        } catch (placeError: any) {
-          console.warn('[process-url] Cached restricted-place recovery failed:', placeError.message);
-        }
-      }
-
-      const places = formatResponsePlaces([...savedPlaces, ...responseOnlyPlaces], {
+      // A completed post is a cache hit. Return only the persisted result: do
+      // not scrape, run OCR, call AI, or write a recovery result on this path.
+      const places = formatResponsePlaces(savedPlaces, {
         authorUsername: cachedContent.authorUsername,
         sourceUrl: existingPost.post_url,
         platform: cachedContent.platform,
@@ -614,6 +613,7 @@ export async function POST(request: Request) {
         }
         return NextResponse.json({
           success: true,
+          cached: true,
           partial: Boolean(partialError),
           error: partialError ? partialResultMessage(places.length) : null,
           socialPostId: existingPost.id,
@@ -656,6 +656,7 @@ export async function POST(request: Request) {
             status: 'pending',
             platform,
             content_id: tempContentId,
+            short_code: shortCode,
             user_id: finalUserId || null,
           }, { onConflict: 'platform,canonical_source_key', ignoreDuplicates: true })
           .select('*');
@@ -681,6 +682,7 @@ export async function POST(request: Request) {
             status: 'pending',
             platform,
             content_id: tempContentId,
+            short_code: shortCode,
             user_id: finalUserId || null
           })
           .select('id')
