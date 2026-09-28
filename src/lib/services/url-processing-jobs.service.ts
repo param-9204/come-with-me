@@ -63,6 +63,25 @@ export class UrlProcessingJobsService {
     return data as UrlProcessingJob | null;
   }
 
+  /**
+   * A mobile user has one stable polling job per canonical social source.
+   * Ordering by creation time also makes this deterministic for rows created
+   * before this idempotency lookup existed.
+   */
+  static async getJobForUserAndSource(userId: string, canonicalSourceKey: string): Promise<UrlProcessingJob | null> {
+    const { data, error } = await supabaseAdmin
+      .from('social_post_accesses')
+      .select(JOB_COLUMNS)
+      .eq('user_id', userId)
+      .eq('canonical_source_key', canonicalSourceKey)
+      .eq('event', 'job')
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw new Error(`Unable to read existing processing job: ${error.message}`);
+    return data as UrlProcessingJob | null;
+  }
+
   /** Mobile job IDs are random server-generated UUIDs and act as the polling capability. */
   static async getJob(id: string): Promise<UrlProcessingJob | null> {
     const { data, error } = await supabaseAdmin

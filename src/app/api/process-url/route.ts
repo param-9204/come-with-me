@@ -466,6 +466,34 @@ export async function POST(request: Request) {
       if (!finalUserId) {
         return NextResponse.json({ success: false, error: 'A valid clerk_user_id is required for mobile processing' }, { status: 400 });
       }
+
+      // Repeated submissions from the same user return their original polling
+      // capability. The canonical key treats spelling variants of the same
+      // reel as one source while still allowing other users to have jobs.
+      const existingJob = await UrlProcessingJobsService.getJobForUserAndSource(finalUserId, canonicalSourceKey);
+      if (existingJob) {
+        const workerScheduled = ['queued', 'waiting'].includes(existingJob.status);
+        if (workerScheduled) {
+          const workerId = `repeat-${uuidv4()}`;
+          after(async () => {
+            try {
+              await UrlProcessingJobsService.drain(origin, workerId, 2);
+            } catch (error) {
+              console.error('[process-url] repeated mobile job drain failed:', error);
+            }
+          });
+        }
+        return NextResponse.json({
+          success: true,
+          reused: true,
+          jobId: existingJob.id,
+          socialPostId: existingJob.social_post_id,
+          status: existingJob.status,
+          workerScheduled,
+          warning: null,
+        }, { status: 202 });
+      }
+
       const claimed = await claimSocialPostForMobileJob(cleanUrl, platform, canonicalSourceKey, finalUserId);
       const status = jobStatusForPost(claimed.post, claimed.created);
       const [job] = await UrlProcessingJobsService.createJobs(finalUserId, [{
