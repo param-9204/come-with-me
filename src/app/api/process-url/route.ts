@@ -3,10 +3,10 @@ import { supabaseAdmin } from '@/lib/supabase';
 import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { DbService } from '@/lib/services/db.service';
 import { AiEnrichmentService } from '@/lib/services/ai-enrichment.service';
-import { MediaEvidenceService } from '@/lib/services/media-evidence.service';
-import { PipelineLog, withPipelineLog } from '@/lib/services/pipeline-log';
+import { PipelineLog } from '@/lib/services/pipeline-log';
 import { ScraperService } from '@/lib/services/scraper.service';
-import type { SocialContent } from '@/lib/types/social';
+import type { ApifyOcrFrameResult, GptVisionFrameResult, SocialContent, TranscriptSegment } from '@/lib/types/social';
+import type { AudioUploadRef } from '@/lib/services/media-evidence.service';
 import { v4 as uuidv4 } from 'uuid';
 import { resolveCanonicalSocialSource } from '@/lib/social-source';
 import { UrlProcessingJobsService, type UrlProcessingJobStatus } from '@/lib/services/url-processing-jobs.service';
@@ -293,6 +293,7 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
     // Poll status
     let contentData: any = null;
     let rawApifyDataObj: any = null;
+    let isDescriptionOnlyPartial = false;
     let pollCount = 0;
     while (true) {
       pollCount++;
@@ -308,6 +309,7 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
       if (statusData.status === 'SUCCEEDED') {
         contentData = statusData.data;
         rawApifyDataObj = statusData.raw;
+        isDescriptionOnlyPartial = Boolean(statusData.partial);
         break;
       } else if (
         ['FAILED', 'ABORTED', 'TIMED-OUT'].includes(statusData.status)
@@ -326,31 +328,43 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
       .update({ status: 'processing' })
       .eq('id', socialPostId);
 
-    // 2. Media evidence in-process: one download, key frames, local OCR,
-    // vision fallback only for hard frames, platform subtitles or Whisper.
-    const mediaLog = new PipelineLog(String(contentData?.contentId || socialPostId), {
-      route: 'process-url', socialPostId, url, pipelineRunId, pipelineStartedAt,
-    });
-    mediaLog.setRunInput({
-      platform: contentData.platform,
-      inputUrl: url,
-      socialPostId,
-      entrypoint: 'process-url',
-      contentId: contentData.contentId,
-      contentType: contentData.contentType,
-      caption: contentData.caption,
-      hashtags: contentData.hashtags,
-      mentions: contentData.mentions,
-      taggedAccounts: contentData.taggedUsers,
-      metadata: { videoDuration: contentData.videoDuration, dimensions: contentData.dimensions },
-    });
-    const media = await withPipelineLog(mediaLog, () => MediaEvidenceService.collect(contentData, rawApifyDataObj));
-    mediaLog.flush();
-    await mediaLog.flushDatabase();
-    const whisperTranscript = media.transcriptText;
-    const audioUploadObj = media.audioUpload;
-    const ocrResultsList = media.ocrFrames;
-    const gptVisionResultsList = media.visionFrames;
+    // 2. Media evidence through /media, exactly as the web client runs it:
+    // its own invocation and time budget, skipped for description-only
+    // (restricted) pages, and a media failure falls back to metadata-only
+    // analysis instead of failing the whole job.
+    let whisperTranscript = '';
+    let transcriptSegments: TranscriptSegment[] = [];
+    let transcriptSource = 'none';
+    let transcriptLanguage: string | null = null;
+    let ocrResultsList: ApifyOcrFrameResult[] = [];
+    let gptVisionResultsList: GptVisionFrameResult[] = [];
+    let audioUploadObj: AudioUploadRef | null = null;
+    let processingWarnings: string[] = [];
+    if (!isDescriptionOnlyPartial) {
+      try {
+        const mediaRes = await fetch(`${origin}/api/process-url/media`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: contentData, rawApifyData: rawApifyDataObj, url, socialPostId, pipelineRunId, pipelineStartedAt }),
+        });
+        const mediaData = await mediaRes.json();
+        if (!mediaRes.ok || !mediaData.success) {
+          throw new Error(mediaData.error || 'Media processing failed');
+        }
+        whisperTranscript = mediaData.transcript || '';
+        transcriptSegments = mediaData.transcriptSegments || [];
+        transcriptSource = mediaData.transcriptSource || 'none';
+        transcriptLanguage = mediaData.transcriptLanguage || null;
+        ocrResultsList = mediaData.ocrFrames || [];
+        gptVisionResultsList = mediaData.visionFrames || [];
+        audioUploadObj = mediaData.audioUpload || null;
+        processingWarnings = Array.isArray(mediaData.warnings)
+          ? mediaData.warnings.filter((warning: unknown): warning is string => typeof warning === 'string' && warning.trim().length > 0)
+          : [];
+      } catch (mediaErr) {
+        console.warn(`[Synchronous Pipeline] Media failed for ${url}, proceeding with metadata only:`, mediaErr instanceof Error ? mediaErr.message : String(mediaErr));
+      }
+    }
 
     // 4. Final synthesis and analysis
     const analyzeRes = await fetch(`${origin}/api/process-url/analyze`, {
@@ -360,12 +374,12 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
         content: contentData,
         rawApifyData: rawApifyDataObj,
         transcript: whisperTranscript,
-        transcriptSegments: media.transcript?.segments || [],
-        transcriptSource: media.transcript?.source || 'none',
-        transcriptLanguage: media.transcript?.language || null,
+        transcriptSegments,
+        transcriptSource,
+        transcriptLanguage,
         apifyOcrFrames: ocrResultsList,
         gptVisionFrames: gptVisionResultsList,
-        processingWarnings: media.warnings,
+        processingWarnings,
         url,
         audioUploadId: audioUploadObj?.id,
         userId: userId || null,
