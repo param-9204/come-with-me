@@ -420,6 +420,10 @@ export class LocationService {
     const value = name.trim();
     // "331 West 4th Street" is an address (a building), not the street itself.
     if (!value || /^\d{1,6}\s/.test(value) || /\d{1,6}\s+\S+.*,/.test(value)) return false;
+    // "Saks 5th Ave", "Christmas Balls 6th Ave": a place named after its street.
+    // Only a direction comes before a numbered street ("West 4th Street").
+    const numbered = value.match(/^(.+?)\s+\d+(?:st|nd|rd|th)\s+\S+$/i);
+    if (numbered && !/^(?:[NSEW]\.?|north|south|east|west)$/i.test(numbered[1])) return false;
     return /\b(?:street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|parkway|pkwy|terrace|highway|hwy)\.?$/i.test(value) ||
       /^(?:rue|calle|via|avenida|strada|chemin|quai|all[ée]e)\s+\S/i.test(value) ||
       /(?:straße|strasse|gasse|straat)$/i.test(value);

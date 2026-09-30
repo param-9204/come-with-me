@@ -1466,7 +1466,11 @@ export class AiEnrichmentService {
         );
         const sourceAddressCount = distinctSourceAddressCount(trustedLocationItems.map((item) => item.text));
         // Every 📍-marked line (any pin style, normalised) is a location the creator pointed at.
-        const markedLocations = creatorItems.filter((item) => /^📍/u.test(item.text)).length;
+        // Vision sometimes redraws the pins as themed emoji ("🏨 The Plaza", "⚓ Hudson
+        // Yards": 22 pins on one read of DdunlaYMFX6, 7 on the next), so an
+        // emoji-led screen line counts as a marker too.
+        const markedLocations = creatorItems.filter((item) => /^📍/u.test(item.text) ||
+          ((item.source === 'ocr' || item.source === 'vision_ocr') && /^\s*\p{Extended_Pictographic}/u.test(item.text))).length;
         // Itinerary captions name their stops by @handle ("coffee from
         // @mochameltcafe", "pilates class at @togetherathletics"); each distinct
         // handle in the creator's own lines is a possible stop. Credits and
