@@ -198,7 +198,8 @@ const PIN_RE = /^\s*📍/u;
 /** Bulleted or numbered lines: a deliberate list, never scenery. */
 /** A word must follow the bullet or number: prices ("9.95") are not list items. */
 const LIST_ITEM_RE = /^\s*(?:[•·●▪◦\-–*]|\d{1,2}[.)])\s*[\p{L}@"'“]/u;
-const GUIDE_HEADING_RE = /\b(?:dining|restaurants?|caf(?:e|é)s?|coffee|bars?|food|spots?|places|guide|itinerary|top)\b/i;
+const LIST_TITLE_RE = /^(?:📍\s*)?\d|\b(?:shops|spots|places|cafes|restaurants|bars|things|guide|best|top)\b/i;
+const GUIDE_HEADING_RE =/\b(?:dining|restaurants?|caf(?:e|é)s?|coffee|bars?|food|spots?|places|guide|itinerary|top)\b/i;
 
 // ──────────────────────────────────────────────────────────────────────
 // Location markers
@@ -578,7 +579,7 @@ export function buildEvidence(content: SocialContent, media: MediaEvidenceInput 
       weight: SOURCE_WEIGHTS.vision_ocr,
       timestamps: group.timestamps.length ? group.timestamps.sort((a, b) => a - b) : undefined,
       frames: group.frameIndexes.length ? group.frameIndexes : undefined,
-      ...(isSceneGroup(group) ? { scene: true } : {}),
+      ...(isSceneGroup(group) ? { scene: true } : group.overlayVotes > 0 && group.sceneVotes === 0 ? { scene: false } : {}),
     });
   }
 
@@ -916,6 +917,18 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
     ? places.filter((place) => !!place.name && findNameSupport(place.name, bundle).some(isPinned)).length
     : 0;
   const pinLabelled = pinnedCandidates >= 2;
+  // A name that is a frame's only overlay text is a title card, as deliberate as
+  // a pin: Vision read "📍 Ralph's Coffee" on one card and plain "Manjul Coffee"
+  // on the next (DdtbaWzI831). The post's own title ("4 Iconic coffee shops in
+  // NYC") is not a card.
+  const overlayLinesPerFrame = new Map<number, number>();
+  for (const item of bundle.items) {
+    if (item.source !== 'vision_ocr' || item.scene !== false) continue;
+    for (const frame of item.frames || []) overlayLinesPerFrame.set(frame, (overlayLinesPerFrame.get(frame) || 0) + 1);
+  }
+  const isCardLabel = (item: EvidenceItem) => item.source === 'vision_ocr' && item.scene === false &&
+    !LIST_TITLE_RE.test(normalizeLocationMarker(item.text)) && normalizeForMatch(item.text).split(' ').length <= 6 &&
+    (item.frames || []).some((frame) => overlayLinesPerFrame.get(frame) === 1);
   const isAreaCandidate = (place: ScorablePlace) => (place.base_category || place.category) === 'CITY';
   const visualAreaCandidates = places.filter((place) => {
     const name = (place.name || '').trim();
@@ -1031,7 +1044,7 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
         repeatedFrames >= repeatedFrameMin) {
         reject('repeated visual guide title or watermark'); continue;
       }
-      const deliberateScreenLabel = support.some(isPinned) || support.some(isListItem);
+      const deliberateScreenLabel = support.some(isPinned) || support.some(isListItem) || support.some(isCardLabel);
       const mapAreaLabel = visualAreaGuide && isAreaCandidate(place) && support.some(isScreenText);
       canPromoteRole = deliberateScreenLabel || mapAreaLabel;
       if (pinLabelled && support.every(isScreenText) && !deliberateScreenLabel && !mapAreaLabel) {

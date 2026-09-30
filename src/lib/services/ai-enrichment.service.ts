@@ -548,7 +548,7 @@ function isPlausibleStreetAddress(value: string): boolean {
   }
   // Avoid converting list copy such as "5 cozy restaurants" into the
   // fabricated address "5 cozy Street".
-  if (/^\d{1,6}\s+(?:cozy|best|top|great|favorite|popular|new|nice|amazing|restaurants?|cafes?|bars?|places?|spots?|stops?|things?|days?|hours?|minutes?|mins?|people|dollars?|years?)\b/i.test(normalized)) {
+  if (/^\d{1,6}\s+(?:cozy|best|top|great|favorite|popular|new|nice|amazing|iconic|hidden|underrated|essential|must|famous|secret|shops?|restaurants?|cafes?|bars?|places?|spots?|stops?|things?|days?|hours?|minutes?|mins?|people|dollars?|years?)\b/i.test(normalized)) {
     return false;
   }
   // Without a road suffix, the short social form needs a street-shaped word
@@ -634,9 +634,12 @@ function attachAddressesFromSources(
   // A number that starts a venue's own name ("11 Madison Park", "15 East") is
   // not a street address to hand to a neighbouring list entry.
   const nameKeys = places.map((place) => collapseAlnum(place.name || '')).filter(Boolean);
+  // Nor is a date or rank written right before a venue's name ("Oct 26 … 31
+  // Pumpkin Palooza, St. Mary's Park" is not "31 Pumpkin Street").
   const found = findStreetAddressesInText(blob).filter((addr) => {
     const rawKey = collapseAlnum(blob.slice(addr.index, addr.end));
-    return !nameKeys.some((key) => key.includes(rawKey));
+    const afterNumber = collapseAlnum(blob.slice(addr.index, addr.index + 120).replace(/^\d+\s*/, ''));
+    return !nameKeys.some((key) => key.includes(rawKey) || (key.length >= 6 && afterNumber.startsWith(key)));
   });
   if (found.length === 0) return places;
 
@@ -786,6 +789,9 @@ function applySharedGeoContext(
   });
 }
 
+const hasRoadWord = (text: string) =>
+  /\b(?:St|Street|Ave|Avenue|Blvd|Boulevard|Rd|Road|Dr|Drive|Ln|Lane|Way|Ct|Court|Pl|Place|Pkwy|Parkway)\b/i.test(text);
+
 function refineExtractedPlaces(places: PlaceExtraction[], bundle: EvidenceBundle): PlaceExtraction[] {
   const textOf = (sources: string[]) => bundle.items.filter((item) => sources.includes(item.source)).map((item) => item.text);
   // Prefer on-screen text for display-name upgrades; caption/speech are fallback only.
@@ -796,8 +802,12 @@ function refineExtractedPlaces(places: PlaceExtraction[], bundle: EvidenceBundle
   const fallbackSources = [caption, speech].filter(Boolean);
   // Scene text is excluded: a billboard or street sign ("1540 BROADWAY",
   // "W 23 St") is not the address of the venue named nearby.
+  // When Vision read the frames, a Tesseract line without a road word ("10 NCC"
+  // for "NYC", "otte New York Palace 501 Show") is a misread, not "10 NCC Street".
+  const hasVision = bundle.items.some((item) => item.source === 'vision_ocr');
   const creatorScreenText = bundle.items
     .filter((item) => ['ocr', 'vision_ocr', 'comment_creator'].includes(item.source) && !item.scene)
+    .filter((item) => !(hasVision && item.source === 'ocr' && !hasRoadWord(item.text)))
     .map((item) => item.text);
   const addressSources = [caption, ...creatorScreenText, speech].filter(Boolean);
 
