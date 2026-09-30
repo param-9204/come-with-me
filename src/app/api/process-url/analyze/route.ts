@@ -6,7 +6,7 @@ import { DbService } from '@/lib/services/db.service';
 import { ApifyOcrService } from '@/lib/services/apify-ocr.service';
 import { GptVisionOcrService } from '@/lib/services/gpt-vision-ocr.service';
 import { WhisperService } from '@/lib/services/whisper.service';
-import { mergeSameEntities } from '@/lib/services/place-evidence.service';
+import { mergeSameEntities, normalizeForMatch } from '@/lib/services/place-evidence.service';
 import { PipelineLog, plog, recordPipelineEvidence, recordPlaceCandidate, withPipelineLog } from '@/lib/services/pipeline-log';
 import { googleMapsUrl } from '@/lib/maps-url';
 import type { PlaceExtraction, TranscriptResult, TranscriptSegment } from '@/lib/types/social';
@@ -192,7 +192,7 @@ async function handleAnalyze(request: Request, log: PipelineLog) {
     if (placeAnalysis && placeAnalysis.length > 0) {
       const uniquePlaces = mergeSameEntities(placeAnalysis.filter((place) => !!place.name), evidenceBundle);
 
-      const saveResults = await mapWithConcurrency(uniquePlaces, SAVE_CONCURRENCY, async (place, index) => {
+      const savePlace = async (place: PlaceExtraction, index: number) => {
         const candidateKey = `accepted-${index}`;
         recordPlaceCandidate(candidateKey, place, 'accepted');
         try {
@@ -207,8 +207,21 @@ async function handleAnalyze(request: Request, log: PipelineLog) {
           recordPlaceCandidate(candidateKey, place, 'save_failed', { reason: placeErr.message || String(placeErr) });
           return { place, id: null };
         }
+      };
+      // Same-name candidates the merge kept apart (different city text) can be
+      // one map place. Saved in parallel, both passed the "already in database"
+      // check and it was inserted twice ("Vermont" ×2 on DdCKkgRReK2), so each
+      // name's candidates are saved one after another.
+      const byName = new Map<string, number[]>();
+      uniquePlaces.forEach((place, index) => {
+        const key = normalizeForMatch(place.name);
+        byName.set(key, [...(byName.get(key) || []), index]);
       });
-      placeIds = [...new Set(saveResults.map((result) => result.id).filter(Boolean) as string[])];
+      const saveResults: Awaited<ReturnType<typeof savePlace>>[] = new Array(uniquePlaces.length);
+      await mapWithConcurrency([...byName.values()], SAVE_CONCURRENCY, async (indexes) => {
+        for (const index of indexes) saveResults[index] = await savePlace(uniquePlaces[index], index);
+      });
+      placeIds =[...new Set(saveResults.map((result) => result.id).filter(Boolean) as string[])];
       unresolvedPlaces = saveResults.filter((result) => !result.id).map((result) => result.place);
       if (unresolvedPlaces.length > 0) {
         plog('run', `${unresolvedPlaces.length} place(s) not saved (no verified location); returned without coordinates`, {

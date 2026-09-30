@@ -765,7 +765,7 @@ export class LocationService {
   /** Google-shaped view of a Mapbox result, so both providers go through one verification path. */
   private static placeFromMapbox(feature: MapboxFeature): ProviderPlace {
     // Geocoding v6 areas carry a feature type instead of POI categories.
-    const areaTypes: Record<string, string> = { neighborhood: 'neighborhood', locality: 'sublocality', place: 'locality', street: 'route' };
+    const areaTypes: Record<string, string> = { region: 'administrative_area_level_1', neighborhood: 'neighborhood', locality: 'sublocality', place: 'locality', street: 'route' };
     const areaType = areaTypes[feature.featureType];
     const types = areaType === 'route'
       ? ['route']
@@ -801,7 +801,10 @@ export class LocationService {
     if (!cityInfo.name) return null;
     const key = `${cityInfo.name}|${cityInfo.country || ''}`;
     if (this.mapboxCityCentres.has(key)) return this.mapboxCityCentres.get(key)!;
-    const features = await MapboxService.geocode(cityInfo.name, 'place', { country: cityInfo.country });
+    // A post's location can be a state ("Vermont"). Mapbox ranks the state
+    // first there and the city first for "New York" / "Washington" (measured
+    // 2026-09-30); `place` alone boxed a Vermont post into Vermont, Illinois.
+    const features = await MapboxService.geocode(cityInfo.name, 'place,region', { country: cityInfo.country });
     const match = features.find((feature) => this.cityMatches(cityInfo.name, [feature.name, feature.place || ''], feature.fullAddress));
     const centre: [number, number] | null = match ? [match.lng, match.lat] : null;
     this.mapboxCityCentres.set(key, centre);

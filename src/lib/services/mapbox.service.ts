@@ -125,7 +125,7 @@ export class MapboxService {
   }
 
   /** Cities, neighbourhoods or street addresses via Geocoding v6. */
-  static geocode(query: string, types: 'place' | 'neighborhood' | 'address', options: SearchOptions = {}): Promise<MapboxFeature[]> {
+  static geocode(query: string, types: 'place' | 'place,region' | 'neighborhood' | 'address', options: SearchOptions = {}): Promise<MapboxFeature[]> {
     return this.request(GEOCODING_V6_URL, { q: query.slice(0, 256), types, ...this.baseParams({ limit: 5, ...options }) });
   }
 
@@ -134,9 +134,11 @@ export class MapboxService {
    * only; pass the city centre as `proximity`. Adding the city to the text
    * made Mapbox match the city words instead (measured on 2026-09-25:
    * "Greenwhich Vilage, New York" returned "New York Avenue, Trenton").
+   * States are areas too: without `region`, "Vermont" returned only the
+   * village of Vermont, Illinois (measured 2026-09-30).
    */
   static geocodeArea(query: string, options: SearchOptions = {}): Promise<MapboxFeature[]> {
-    return this.request(GEOCODING_V6_URL, { q: query.slice(0, 256), types: 'neighborhood,locality,place', ...this.baseParams({ limit: 5, ...options }) });
+    return this.request(GEOCODING_V6_URL, { q: query.slice(0, 256), types: 'region,neighborhood,locality,place', ...this.baseParams({ limit: 5, ...options }) });
   }
 
   /**
