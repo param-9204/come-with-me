@@ -30,7 +30,7 @@ async function extractionRunsForPostUrl(postUrl: string | null) {
   if (!token) return { data: [] as Data[], error: null };
   let emptyResult: { data: Data[]; error: null } = { data: [], error: null };
   let lastError: { code?: string; message?: string } | null = null;
-  for (const column of ['post_url', 'url', 'source_url']) {
+  for (const column of ['input_url', 'post_url', 'url', 'source_url']) {
     const result = await supabaseAdmin.from('extraction_runs').select('*').ilike(column, `%${token}%`);
     if (!result.error) {
       if ((result.data ?? []).length) return result as { data: Data[]; error: null };
@@ -176,7 +176,16 @@ function cleanEvidence(value: unknown) {
 function extractionView(runs: Data[], stages: Data[], calls: Data[], candidates: Data[], logs: Data[]) {
   return runs.map((run, index) => {
     const runId = run.id;
-    const evidenceBySource = data(run.evidence_by_source);
+    const inputSnapshot = data(run.input_snapshot);
+    const resultSummary = data(run.result_summary);
+    const inputMeta = data(inputSnapshot.metadata);
+    
+    const captionChars = typeof inputSnapshot.caption === 'string' ? inputSnapshot.caption.length : null;
+    const hashtagCount = Array.isArray(inputSnapshot.hashtags) ? inputSnapshot.hashtags.length : null;
+    const mentionCount = Array.isArray(inputSnapshot.mentions) ? inputSnapshot.mentions.length : null;
+    const taggedAccountCount = Array.isArray(inputSnapshot.taggedAccounts) ? inputSnapshot.taggedAccounts.length : null;
+    const subtitleTracks = Array.isArray(inputMeta.subtitleTracks) ? inputMeta.subtitleTracks.length : null;
+    
     const logItems = logs.filter((log) => log.run_id === runId).map((log) => ({
       part: text(log.part) || 'pipeline',
       events: number(log.event_count) || 0,
@@ -185,35 +194,34 @@ function extractionView(runs: Data[], stages: Data[], calls: Data[], candidates:
     }));
     return {
       label: `Run ${index + 1}`,
-      trigger: text(run.trigger) || 'processing',
+      trigger: text(run.entrypoint) || text(run.trigger) || 'processing',
       status: text(run.status) || 'pending',
       started_at: text(run.started_at) || text(run.created_at),
       duration_ms: number(run.duration_ms),
-      failed_stage: text(run.failed_stage),
       error_message: text(run.error_message),
       input: {
-        caption_characters: number(run.caption_chars),
-        hashtags: number(run.hashtag_count),
-        mentions: number(run.mention_count),
-        tagged_accounts: number(run.tagged_account_count),
+        caption_characters: captionChars !== null ? captionChars : number(run.caption_chars),
+        hashtags: hashtagCount !== null ? hashtagCount : number(run.hashtag_count),
+        mentions: mentionCount !== null ? mentionCount : number(run.mention_count),
+        tagged_accounts: taggedAccountCount !== null ? taggedAccountCount : number(run.tagged_account_count),
         comments: number(run.comment_count),
         media_items: number(run.media_items),
-        subtitle_tracks: number(run.subtitle_tracks),
+        subtitle_tracks: subtitleTracks !== null ? subtitleTracks : number(run.subtitle_tracks),
       },
       evidence: {
         items: number(run.evidence_items),
-        sources: Object.entries(evidenceBySource).map(([source, count]) => ({ source, count: number(count) || 0 })),
+        sources: [], // evidence_by_source was removed from the schema
         transcript_source: text(run.transcript_source),
         transcript_language: text(run.transcript_language),
-        ocr_frames: number(run.ocr_frames),
-        vision_frames: number(run.vision_frames),
+        ocr_frames: number(inputMeta.ocrFrameCount) ?? number(run.ocr_frames),
+        vision_frames: number(inputMeta.visionFrameCount) ?? number(run.vision_frames),
       },
       outcome: {
-        candidates: number(run.candidates_count),
-        accepted: number(run.accepted_count),
-        rejected: number(run.rejected_count),
-        saved: number(run.saved_count),
-        unsaved: number(run.unsaved_count),
+        candidates: number(resultSummary.returnedPlaceCount) ?? number(run.candidates_count),
+        accepted: number(resultSummary.persistedPlaceCount) ?? number(run.accepted_count),
+        rejected: number(resultSummary.rejectedCandidateCount) ?? number(run.rejected_count),
+        saved: number(resultSummary.persistedPlaceCount) ?? number(run.saved_count),
+        unsaved: number(resultSummary.unresolvedPlaceCount) ?? number(run.unsaved_count),
         recovery_places_added: number(run.recovery_places_added),
       },
       stages: stages.filter((stage) => stage.run_id === runId).map((stage) => ({

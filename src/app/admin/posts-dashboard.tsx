@@ -335,9 +335,9 @@ function Places({ detail }: { detail: PostDetail }) {
                   {link.explanation}
                 </p>
               )}
-              {location?.map_url && (
+              {(place.google_place_id || location?.latitude) && (
                 <a
-                  href={location.map_url}
+                  href={place.google_place_id ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(name)}&query_place_id=${place.google_place_id}` : `https://www.google.com/maps/search/?api=1&query=${location?.latitude},${location?.longitude}`}
                   target="_blank"
                   rel="noreferrer"
                   className="mt-4 inline-flex items-center gap-1 text-xs font-bold text-indigo-300 hover:text-indigo-200"
@@ -852,7 +852,7 @@ function ApifyExtraction({ detail }: { detail: PostDetail }) {
     !Array.isArray(detail.related.apify)
       ? (detail.related.apify as Data)
       : {};
-  if (apify.available !== true)
+  if (Object.keys(apify).length === 0)
     return (
       <Section title="Apify extraction">
         <p className="text-sm text-zinc-500">

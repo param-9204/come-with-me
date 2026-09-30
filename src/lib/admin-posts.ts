@@ -168,17 +168,19 @@ export async function getAdminPostPage(options: { limit?: number; offset?: numbe
   const offset = Math.max(options.offset ?? 0, 0);
   const { count, error: countError } = await supabaseAdmin
     .from('social_posts')
-    .select('id', { count: 'exact', head: true });
+    .select('id', { count: 'exact', head: true })
+    .or('content_id.is.null,content_id.not.ilike.%pending%');
 
   if (countError) {
     console.error('[Admin] Unable to count posts:', countError.message);
     return { posts: [], total: 0, nextOffset: null, error: countError.message };
   }
 
-  const fields = 'id, user_id, place_id, platform, content_type, author_username, caption, display_url, post_url, likes, views, comments, primary_category, short_code, status, created_at, raw_apify_data';
+  const fields = 'id, user_id, place_id, platform, content_type, content_id, author_username, caption, display_url, post_url, likes, views, comments, primary_category, short_code, status, created_at, raw_apify_data';
   const { data, error } = await supabaseAdmin
     .from('social_posts')
     .select(fields)
+    .or('content_id.is.null,content_id.not.ilike.%pending%')
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
 
@@ -187,7 +189,10 @@ export async function getAdminPostPage(options: { limit?: number; offset?: numbe
     return { posts: [], total: count ?? 0, nextOffset: null, error: error.message };
   }
 
-  const rows = data ?? [];
+  const rows = (data ?? []).filter(post => {
+    if (!post.content_id) return true;
+    return !post.content_id.toLowerCase().includes('pending');
+  });
   const userIds = [...new Set(rows.map((post) => post.user_id).filter((id): id is string => typeof id === 'string' && Boolean(id)))];
   const placeIds = [...new Set(rows.map((post) => post.place_id).filter((id): id is string => typeof id === 'string' && Boolean(id)))];
   const [profilesResult, placesResult] = await Promise.all([

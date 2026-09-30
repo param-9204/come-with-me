@@ -2,6 +2,7 @@ import AdminPostsDashboard from './posts-dashboard';
 import { getAdminPostPage } from '@/lib/admin-posts';
 
 export const dynamic = 'force-dynamic';
+export const revalidate = 0;
 
 export default async function AdminPage() {
   const { posts, total, error, nextOffset } = await getAdminPostPage({ limit: 15 });

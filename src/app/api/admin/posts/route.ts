@@ -2,6 +2,9 @@ import { NextResponse } from 'next/server';
 
 import { getAdminPostPage } from '@/lib/admin-posts';
 
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+
 /** Returns the light-weight data used by the /admin post directory. */
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
