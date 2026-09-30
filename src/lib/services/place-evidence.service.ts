@@ -432,6 +432,9 @@ function groupOcrLines(entries: OcrEntry[], preferComplete = false): OcrGroup[] 
     const sceneVote = entry.scene === true ? 1 : 0;
     const overlayVote = entry.scene === false ? 1 : 0;
     if (existing) {
+      // A pin on any sighting is kept: one screen can list a name plain under
+      // one heading and pinned under another ("📍 Lotte New York Palace").
+      const pinned = PIN_RE.test(existing.text) || PIN_RE.test(entry.text);
       existing.frames++;
       existing.sceneVotes += sceneVote;
       existing.overlayVotes += overlayVote;
@@ -443,6 +446,7 @@ function groupOcrLines(entries: OcrEntry[], preferComplete = false): OcrGroup[] 
         existing.text = entry.text;
         if (completes) existing.key = key;
       }
+      if (pinned && !PIN_RE.test(existing.text)) existing.text = `📍 ${existing.text.trim()}`;
     } else {
       groups.push({
         text: entry.text.trim(),
@@ -927,6 +931,18 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
   const visualAreaGuide = visualAreaNames.size >= 3 && (guideContext || visualAreaNames.size >= 4);
   const visualGuideHeading = bundle.items.some((item) => isScreenText(item) && GUIDE_HEADING_RE.test(item.text));
   const visualFrameCount = new Set(bundle.items.filter(isScreenText).flatMap((item) => item.frames || [])).size;
+  const repeatedFrameMin = Math.max(3, Math.ceil(visualFrameCount * 0.6));
+  const screenFrames = (name: string) =>
+    new Set(findNameSupport(name, bundle).filter(isScreenText).flatMap((item) => item.frames || [])).size;
+  // Venue candidates on most frames. When many are, the video holds one static
+  // screen (a cheat sheet shown for 8 s, every name on every frame), so
+  // repetition no longer tells a title from the list under it.
+  const repeatedVenues = new Set(visualGuideHeading
+    ? places.filter((place) => {
+      const name = stripGuideOrdinal((place.name || '').trim());
+      return !!name && !isCityName(name) && screenFrames(name) >= repeatedFrameMin;
+    })
+    : []);
 
   for (const place of places) {
     let name = stripGuideOrdinal((place.name || '').trim());
@@ -1004,12 +1020,15 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
       // AMDAVAD" over every venue card). Not when it is a numbered or bulleted
       // list line (a one-slide list is on every frame), and not when it is the
       // post's only candidate (a single-venue video shows the venue's name
-      // throughout, e.g. "SUNDOWNER CAFE").
+      // throughout, e.g. "SUNDOWNER CAFE"), and not on a static screen where
+      // most other venues repeat too (NYC Christmas cheat sheet, DdunlaYMFX6).
       const repeatedFrames = new Set(support.filter(isScreenText).flatMap((item) => item.frames || [])).size;
       // Other candidates that are venues; a city candidate ("Ahmedabad") is context, not a second place.
       const otherVenues = places.filter((other) => other !== place && !!other.name && !isCityName(other.name)).length;
-      if (visualGuideHeading && otherVenues > 0 && support.every(isScreenText) && !support.some(isListItem) &&
-        repeatedFrames >= Math.max(3, Math.ceil(visualFrameCount * 0.6))) {
+      const otherRepeated = repeatedVenues.size - (repeatedVenues.has(place) ? 1 : 0);
+      const staticScreen = otherRepeated >= 3 && otherRepeated * 2 >= otherVenues;
+      if (visualGuideHeading && otherVenues > 0 && !staticScreen && support.every(isScreenText) && !support.some(isListItem) &&
+        repeatedFrames >= repeatedFrameMin) {
         reject('repeated visual guide title or watermark'); continue;
       }
       const deliberateScreenLabel = support.some(isPinned) || support.some(isListItem);

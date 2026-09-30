@@ -598,6 +598,8 @@ function expandShortStreetAddress(address: string): string {
 
 type FoundAddress = { address: string; index: number; end: number };
 
+const DATE_BEFORE_NUMBER_RE = /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s*$/i;
+
 function findStreetAddressesInText(text: string): FoundAddress[] {
   if (!text) return [];
   const found: FoundAddress[] = [];
@@ -606,6 +608,9 @@ function findStreetAddressesInText(text: string): FoundAddress[] {
   while ((match = re.exec(text)) !== null) {
     const candidate = normalizeAddressCandidate(match[1] || match[0]);
     if (!isPlausibleStreetAddress(candidate)) continue;
+    // A date ("Nov 14—Jan 10 Bronx Zoo" → "10 Bronx Street") or a zero-led OCR
+    // fragment ("066 Rockettes") is not a building number.
+    if (/^0/.test(candidate) || DATE_BEFORE_NUMBER_RE.test(text.slice(Math.max(0, match.index - 12), match.index))) continue;
     found.push({
       address: expandShortStreetAddress(candidate),
       index: match.index,
