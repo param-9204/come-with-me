@@ -184,6 +184,11 @@ export class LocationService {
     return { lat: null, lng: null, formattedAddress: null, neighborhood: null, city: null };
   }
 
+  /** Google Places can be searched now (key configured, daily quota not used up). */
+  static googleAvailable(): boolean {
+    return Boolean(this.apiKey()) && !this.placesQuotaExhausted();
+  }
+
   private static apiKey(): string | null {
     const key = process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_PLACES_API_KEY;
     return key && !key.startsWith('your-google-') ? key : null;
@@ -972,9 +977,24 @@ export class LocationService {
 
       const places = (await this.textSearch(first.query, apiKey, first.cityInfo.country))
         .map((place) => ({ ...place, provider: 'google' as const }));
-      for (const [index, lookup] of lookups.entries()) {
-        const verified = this.verifyCandidates(places, lookup, index === 0 ? 'Google Maps' : 'Google Maps (without the neighbourhood)');
-        if (verified) return verified;
+      // Google's answer is final: its top result is the place, under Google's
+      // name, with no city/type/name checks. Measured on 36 rejected Google
+      // answers (2026-10-02): the checks discarded ~27 correct places (Tudor City
+      // Bridge under a wrong "Washington, DC", Saks Fifth Avenue, Ithaca under
+      // "New York") against 2 wrong ones caused by bad input. Mapbox is used
+      // only when Google returns nothing.
+      const top = places.find((place) => Number.isFinite(place.location?.latitude) && Number.isFinite(place.location?.longitude));
+      if (top) {
+        const result = this.resultFromPlace(top, first.cityInfo.name);
+        const similarity = first.cleanName ? this.nameSimilarity(first.cleanName, top.displayName?.text || '') : 0;
+        result.similarity = similarity;
+        result.identity = similarity === 1 ? 'exact_name' : 'fuzzy';
+        result.candidateCount = places.length;
+        plog('geocode', `Google Maps search "${first.query}": took top result "${top.displayName?.text || top.formattedAddress}"`, {
+          results: places.length,
+          chosen: { name: top.displayName?.text, address: top.formattedAddress, type: top.primaryType || top.types?.[0], similarity: Math.round(similarity * 100) / 100 },
+        });
+        return result;
       }
 
       // A source-provided street address still resolves when a small venue is

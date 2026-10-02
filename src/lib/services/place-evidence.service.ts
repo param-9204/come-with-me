@@ -751,10 +751,22 @@ function isCreatorOrAudio(name: string, bundle: EvidenceBundle): string | null {
 function creatorOwnLocationLines(bundle: EvidenceBundle, places: ScorablePlace[], self: ScorablePlace): EvidenceItem[] {
   const others = places.filter((place) => place !== self && place.name && compact(place.name) !== compact(self.name || ''));
   return bundle.items.filter((item) =>
-    (item.source === 'caption' || item.source === 'comment_creator') &&
-    PIN_RE.test(item.text) &&
-    !others.some((place) => itemSupportsName(place.name || '', item))
+    ((item.source === 'caption' || item.source === 'comment_creator') &&
+      PIN_RE.test(item.text) &&
+      !others.some((place) => itemSupportsName(place.name || '', item))) ||
+    // A geotag naming the account itself is the business posting from its own
+    // premises ("jawn.supply" tagged at "Jawn Supply", Dd4K-gwkVu2). A blogger's
+    // geotag never names the blogger.
+    geotagNamesCreator(item, bundle)
   );
+}
+
+/** The post's geotag is the creator's own account name ("Jawn Supply" by @jawn.supply), before any ", City". */
+function geotagNamesCreator(item: EvidenceItem, bundle: EvidenceBundle): boolean {
+  if (item.source !== 'location_tag') return false;
+  const tagKey = compact(item.text.split(/\s*[,|–—]\s*/)[0]);
+  return [bundle.context.creatorFullName, bundle.context.creatorUsername]
+    .some((name) => !!compact(name || '') && tagKey === compact(name || ''));
 }
 
 /**
@@ -917,6 +929,10 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
     ? places.filter((place) => !!place.name && findNameSupport(place.name, bundle).some(isPinned)).length
     : 0;
   const pinLabelled = pinnedCandidates >= 2;
+  // The creator is a business posting about itself, located by its own geotag or pins.
+  const ownVenuePost = bundle.items.some((item) => geotagNamesCreator(item, bundle)) || places.some((place) => !!place.name &&
+    isCreatorOrAudio(stripGuideOrdinal(place.name.trim()), bundle) === 'creator account' &&
+    creatorOwnLocationLines(bundle, places, place).length > 0);
   // A name that is a frame's only overlay text is a title card, as deliberate as
   // a pin: Vision read "📍 Ralph's Coffee" on one card and plain "Manjul Coffee"
   // on the next (DdtbaWzI831). The post's own title ("4 Iconic coffee shops in
@@ -1020,6 +1036,14 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
       support = [...support, ...handleLines, ...ownVenueLocations.filter((item) => !support.includes(item))];
       if (support.length === 0) { reject('name not found in evidence'); continue; }
       if (support.every((item) => item.source === 'creator_bio')) { reject('only in creator bio'); continue; }
+      // On a business's own post, a caption name with no pin or address of its
+      // own is what the business sells ("80s Pinstripe Jacket" on Jawn Supply's
+      // post), not another place. Branches carry pins (MIAM Café) and are kept.
+      if (ownVenuePost && !excluded && !place.address &&
+        support.every((item) => item.source === 'caption' || item.source === 'comment_creator') &&
+        !support.some((item) => PIN_RE.test(item.text))) {
+        reject("item on the business's own post, not a place"); continue;
+      }
       // Tags and mentions identify an account, not necessarily a place in this
       // post. They may help resolve a name that is independently shown or
       // recommended, but must never be the sole reason a place is persisted.

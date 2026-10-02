@@ -557,6 +557,8 @@ function isPlausibleStreetAddress(value: string): boolean {
   // become the address "10 not Street".
   const hasRoadSuffix = /\s(?:St|Street|Ave|Avenue|Blvd|Boulevard|Rd|Road|Dr|Drive|Ln|Lane|Way|Ct|Court|Pl|Place|Pkwy|Parkway)\.?$/i.test(normalized);
   if (!hasRoadSuffix) {
+    // A year without a road word is a year ("Deadstock 1993 NL champs SnapBack").
+    if (/^(?:19|20)\d{2}\s/.test(normalized)) return false;
     const streetWord = normalized
       .replace(/^\d{1,6}\s+/, '')
       .replace(/^(?:[NSEW]\.?|North|South|East|West)\s+/i, '')

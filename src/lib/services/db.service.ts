@@ -181,9 +181,15 @@ export class DbService {
       .ilike('city', escapeLike((placeData.city || '').trim()))
       .order('created_at', { ascending: true })
       .limit(5);
-    const existing = (existingRows || []).find((row) => row.latitude !== null && row.longitude !== null)
-      || (existingRows || [])[0]
-      || null;
+    // Google is always searched while it is available; the same Google place is
+    // then reused by its id or coordinates below. A stored row is reused by
+    // name alone only when Google cannot be searched (an old wrong pin, such as
+    // "Vermont" in Illinois, is never repeated while Google is up).
+    const existing = LocationService.googleAvailable()
+      ? null
+      : (existingRows || []).find((row) => row.latitude !== null && row.longitude !== null)
+        || (existingRows || [])[0]
+        || null;
 
     if (existing) {
       plog('db', `"${placeData.name}" already in database (name + city)`, { placeId: existing.id, hasCoordinates: existing.latitude !== null });
@@ -276,7 +282,9 @@ export class DbService {
       // otherwise it discards valid coordinates after the geocoder succeeded.
       const strongIdentity = coords.identity === 'exact_name' || coords.identity === 'source_address'
         || (!!coords.matchedName && LocationService.nameSimilarity(placeData.map_name || placeData.name, coords.matchedName) === 1);
-      const conflict = coords.lat !== null && !strongIdentity
+      // Google's answer is final (LocationService.geocodeWithGoogle); only a
+      // Mapbox fallback is still checked against the extracted category.
+      const conflict = coords.lat !== null && !strongIdentity && coords.provider !== 'google'
         ? googleTypeConflict(placeData.base_category || (placeData.category as PlaceCategory), coords.primaryType, coords.types)
         : null;
       const resolvedCityFromAddress = coords.formattedAddress ? LocationService.detectCityFromText(coords.formattedAddress) : '';
@@ -481,9 +489,10 @@ export class DbService {
     // that provider's canonical business name with its address/coordinates.
     // This prevents an OCR/list label such as "1. Cafe Carmellini" from being
     // saved while the actual provider result was "Café Carmellini".
+    // A Google result is always saved under Google's name.
     const useProviderName = Boolean(
       geocode?.matchedName &&
-      typeof geocode.similarity === 'number' && geocode.similarity >= 0.5 &&
+      (geocode.provider === 'google' || (typeof geocode.similarity === 'number' && geocode.similarity >= 0.5)) &&
       lat !== null && lng !== null && geocode.formattedAddress
     );
     const displayName = useProviderName
