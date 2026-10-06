@@ -316,6 +316,194 @@ export function normalizeAdminPost(post: Json) {
   };
 }
 
+export type AdminPostStatusFilter =
+  | "all"
+  | "completed"
+  | "processing"
+  | "failed"
+  | "merged";
+export type AdminPostSort = "created_at" | "likes" | "views" | "comments";
+
+export type AdminPostFilters = {
+  limit?: number;
+  offset?: number;
+  search?: string;
+  status?: AdminPostStatusFilter;
+  platform?: string;
+  contentType?: string;
+  /** A profile id, or "none" for posts that no user submitted. */
+  userId?: string;
+  /** Inclusive UTC dates (YYYY-MM-DD) applied to social_posts.created_at. */
+  from?: string;
+  to?: string;
+  sort?: AdminPostSort;
+  ascending?: boolean;
+};
+
+export const ADMIN_POST_STATUSES: AdminPostStatusFilter[] = [
+  "all",
+  "completed",
+  "processing",
+  "failed",
+  "merged",
+];
+const SORTS: AdminPostSort[] = ["created_at", "likes", "views", "comments"];
+const PROCESSING_STATUSES = ["pending", "scraped", "processing"];
+// Placeholder rows keep a pending_<uuid> content_id until the scrape lands.
+const ELIGIBLE_POSTS = "content_id.is.null,content_id.not.ilike.%pending%";
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DAY = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Reads /admin URL params into filters; unknown values fall back to defaults. */
+export function parseAdminPostFilters(
+  params: Record<string, string | string[] | undefined>,
+  pageSize: number,
+): AdminPostFilters & { page: number } {
+  const one = (key: string) => {
+    const value = params[key];
+    return (Array.isArray(value) ? value[0] : value)?.trim() || undefined;
+  };
+  const page = Math.max(Number.parseInt(one("page") || "1", 10) || 1, 1);
+  const status = one("status") as AdminPostStatusFilter | undefined;
+  const sort = one("sort") as AdminPostSort | undefined;
+  const user = one("user");
+  const from = one("from");
+  const to = one("to");
+  return {
+    page,
+    limit: pageSize,
+    offset: (page - 1) * pageSize,
+    search: one("q"),
+    status: status && ADMIN_POST_STATUSES.includes(status) ? status : "all",
+    platform: one("platform"),
+    contentType: one("type"),
+    userId: user === "none" || (user && UUID.test(user)) ? user : undefined,
+    from: from && DAY.test(from) ? from : undefined,
+    to: to && DAY.test(to) ? to : undefined,
+    sort: sort && SORTS.includes(sort) ? sort : "created_at",
+    ascending: one("dir") === "asc",
+  };
+}
+
+// PostgREST filter strings treat , ( ) as syntax and % _ * as wildcards.
+const searchTerm = (value?: string) =>
+  (value || "")
+    .replace(/[,()"'\\%_*]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const nextDay = (day: string) => {
+  const date = new Date(`${day}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + 1);
+  return date.toISOString().slice(0, 10);
+};
+
+type PostQuery = ReturnType<ReturnType<typeof supabaseAdmin.from>["select"]>;
+type ResolvedScope = {
+  userClause: string | null;
+  searchClause: string | null;
+};
+
+/**
+ * User and search filters need ids from other tables (social_post_accesses,
+ * profiles). They are resolved once and reused by the page and count queries.
+ * A user "owns" a post when they created it (social_posts.user_id) or later
+ * submitted the same URL (social_post_accesses).
+ */
+async function resolveScope(filters: AdminPostFilters): Promise<ResolvedScope> {
+  let userClause: string | null = null;
+  if (filters.userId === "none") {
+    const { data } = await supabaseAdmin
+      .from("social_post_accesses")
+      .select("social_post_id")
+      .not("user_id", "is", null)
+      .not("social_post_id", "is", null);
+    const ids = [...new Set((data ?? []).map((row) => row.social_post_id))];
+    userClause = ids.length
+      ? `and(user_id.is.null,id.not.in.(${ids.join(",")}))`
+      : "user_id.is.null";
+  } else if (filters.userId) {
+    // The id is interpolated into a PostgREST filter string below.
+    if (!UUID.test(filters.userId))
+      return { userClause: "id.is.null", searchClause: null };
+    const { data } = await supabaseAdmin
+      .from("social_post_accesses")
+      .select("social_post_id")
+      .eq("user_id", filters.userId)
+      .not("social_post_id", "is", null);
+    const ids = [...new Set((data ?? []).map((row) => row.social_post_id))];
+    userClause = ids.length
+      ? `user_id.eq.${filters.userId},id.in.(${ids.join(",")})`
+      : `user_id.eq.${filters.userId}`;
+  }
+
+  const term = searchTerm(filters.search);
+  let searchClause: string | null = null;
+  if (term) {
+    const { data: profiles } = await supabaseAdmin
+      .from("profiles")
+      .select("id")
+      .or(`display_name.ilike.%${term}%,email.ilike.%${term}%`)
+      .limit(50);
+    const clauses = [
+      "author_username",
+      "caption",
+      "post_url",
+      "short_code",
+      "primary_category",
+    ].map((column) => `${column}.ilike.%${term}%`);
+    if (UUID.test(term)) clauses.push(`id.eq.${term}`);
+    const profileIds = (profiles ?? []).map((profile) => profile.id);
+    if (profileIds.length)
+      clauses.push(`user_id.in.(${profileIds.join(",")})`);
+    searchClause = clauses.join(",");
+  }
+  return { userClause, searchClause };
+}
+
+function applyFilters(
+  query: PostQuery,
+  filters: AdminPostFilters,
+  scope: ResolvedScope,
+): PostQuery {
+  let next = query.or(ELIGIBLE_POSTS);
+  if (scope.userClause) next = next.or(scope.userClause);
+  if (scope.searchClause) next = next.or(scope.searchClause);
+  if (filters.platform) next = next.eq("platform", filters.platform);
+  if (filters.contentType) next = next.eq("content_type", filters.contentType);
+  if (filters.from) next = next.gte("created_at", `${filters.from}T00:00:00Z`);
+  if (filters.to)
+    next = next.lt("created_at", `${nextDay(filters.to)}T00:00:00Z`);
+  if (filters.status === "processing")
+    next = next.in("status", PROCESSING_STATUSES);
+  else if (filters.status && filters.status !== "all")
+    next = next.eq("status", filters.status);
+  return next;
+}
+
+/** Counts for the status tabs, using every active filter except status. */
+export async function getAdminPostStatusCounts(
+  filters: AdminPostFilters = {},
+): Promise<Record<AdminPostStatusFilter, number | null>> {
+  const scope = await resolveScope(filters);
+  const counts = await Promise.all(
+    ADMIN_POST_STATUSES.map(async (status) => {
+      const { count } = await applyFilters(
+        supabaseAdmin
+          .from("social_posts")
+          .select("id", { count: "exact", head: true }),
+        { ...filters, status },
+        scope,
+      );
+      return [status, count ?? null] as const;
+    }),
+  );
+  return Object.fromEntries(counts) as Record<
+    AdminPostStatusFilter,
+    number | null
+  >;
+}
+
 export async function getAdminPostList(): Promise<{
   posts: AdminPostSummary[];
   total: number;
@@ -325,7 +513,7 @@ export async function getAdminPostList(): Promise<{
 }
 
 export async function getAdminPostPage(
-  options: { limit?: number; offset?: number } = {},
+  options: AdminPostFilters = {},
 ): Promise<{
   posts: AdminPostSummary[];
   total: number;
@@ -334,10 +522,16 @@ export async function getAdminPostPage(
 }> {
   const limit = Math.min(Math.max(options.limit ?? 15, 1), 100);
   const offset = Math.max(options.offset ?? 0, 0);
-  const { count, error: countError } = await supabaseAdmin
-    .from("social_posts")
-    .select("id", { count: "exact", head: true })
-    .or("content_id.is.null,content_id.not.ilike.%pending%");
+  const sort =
+    options.sort && SORTS.includes(options.sort) ? options.sort : "created_at";
+  const scope = await resolveScope(options);
+  const { count, error: countError } = await applyFilters(
+    supabaseAdmin
+      .from("social_posts")
+      .select("id", { count: "exact", head: true }),
+    options,
+    scope,
+  );
 
   if (countError) {
     console.error("[Admin] Unable to count posts:", countError.message);
@@ -346,11 +540,16 @@ export async function getAdminPostPage(
 
   const fields =
     "id, user_id, place_id, platform, content_type, content_id, author_username, caption, display_url, post_url, likes, views, comments, primary_category, short_code, status, created_at, raw_apify_data";
-  const { data, error } = await supabaseAdmin
-    .from("social_posts")
-    .select(fields)
-    .or("content_id.is.null,content_id.not.ilike.%pending%")
-    .order("created_at", { ascending: false })
+  let pageQuery = applyFilters(
+    supabaseAdmin.from("social_posts").select(fields),
+    options,
+    scope,
+  ).order(sort, { ascending: Boolean(options.ascending), nullsFirst: false });
+  // Stable order for ties (equal like counts, identical timestamps).
+  if (sort !== "created_at")
+    pageQuery = pageQuery.order("created_at", { ascending: false });
+  const { data, error } = await pageQuery
+    .order("id", { ascending: true })
     .range(offset, offset + limit - 1);
 
   if (error) {
@@ -363,8 +562,8 @@ export async function getAdminPostPage(
     };
   }
 
-  const rows = (data ?? []).filter((post) => {
-    if (!post.content_id) return true;
+  const rows = ((data ?? []) as Json[]).filter((post) => {
+    if (typeof post.content_id !== "string") return true;
     return !post.content_id.toLowerCase().includes("pending");
   });
   const userIds = [
@@ -402,7 +601,7 @@ export async function getAdminPostPage(
     (placesResult.data ?? []).map((place) => [place.id, place]),
   );
   const posts = rows.map((post) => {
-    const normalized = normalizeAdminPost(post as Json);
+    const normalized = normalizeAdminPost(post);
     const profile =
       typeof post.user_id === "string" ? profiles.get(post.user_id) : null;
     const place =

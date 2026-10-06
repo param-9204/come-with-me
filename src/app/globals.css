@@ -16,6 +16,80 @@
   --color-indigo-600: #4f46e5;
 }
 
+/*
+ * Admin design tokens. Values live on .admin-root so light/dark swap in one
+ * place; "inline" makes utilities reference var(--admin-*) directly, because a
+ * var() stored on :root would resolve before .admin-root defines it.
+ */
+@theme inline {
+  --color-canvas: var(--admin-canvas);
+  --color-surface: var(--admin-surface);
+  --color-subtle: var(--admin-subtle);
+  --color-line: var(--admin-line);
+  --color-line-strong: var(--admin-line-strong);
+  --color-ink: var(--admin-ink);
+  --color-ink-2: var(--admin-ink-2);
+  --color-ink-3: var(--admin-ink-3);
+  --color-accent: var(--admin-accent);
+  --color-accent-soft: var(--admin-accent-soft);
+  --color-good: var(--admin-good);
+  --color-good-soft: var(--admin-good-soft);
+  --color-warn: var(--admin-warn);
+  --color-warn-soft: var(--admin-warn-soft);
+  --color-bad: var(--admin-bad);
+  --color-bad-soft: var(--admin-bad-soft);
+}
+
+.admin-root {
+  color-scheme: light;
+  --admin-canvas: #f6f6f4;
+  --admin-surface: #ffffff;
+  --admin-subtle: #f1f0ed;
+  --admin-line: #e3e2dd;
+  --admin-line-strong: #cbc9c2;
+  --admin-ink: #18181a;
+  --admin-ink-2: #4a4945;
+  --admin-ink-3: #6f6d67;
+  --admin-accent: #c2410c;
+  --admin-accent-soft: #fbeee6;
+  --admin-good: #15803d;
+  --admin-good-soft: #e8f5ec;
+  --admin-warn: #a16207;
+  --admin-warn-soft: #fbf3dc;
+  --admin-bad: #c42b2b;
+  --admin-bad-soft: #fbeaea;
+  background-color: var(--admin-canvas);
+  color: var(--admin-ink);
+  font-size: 14px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .admin-root {
+    color-scheme: dark;
+    --admin-canvas: #0f0f0e;
+    --admin-surface: #171716;
+    --admin-subtle: #1f1f1d;
+    --admin-line: #2b2b28;
+    --admin-line-strong: #3d3c38;
+    --admin-ink: #f2f2ef;
+    --admin-ink-2: #c3c2b7;
+    --admin-ink-3: #8f8d86;
+    --admin-accent: #e0662a;
+    --admin-accent-soft: #2a1b13;
+    --admin-good: #4ade80;
+    --admin-good-soft: #13241a;
+    --admin-warn: #facc15;
+    --admin-warn-soft: #2a2410;
+    --admin-bad: #f87171;
+    --admin-bad-soft: #2c1515;
+  }
+}
+
+.admin-root :focus-visible {
+  outline: 2px solid var(--admin-accent);
+  outline-offset: 2px;
+}
+
 *, *::before, *::after {
   box-sizing: border-box;
 }
