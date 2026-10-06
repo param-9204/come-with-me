@@ -94,7 +94,7 @@ async function runBackgroundPipeline(
       route: 'stream', socialPostId, url: cleanUrl, pipelineRunId, pipelineStartedAt,
     });
     failureLog.setRunInput({
-      platform: cleanUrl.includes('tiktok.com') ? 'tiktok' : 'instagram',
+      platform: cleanUrl.includes('tiktok.com') ? 'tiktok' : /(?:youtube\.com|youtu\.be)/i.test(cleanUrl) ? 'youtube' : /(?:facebook\.com|fb\.watch)/i.test(cleanUrl) ? 'facebook' : 'instagram',
       inputUrl: cleanUrl,
       socialPostId,
       entrypoint: 'stream',
@@ -150,7 +150,7 @@ export async function POST(request: Request) {
   try {
     source = await resolveCanonicalSocialSource(url);
   } catch (_) {
-    return new Response('data: {"error":"A valid Instagram or TikTok URL is required"}\n\n', { status: 400 });
+    return new Response('data: {"error":"A valid Instagram, TikTok, YouTube, or Facebook URL is required"}\n\n', { status: 400 });
   }
   const { cleanUrl, platform, key: canonicalSourceKey } = source;
 
@@ -330,9 +330,7 @@ export async function POST(request: Request) {
             if (currentStatus === 'scraped') {
               rawApifyDataObj = dbPost.raw_apify_data;
               if (rawApifyDataObj) {
-                const { normalized } = platform === 'tiktok'
-                  ? await ScraperService.normalizeTikTokRaw(rawApifyDataObj)
-                  : ScraperService.normalizeInstagramRaw(rawApifyDataObj);
+                const { normalized } = await ScraperService.normalizeRawForPlatform(rawApifyDataObj, platform);
                 contentData = normalized;
               }
               const basicCard = {

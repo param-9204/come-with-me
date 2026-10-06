@@ -147,7 +147,7 @@ export interface SubtitleTrack {
 // ──────────────────────────────────────────────────────────────────────
 
 export interface SocialContent {
-  platform: 'instagram' | 'tiktok';
+  platform: 'instagram' | 'tiktok' | 'youtube' | 'facebook';
   contentId: string;
   contentType: 'post' | 'reel' | 'video';
   authorUsername: string;

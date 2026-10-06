@@ -13,7 +13,7 @@ export async function GET(request: Request) {
     const pipelineStartedAt = searchParams.get('pipelineStartedAt');
     const inputUrl = searchParams.get('url');
     log.adoptPipelineRun(pipelineRunId, pipelineStartedAt);
-    log.setRunInput({ inputUrl, entrypoint: 'scrape-status', platform: inputUrl?.includes('tiktok.com') ? 'tiktok' : inputUrl ? 'instagram' : null });
+    log.setRunInput({ inputUrl, entrypoint: 'scrape-status', platform: inputUrl?.includes('tiktok.com') ? 'tiktok' : inputUrl && /(?:youtube\.com|youtu\.be)/i.test(inputUrl) ? 'youtube' : inputUrl && /(?:facebook\.com|fb\.watch)/i.test(inputUrl) ? 'facebook' : inputUrl ? 'instagram' : null });
 
     if (!runId || !actorId) {
       return NextResponse.json({ error: 'Missing required query parameters: runId and actorId' }, { status: 400 });
@@ -30,7 +30,7 @@ export async function GET(request: Request) {
     });
 
     if (status === 'SUCCEEDED' && defaultDatasetId) {
-      const { normalized, raw } = await ScraperService.fetchAndNormalize(defaultDatasetId, actorId);
+      const { normalized, raw } = await ScraperService.fetchAndNormalize(defaultDatasetId, actorId, inputUrl || undefined);
       const accessFailure = [raw?.error, raw?.http_error_reason, raw?.errorDescription]
         .filter((value) => typeof value === 'string')
         .join(' ');

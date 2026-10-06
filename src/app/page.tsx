@@ -796,7 +796,7 @@ export default function Page() {
               Social Media Intelligence Scraper
             </h1>
             <p className="text-sm text-zinc-500">
-              Paste an Instagram Reel or TikTok link to extract metadata, transcribe audio,
+              Paste an Instagram Reel, TikTok, YouTube Short, or Facebook Reel link to extract metadata, transcribe audio,
               run OCR on video frames, and generate a full AI intelligence report.
             </p>
           </div>
@@ -808,7 +808,7 @@ export default function Page() {
               </div>
               <input
                 type="url"
-                placeholder="https://www.instagram.com/p/... or https://www.tiktok.com/@..."
+                placeholder="Instagram, TikTok, YouTube Short, or Facebook Reel URL"
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
                 className="w-full pl-10 pr-4 py-2.5 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/50 transition-colors"
@@ -1234,7 +1234,7 @@ export default function Page() {
               <IconSearch />
             </div>
             <p className="text-sm font-medium text-zinc-500 mb-1">Paste a link to get started</p>
-            <p className="text-xs">Supports Instagram Reels &amp; TikTok videos</p>
+            <p className="text-xs">Supports Instagram Reels, TikTok, YouTube Shorts &amp; Facebook Reels</p>
           </div>
         )}
 
