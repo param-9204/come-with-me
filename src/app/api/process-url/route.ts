@@ -3,6 +3,8 @@ import { supabaseAdmin } from '@/lib/supabase';
 import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { DbService } from '@/lib/services/db.service';
 import { AiEnrichmentService } from '@/lib/services/ai-enrichment.service';
+import { MediaEvidenceService } from '@/lib/services/media-evidence.service';
+import { SupabaseImageStorageService } from '@/lib/services/supabase-image-storage.service';
 import { PipelineLog } from '@/lib/services/pipeline-log';
 import { ScraperService } from '@/lib/services/scraper.service';
 import type { ApifyOcrFrameResult, GptVisionFrameResult, SocialContent, TranscriptSegment } from '@/lib/types/social';
@@ -179,6 +181,149 @@ function formatResponsePlaces(
 
 function responsePlaceIds(places: any[]): string[] {
   return places.map((place) => place?.id || place?.place_id).filter(Boolean);
+}
+
+const MAX_IMAGE_UPLOADS = 10;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif']);
+
+/** Resolve an authenticated owner when there is one. */
+async function resolveImageUploadUser(authUser: Awaited<ReturnType<typeof getAuthUser>>): Promise<string | null> {
+  return resolveProfileId({
+    clerkId: authUser?.clerkId,
+    userIdInput: authUser?.id,
+    email: authUser?.email,
+  });
+}
+
+function isImageFile(value: FormDataEntryValue): value is File {
+  return typeof value !== 'string' && typeof (value as File).arrayBuffer === 'function';
+}
+
+function uploadContent(uploadId: string, imageUrls: string[], caption: string): SocialContent {
+  return {
+    platform: 'upload',
+    contentId: uploadId,
+    contentType: 'post',
+    authorUsername: 'upload',
+    authorFullName: '',
+    caption,
+    displayUrl: imageUrls[0] || '',
+    images: imageUrls,
+    shortCode: '',
+    metrics: { likes: null, views: null, plays: null, comments: null, shares: null, saves: null },
+    hashtags: tokensFromText(caption, '#'),
+    mentions: tokensFromText(caption, '@'),
+    taggedUsers: [],
+    musicInfo: null,
+    videoDuration: null,
+    dimensions: null,
+    paidPartnership: false,
+    productType: null,
+    publishedAt: new Date().toISOString(),
+    rawApifyData: { uploaded_image_id: uploadId, image_urls: imageUrls },
+  };
+}
+
+async function handleImageUpload(request: Request, authUser: Awaited<ReturnType<typeof getAuthUser>>) {
+  const finalUserId = await resolveImageUploadUser(authUser);
+  const isLocalDevelopment = process.env.NODE_ENV === 'development';
+  if (!finalUserId && !isLocalDevelopment) {
+    return NextResponse.json({ success: false, error: 'Authentication is required for image uploads' }, { status: 401 });
+  }
+
+  const formData = await request.formData();
+  const files = formData.getAll('images').filter(isImageFile);
+  const captionValue = formData.get('caption');
+  const caption = typeof captionValue === 'string' ? captionValue.trim() : '';
+  if (files.length === 0 || files.length > MAX_IMAGE_UPLOADS) {
+    return NextResponse.json({ success: false, error: `images must contain 1 to ${MAX_IMAGE_UPLOADS} files` }, { status: 400 });
+  }
+  const invalid = files.find((file) => !IMAGE_MIME_TYPES.has(file.type.toLowerCase()) || file.size <= 0 || file.size > MAX_IMAGE_BYTES);
+  if (invalid) {
+    return NextResponse.json({
+      success: false,
+      error: `Each image must be JPEG, PNG, WebP, HEIC, or HEIF and no larger than ${MAX_IMAGE_BYTES / 1024 / 1024}MB`,
+    }, { status: 400 });
+  }
+
+  let storagePaths: string[] = [];
+  let uploadedImageId: string | null = null;
+  try {
+    const storageOwner = finalUserId || 'local-postman';
+    const uploads = await Promise.all(files.map((file) => SupabaseImageStorageService.upload(file, storageOwner)));
+    storagePaths = uploads.map((upload) => upload.storagePath);
+    const imageUrls = uploads.map((upload) => upload.publicUrl);
+    const uploaded = await DbService.createUploadedImage({
+      userId: finalUserId,
+      fileNames: files.map((file) => file.name),
+      storagePaths,
+      imageUrls,
+      caption,
+    });
+    uploadedImageId = uploaded.id;
+
+    const content = uploadContent(uploaded.id, imageUrls, caption);
+    const media = await MediaEvidenceService.collect(content, content.rawApifyData, { persistAudio: false });
+    const enrichment = await AiEnrichmentService.analyzeContent(content, content.rawApifyData, {
+      ocrFrames: media.ocrFrames,
+      visionFrames: media.visionFrames,
+      transcript: media.transcript,
+    });
+    const placesToSave = enrichment?.places || [];
+    const saveResults = await Promise.all(placesToSave.map(async (place) => {
+      const placeId = await DbService.savePlace(place, imageUrls[0] || '', 'upload', '', finalUserId || undefined);
+      if (placeId) await DbService.linkPlaceToUploadedImage(uploaded.id, placeId, place);
+      return { place, placeId };
+    }));
+    const savedPlaces = await DbService.getPlacesForUploadedImage(uploaded.id);
+    const savedKeys = new Set(savedPlaces.map((place: any) => `${String(place.name || '').trim().toLowerCase()}|${String(place.city || '').trim().toLowerCase()}`));
+    const unresolvedPlaces = saveResults
+      .filter((result) => !result.placeId)
+      .map((result) => result.place)
+      .filter((place) => !savedKeys.has(`${String(place.name || '').trim().toLowerCase()}|${String(place.city || '').trim().toLowerCase()}`));
+    const places = formatResponsePlaces([...savedPlaces, ...unresolvedPlaces], {
+      sourceUrl: imageUrls[0] || null,
+      platform: 'upload',
+    });
+    const warnings = [...new Set([
+      ...(media.warnings || []),
+      ...(enrichment?.warning ? [enrichment.warning] : []),
+      ...(unresolvedPlaces.length ? [`${unresolvedPlaces.length} place(s) could not be saved with a verified location.`] : []),
+    ])];
+    await DbService.completeUploadedImage(uploaded.id, enrichment?.analysis || null);
+
+    const gptTexts = [...new Set(media.visionFrames.flatMap((frame) => frame.texts || []))];
+    const ocrTexts = [...new Set(media.ocrFrames.flatMap((frame) => frame.texts || []))];
+    return NextResponse.json({
+      success: true,
+      partial: warnings.length > 0,
+      error: warnings.length ? warnings.join(' ') : null,
+      warnings,
+      socialPostId: null,
+      uploadedImageId: uploaded.id,
+      suggested_title: enrichment?.analysis?.content?.suggested_title ?? null,
+      data: { id: uploaded.id, status: 'completed', image_urls: imageUrls, caption },
+      rawApifyData: content.rawApifyData,
+      places,
+      place: places[0] || null,
+      place_id: places[0]?.id || places[0]?.place_id || null,
+      placeIds: responsePlaceIds(places),
+      aiAnalysis: enrichment?.analysis || null,
+      transcript: media.transcriptText || null,
+      scrapedData: content,
+      ocrComparison: {
+        apifyOcr: { frames: media.ocrFrames, allTexts: ocrTexts, totalFramesProcessed: media.ocrFrames.length, processingTimeMs: 0 },
+        gptVision: { frames: media.visionFrames, allTexts: gptTexts, allBrands: [], allLocations: [], allPrices: [], allCtas: [], totalFramesProcessed: media.visionFrames.length, processingTimeMs: 0 },
+      },
+      audioUpload: null,
+    });
+  } catch (error: any) {
+    const message = error?.message || 'Image upload processing failed';
+    if (uploadedImageId) await DbService.failUploadedImage(uploadedImageId, message);
+    else await SupabaseImageStorageService.remove(storagePaths);
+    return NextResponse.json({ success: false, error: message }, { status: 500 });
+  }
 }
 
 /**
@@ -433,6 +578,9 @@ export async function POST(request: Request) {
     // 1. Optionally resolve user ID — process-url is PUBLIC (no auth required).
     //    Mobile sends clerk_user_id; a verified Clerk token can provide it instead.
     const authUser = await getAuthUser(request);
+    if ((request.headers.get('content-type') || '').toLowerCase().includes('multipart/form-data')) {
+      return handleImageUpload(request, authUser);
+    }
     const headerUserId = request.headers.get('x-user-id');
     const body = await request.json();
     const {
