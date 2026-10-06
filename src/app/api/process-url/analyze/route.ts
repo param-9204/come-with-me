@@ -374,6 +374,7 @@ async function handleAnalyze(request: Request, log: PipelineLog) {
       rawApifyData,
       transcript,
       ocrComparison,
+      suggested_title: aiAnalysis?.content?.suggested_title ?? null,
       aiAnalysis,
       places: finalPlaces,
       place: finalPlaces.length > 0 ? finalPlaces[0] : null,

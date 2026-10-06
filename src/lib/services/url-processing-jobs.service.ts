@@ -116,16 +116,18 @@ export class UrlProcessingJobsService {
     const postIds = waiting.map((job) => job.social_post_id).filter(Boolean) as string[];
     const { data: posts } = await supabaseAdmin
       .from('social_posts')
-      .select('id, status')
+      .select('id, status, suggested_title')
       .in('id', postIds);
     const statusByPost = new Map((posts || []).map((post) => [post.id, post.status]));
+    const postById = new Map((posts || []).map((post) => [post.id, post]));
 
     await Promise.all(waiting.map(async (job) => {
       const status = statusByPost.get(job.social_post_id!);
       if (status === 'completed') {
+        const post = postById.get(job.social_post_id!);
         await supabaseAdmin.from('social_post_accesses').update({
           status: 'completed',
-          result: { socialPostId: job.social_post_id, socialPostStatus: status },
+          result: { socialPostId: job.social_post_id, socialPostStatus: status, suggested_title: post?.suggested_title || null },
           locked_at: null,
           locked_by: null,
         }).eq('id', job.id).eq('event', 'job').eq('status', 'waiting');
@@ -160,7 +162,13 @@ export class UrlProcessingJobsService {
         return;
       }
       if (response.ok && payload?.success) {
-        await this.finishCompleted(job, socialPostId, payload?.status || 'completed', Array.isArray(payload?.places) ? payload.places.length : 0);
+        await this.finishCompleted(
+          job,
+          socialPostId,
+          payload?.status || 'completed',
+          Array.isArray(payload?.places) ? payload.places.length : 0,
+          typeof payload?.suggested_title === 'string' ? payload.suggested_title : null,
+        );
         return;
       }
       throw new Error(payload?.error || `Processor returned HTTP ${response.status}`);
@@ -212,7 +220,13 @@ export class UrlProcessingJobsService {
     if (error) throw new Error(`Unable to mark processing job as waiting: ${error.message}`);
   }
 
-  private static async finishCompleted(job: UrlProcessingJob, socialPostId: string | null, socialPostStatus: string, placeCount: number): Promise<void> {
+  private static async finishCompleted(
+    job: UrlProcessingJob,
+    socialPostId: string | null,
+    socialPostStatus: string,
+    placeCount: number,
+    suggestedTitle: string | null,
+  ): Promise<void> {
     const { error } = await supabaseAdmin
       .from('social_post_accesses')
       .update({
@@ -221,7 +235,7 @@ export class UrlProcessingJobsService {
         locked_at: null,
         locked_by: null,
         last_error: null,
-        result: { socialPostId, socialPostStatus, placeCount },
+        result: { socialPostId, socialPostStatus, placeCount, suggested_title: suggestedTitle },
       })
       .eq('id', job.id)
       .eq('event', 'job')

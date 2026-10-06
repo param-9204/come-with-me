@@ -224,6 +224,7 @@ category = base_category, or "HIDDEN GEMS" only when the evidence explicitly cal
 description: at most 12 words taken from the evidence, or "".`;
 
 const ANALYSIS_RULES = `ANALYSIS (compact, from evidence only):
+- suggested_title: a factual 4 or 5 word title that describes the whole reel, post, or video. Use only supported evidence. No hashtags, emojis, quotation marks, or ending punctuation. Return "" when the evidence is insufficient.
 - summary: factual post summary in at most 20 words. Do not add claims that are absent from EVIDENCE.
 - primary_category: exactly one of RESTAURANTS, COFFEE, BARS, NIGHTLIFE, SHOPPING, CULTURE, NATURE, ADVENTURE, TRAVEL, CITY, HIDDEN GEMS, or "". Prefer the category supported by the featured places; otherwise use "".
 - topics and keywords: at most 3 each; include only meaningful themes/terms explicit in EVIDENCE. Do not include a hashtag merely because it exists.
@@ -273,6 +274,7 @@ const PLACE_ITEM_SCHEMA = {
 const ANALYSIS_SCHEMA = {
   type: 'object',
   properties: {
+    suggested_title: { type: 'string' },
     summary: { type: 'string' }, primary_category: { type: 'string' }, topics: { type: 'array', items: { type: 'string' } }, keywords: { type: 'array', items: { type: 'string' } },
     tone: { type: 'array', items: { type: 'string' } }, niche: { type: 'string' },
     is_promotional: { type: 'boolean' }, is_sponsored: { type: 'boolean' }, promotion_type: { type: 'string' },
@@ -280,7 +282,7 @@ const ANALYSIS_SCHEMA = {
     primary_audience: { type: 'string' }, audience_interests: { type: 'array', items: { type: 'string' } }, geographic_focus: { type: 'array', items: { type: 'string' } },
     audience_intent: { type: 'string' }, audience_confidence: { type: 'number' },
   },
-  required: ['summary', 'primary_category', 'topics', 'keywords', 'tone', 'niche', 'is_promotional', 'is_sponsored', 'promotion_type', 'call_to_actions', 'offers', 'primary_audience', 'audience_interests', 'geographic_focus', 'audience_intent', 'audience_confidence'],
+  required: ['suggested_title', 'summary', 'primary_category', 'topics', 'keywords', 'tone', 'niche', 'is_promotional', 'is_sponsored', 'promotion_type', 'call_to_actions', 'offers', 'primary_audience', 'audience_interests', 'geographic_focus', 'audience_intent', 'audience_confidence'],
   additionalProperties: false,
 };
 
@@ -317,6 +319,17 @@ function str(value: unknown): string {
 
 function strList(value: unknown): string[] {
   return Array.isArray(value) ? value.map(str).filter(Boolean) : [];
+}
+
+/**
+ * The prompt asks for a 4–5 word title, but model/provider fallbacks are not
+ * schema-enforced. Reject invalid values instead of trimming or inventing one.
+ */
+function validSuggestedTitle(value: unknown): string | null {
+  const title = str(value).replace(/\s+/g, ' ');
+  if (!title || /[#"“”`\p{Extended_Pictographic}]/u.test(title) || /[.!?…]$/.test(title)) return null;
+  const words = title.match(/[\p{L}\p{N}]+(?:['’-][\p{L}\p{N}]+)*/gu) || [];
+  return words.length >= 4 && words.length <= 5 ? title : null;
 }
 
 function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
@@ -1350,6 +1363,7 @@ function generateFallbackAnalysis(content: SocialContent, bundle: EvidenceBundle
   const detectedCity = LocationService.detectCityFromText(caption) || (places.length > 0 ? places[0].city : '');
 
   return {
+    suggested_title: '',
     summary,
     primary_category,
     topics: hashtags.slice(0, 3),
@@ -1435,6 +1449,7 @@ export class AiEnrichmentService {
           throw new Error('[AI Analysis] Model returned invalid JSON.');
         }
         parsed = isRecord(parsedJson) && isRecord(parsedJson.analysis) ? parsedJson.analysis : {};
+        parsed.suggested_title = validSuggestedTitle(parsed.suggested_title);
 
         let candidates: RawPlaceCandidate[] = [];
         try {
@@ -1615,6 +1630,7 @@ export class AiEnrichmentService {
         dimensions: content.dimensions
           ? { ...content.dimensions, orientation: content.dimensions.height > content.dimensions.width ? 'vertical' : 'horizontal' }
           : null,
+        suggested_title: validSuggestedTitle(parsed.suggested_title),
         summary: parsed.summary || '',
         primary_category: parsed.primary_category || '',
         secondary_categories: [],

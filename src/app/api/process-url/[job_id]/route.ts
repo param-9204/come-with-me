@@ -21,6 +21,7 @@ export async function GET(
       attemptCount: job.attempt_count,
       maxAttempts: job.max_attempts,
       error: job.status === 'failed' ? job.last_error : null,
+      suggested_title: typeof job.result?.suggested_title === 'string' ? job.result.suggested_title : null,
       result: job.result,
       createdAt: job.created_at,
       updatedAt: job.updated_at,

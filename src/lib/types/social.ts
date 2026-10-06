@@ -347,6 +347,8 @@ export interface AiAnalysisResult {
     published_at: string | null;
     duration_seconds: number | null;
     dimensions: { width: number | null; height: number | null; orientation: string } | null;
+    /** AI-generated 4–5 word description of the post; null when unavailable. */
+    suggested_title: string | null;
     summary: string;
     primary_category: string;
     secondary_categories: string[];
@@ -503,6 +505,7 @@ export interface VisibleTextItem {
 
 export interface PipelineResult {
   success: boolean;
+  suggested_title?: string | null;
   scrapedData: SocialContent | null;
   rawApifyData: any;
   transcript: string;

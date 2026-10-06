@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS public.social_posts (
   mentioned_locations text[],
   primary_category text,
   secondary_categories text[],
+  suggested_title text,
   content_summary text,
   is_promotional boolean,
   is_paid_partnership boolean,
@@ -690,7 +691,8 @@ SELECT
   p.category AS place_category,
   p.latitude,
   p.longitude,
-  p.address AS place_address
+  p.address AS place_address,
+  sp.suggested_title
 FROM public.social_posts sp
 LEFT JOIN public.places p ON sp.place_id = p.id;
 

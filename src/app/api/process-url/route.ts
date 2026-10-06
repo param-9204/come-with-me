@@ -113,6 +113,7 @@ function processingResponse(post: any) {
     processing: true,
     status: post.status,
     socialPostId: post.id,
+    suggested_title: post.suggested_title ?? null,
     data: post,
     places: [],
     place: null,
@@ -503,6 +504,9 @@ export async function POST(request: Request) {
           jobId: existingJob.id,
           socialPostId: existingJob.social_post_id,
           status: existingJob.status,
+          suggested_title: typeof existingJob.result?.suggested_title === 'string'
+            ? existingJob.result.suggested_title
+            : null,
           workerScheduled,
           warning: null,
         }, { status: 202 });
@@ -517,7 +521,11 @@ export async function POST(request: Request) {
         social_post_id: claimed.post.id,
         status,
         result: status === 'completed'
-          ? { socialPostId: claimed.post.id, socialPostStatus: 'completed' }
+          ? {
+              socialPostId: claimed.post.id,
+              socialPostStatus: 'completed',
+              suggested_title: claimed.post.suggested_title ?? null,
+            }
           : null,
       }]);
 
@@ -539,6 +547,7 @@ export async function POST(request: Request) {
         jobId: job.id,
         socialPostId: claimed.post.id,
         status: job.status,
+        suggested_title: claimed.post.suggested_title ?? null,
         workerScheduled,
         warning: workerScheduled || status === 'completed'
           ? null
@@ -659,6 +668,7 @@ export async function POST(request: Request) {
           partial: Boolean(partialError),
           error: partialError ? partialResultMessage(places.length) : null,
           socialPostId: existingPost.id,
+          suggested_title: existingPost.suggested_title ?? null,
           data: responseData,
           rawApifyData: existingPost.raw_apify_data || null,
           places,
@@ -783,6 +793,7 @@ export async function POST(request: Request) {
       error: analyzeData?.partial ? analyzeData.error : null,
       warnings: Array.isArray(analyzeData?.warnings) ? analyzeData.warnings : [],
       socialPostId: completedPost.id,
+      suggested_title: analyzeData?.suggested_title ?? completedPost.suggested_title ?? null,
       data: completedPost,
       rawApifyData: analyzeData?.rawApifyData || completedPost.raw_apify_data || null,
       places,
@@ -867,6 +878,7 @@ export async function GET(request: Request) {
       success: true,
       status: post.status,
       socialPostId: post.id,
+      suggested_title: post.suggested_title ?? null,
       data: post,
       rawApifyData: post.raw_apify_data || null,
       places,

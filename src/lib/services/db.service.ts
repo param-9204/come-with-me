@@ -696,6 +696,7 @@ export class DbService {
     // Extract top-level analysis fields for indexed columns
     const primaryCategory = aiAnalysis?.content?.primary_category || null;
     const secondaryCategories = aiAnalysis?.content?.secondary_categories || [];
+    const suggestedTitle = aiAnalysis?.content?.suggested_title || null;
     const contentSummary = aiAnalysis?.content?.summary || null;
     const mentionedBrands = aiAnalysis
       ? [
@@ -775,6 +776,7 @@ export class DbService {
       mentioned_locations: mentionedLocations.length ? mentionedLocations : null,
       primary_category: primaryCategory,
       secondary_categories: secondaryCategories.length ? secondaryCategories : null,
+      suggested_title: suggestedTitle,
       content_summary: contentSummary,
       niche,
       target_audience: targetAudience,
