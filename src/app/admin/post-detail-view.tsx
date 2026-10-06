@@ -1,361 +1,494 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 
-import ApifyTraceDetails from "./apify-trace-details";
-import ExtractedComments from "./extracted-comments";
+import ExtractedComments, { apifyComments } from "./extracted-comments";
+import ExtractionView, { latestRunHealth } from "./extraction-view";
 import PostMediaGallery from "./post-media-gallery";
+import Thumbnail from "./post-thumbnail";
 import {
-  ApifyExtraction,
-  type Data,
   type PostDetail,
-  ExtractionPipeline,
-  Info,
-  Metric,
-  OverlayMetric,
   Places,
-  PostReference,
-  Section,
-  Tags,
-  TokenUsage,
-  TraceLog,
-  date,
+  collectPlaces,
+  record,
+  records,
   strings,
-  text,
 } from "./post-components";
+import {
+  Avatar,
+  Chips,
+  FactList,
+  PageHeader,
+  Panel,
+  StatStrip,
+  StatusBadge,
+  buttonClass,
+  fmt,
+} from "./ui";
+import { CopyButton, TabPanel, Tabs } from "./ui-client";
 
-type PrimaryTab = "social" | "apify";
-type ExtractionView = "readable" | "json";
+type Tab = "overview" | "places" | "comments" | "extraction" | "raw";
+const TABS: Tab[] = ["overview", "places", "comments", "extraction", "raw"];
 
-const tabClass = (active: boolean) =>
-  `cursor-pointer rounded-lg px-3 py-2 text-xs font-bold transition ${active ? "bg-indigo-500/20 text-indigo-200" : "bg-zinc-800 text-zinc-400 hover:text-zinc-200"}`;
+const optional = (value: unknown) =>
+  typeof value === "string" && value.trim() ? value : null;
 
-function SocialPostMetrics({ post }: { post: Data }) {
-  const metrics: Array<[string, unknown]> = [
-    ["Views", post.views],
-    ["Likes", post.likes],
-    ["Comments", post.comments],
-    ["Video plays", post.video_plays],
-    ["Shares", post.shares],
-    ["Saves", post.saves],
-  ];
-  const availableMetrics = metrics.filter(([, value]) =>
-    Number.isFinite(Number(value)),
-  );
-
-  if (!availableMetrics.length) return null;
-  return (
-    <Section title="Post / reel metrics">
-      <div className="grid gap-3 sm:grid-cols-3 xl:grid-cols-6">
-        {availableMetrics.map(([title, value]) => (
-          <Metric key={title} title={title} value={value} />
-        ))}
-      </div>
-    </Section>
-  );
+function initialTab(): Tab {
+  if (typeof window === "undefined") return "overview";
+  const hash = window.location.hash.slice(1) as Tab;
+  return TABS.includes(hash) ? hash : "overview";
 }
 
-function SocialPostVideo({ post }: { post: Data }) {
-  const videoUrl = typeof post.video_url === "string" ? post.video_url : null;
-  if (!videoUrl) return null;
-
+function Caption({ caption }: { caption: string | null }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!caption)
+    return <p className="text-[13px] text-ink-3">This post has no caption.</p>;
+  const long = caption.length > 420 || caption.split("\n").length > 8;
   return (
-    <Section title="Video">
-      <a
-        href={videoUrl}
-        target="_blank"
-        rel="noreferrer"
-        className="inline-flex items-center gap-1 text-sm font-semibold text-indigo-300 hover:text-indigo-200"
+    <div>
+      <p
+        className={`text-[13px] leading-6 whitespace-pre-wrap text-ink ${long && !expanded ? "line-clamp-8" : ""}`}
       >
-        Open post video <span aria-hidden>&#8599;</span>
-      </a>
-    </Section>
+        {caption}
+      </p>
+      {long && (
+        <button
+          type="button"
+          onClick={() => setExpanded((current) => !current)}
+          className="mt-1 cursor-pointer text-xs font-medium text-accent hover:underline"
+        >
+          {expanded ? "Show less" : "Show full caption"}
+        </button>
+      )}
+    </div>
   );
 }
 
-function PostPreview({ post }: { post: Data }) {
-  const primaryImageUrl =
-    typeof post.display_url === "string" ? post.display_url : null;
+function Overview({ detail }: { detail: PostDetail }) {
+  const post = detail.post;
+  const tagGroups: Array<[string, string[]]> = [
+    ["Hashtags", strings(post.hashtags)],
+    ["Mentions", strings(post.mentions)],
+    ["Tagged creators", strings(post.tagged_users)],
+    ["Brands mentioned", strings(post.mentioned_brands)],
+    ["Locations mentioned", strings(post.mentioned_locations)],
+    ["Calls to action", strings(post.call_to_actions)],
+    ["Topics", strings(post.topics)],
+  ];
+  const present = tagGroups.filter(([, values]) => values.length);
+  const missing = tagGroups.filter(([, values]) => !values.length);
+  const transcript = optional(post.transcript);
+  const visibleText = optional(post.visible_text);
 
   return (
-    <section className="overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-900/65">
-      <div className="grid lg:grid-cols-[260px_minmax(0,1fr)]">
-        <div className="relative !h-[439px] !w-[260px] overflow-hidden bg-zinc-950 lg:mx-0">
-          {primaryImageUrl ? (
-            <img
-              src={primaryImageUrl}
-              alt="Post cover"
-              className="h-full w-full object-cover"
-              referrerPolicy="no-referrer"
-            />
-          ) : (
-            <div className="grid h-full w-full place-items-center text-5xl text-zinc-700">
-              &#9678;
-            </div>
-          )}
-          <p className="absolute left-3 top-3 rounded-md bg-black/45 px-2 py-1 text-[10px] font-bold uppercase tracking-[.14em] text-white shadow-lg">
-            {text(post.platform)} {text(post.content_type)}
-          </p>
-          <div className="absolute bottom-[86px] right-2 grid w-[48px] grid-cols-1 gap-2 rounded-2xl border border-white/15 bg-black/55 py-2 shadow-xl backdrop-blur-md">
-            <OverlayMetric label="Views" value={post.views} />
-            <OverlayMetric label="Likes" value={post.likes} />
-            <OverlayMetric label="Comments" value={post.comments} />
-            <OverlayMetric label="Plays" value={post.video_plays} />
-            <OverlayMetric label="Shares" value={post.shares} />
-            <OverlayMetric label="Saves" value={post.saves} />
-          </div>
-          <div className="absolute bottom-3 left-3 right-[60px] rounded-xl border border-white/15 bg-black/40 p-3 backdrop-blur-md">
-            <p className="truncate text-base font-bold text-white">
-              @{text(post.author_username)}
-            </p>
-            <p className="mt-1 line-clamp-2 text-xs leading-4 text-white/75">
-              {[post.owner_full_name, post.niche]
-                .filter(
-                  (item): item is string =>
-                    typeof item === "string" && item.length > 0,
-                )
-                .join(" | ") || "Creator profile"}
+    <div className="space-y-4">
+      <Panel title="Caption">
+        <Caption caption={optional(post.caption)} />
+        {optional(post.first_comment) && (
+          <div className="mt-4 border-t border-line pt-3">
+            <p className="mb-1 text-xs text-ink-3">First comment</p>
+            <p className="text-[13px] leading-6 whitespace-pre-wrap text-ink-2">
+              {String(post.first_comment)}
             </p>
           </div>
-        </div>
-        <div className="h-[439px] overflow-y-auto p-6 scrollbar-thin scrollbar-thumb-zinc-700">
-          <p className="text-[10px] font-bold uppercase tracking-[.16em] text-indigo-300">
-            Caption
+        )}
+      </Panel>
+      <Panel title="AI analysis">
+        {optional(post.content_summary) ? (
+          <p className="text-[13px] leading-6 text-ink">
+            {String(post.content_summary)}
           </p>
-          <p className="mt-3 whitespace-pre-wrap text-sm leading-7 text-zinc-200">
-            {text(post.caption)}
+        ) : (
+          <p className="text-[13px] text-ink-3">No summary was generated.</p>
+        )}
+        {present.length > 0 && (
+          <dl className="mt-4 divide-y divide-line border-t border-line">
+            {present.map(([label, values]) => (
+              <div
+                key={label}
+                className="grid gap-1 py-2.5 sm:grid-cols-[160px_minmax(0,1fr)]"
+              >
+                <dt className="text-xs text-ink-3 sm:pt-0.5">{label}</dt>
+                <dd>
+                  <Chips values={values} />
+                </dd>
+              </div>
+            ))}
+          </dl>
+        )}
+        {missing.length > 0 && (
+          <p className="mt-3 text-xs text-ink-3">
+            None recorded: {missing.map(([label]) => label.toLowerCase()).join(", ")}.
           </p>
-          <div className="mt-6 space-y-5">
-            <Info title="Hashtags">
-              <Tags values={strings(post.hashtags)} />
-            </Info>
-            <Info title="Mentions">
-              <Tags values={strings(post.mentions)} />
-            </Info>
-            {typeof post.first_comment === "string" && post.first_comment && (
-              <Info title="First comment">
-                <p className="whitespace-pre-wrap text-zinc-400">
-                  {post.first_comment}
+        )}
+      </Panel>
+      {(transcript || visibleText) && (
+        <Panel title="Spoken and on-screen text">
+          <div className="space-y-2">
+            {transcript && (
+              <details>
+                <summary className="cursor-pointer text-[13px] font-medium text-ink-2 hover:text-ink">
+                  Audio transcript
+                </summary>
+                <p className="mt-2 text-[13px] leading-6 whitespace-pre-wrap text-ink-2">
+                  {transcript}
                 </p>
-              </Info>
+              </details>
+            )}
+            {visibleText && (
+              <details>
+                <summary className="cursor-pointer text-[13px] font-medium text-ink-2 hover:text-ink">
+                  Text detected in media
+                </summary>
+                <p className="mt-2 text-[13px] leading-6 whitespace-pre-wrap text-ink-2">
+                  {visibleText}
+                </p>
+              </details>
             )}
           </div>
-        </div>
-      </div>
-    </section>
+        </Panel>
+      )}
+      <PostMediaGallery
+        imageUrls={strings(post.images)}
+        primaryImageUrl={optional(post.display_url)}
+      />
+    </div>
   );
 }
 
-function SocialPostContent({ detail }: { detail: PostDetail }) {
+function Requesters({ detail }: { detail: PostDetail }) {
+  const requesters = records(detail.related.requesters);
+  return (
+    <Panel
+      title="Requested by"
+      description={
+        requesters.length > 1
+          ? `${requesters.length} users submitted this link`
+          : undefined
+      }
+      flush
+    >
+      {requesters.length ? (
+        <ul className="divide-y divide-line">
+          {requesters.map((requester) => (
+            <li key={String(requester.user_id)}>
+              <Link
+                href={`/admin/users/${requester.user_id}`}
+                className="flex items-center gap-3 px-4 py-2.5 hover:bg-subtle"
+              >
+                <Avatar
+                  name={optional(requester.display_name)}
+                  url={optional(requester.avatar_url)}
+                />
+                <div className="min-w-0">
+                  <p className="truncate text-[13px] font-medium text-ink">
+                    {optional(requester.display_name) ||
+                      optional(requester.email) ||
+                      "Unnamed user"}
+                  </p>
+                  <p className="truncate text-xs text-ink-3">
+                    {requester.is_creator ? "Created" : "Requested"}{" "}
+                    {fmt.relative(requester.first_requested_at)}
+                  </p>
+                </div>
+              </Link>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="px-4 py-3 text-[13px] text-ink-3">
+          Not linked to a registered user. It was submitted before user
+          attribution or without signing in.
+        </p>
+      )}
+    </Panel>
+  );
+}
+
+export default function PostDetailView({
+  postId,
+  detail,
+  backHref,
+}: {
+  postId: string;
+  detail: PostDetail;
+  backHref: string;
+}) {
+  const [tab, setTab] = useState<Tab>(initialTab);
+  const [placeQuery, setPlaceQuery] = useState("");
   const post = detail.post;
-  const images = strings(post.images);
-  const primaryImageUrl =
-    typeof post.display_url === "string" ? post.display_url : null;
+  const related = detail.related;
+  const saves = record(related.saves);
+  const reference = record(related.post_reference);
+  const postUrl = optional(post.post_url) || optional(reference.url);
+  const shortCode = optional(reference.short_code) || optional(post.short_code);
+  const places = collectPlaces(detail).places.length;
+  const comments = apifyComments(detail).length;
+  const tokens = record(related.token_usage).total_tokens;
+  const health = latestRunHealth(detail);
+  const author = optional(post.author_username) || "unknown";
   const music = [post.music_name, post.music_artist]
-    .filter(
-      (item): item is string => typeof item === "string" && item.length > 0,
-    )
+    .filter((item): item is string => typeof item === "string" && Boolean(item))
     .join(" — ");
 
-  return (
-    <div className="space-y-5">
-      <PostMediaGallery imageUrls={images} primaryImageUrl={primaryImageUrl} />
-      <PostReference detail={detail} />
-      <SocialPostMetrics post={post} />
-      <SocialPostVideo post={post} />
-      <TokenUsage detail={detail} />
-      <Section title="Content insights" note={date(post.created_at, true)}>
-        <div className="grid gap-x-6 gap-y-5 sm:grid-cols-2 xl:grid-cols-3">
-          <Info title="Summary">{text(post.content_summary)}</Info>
-          <Info title="Primary category">{text(post.primary_category)}</Info>
-          <Info title="Additional categories">
-            <Tags values={strings(post.secondary_categories)} />
-          </Info>
-          <Info title="Music">{music || "Not available"}</Info>
-          <Info title="Video duration">
-            {typeof post.video_duration === "number"
-              ? `${post.video_duration} seconds`
-              : "Not available"}
-          </Info>
-          <Info title="Video format">
-            {post.dimensions_width && post.dimensions_height
-              ? `${post.dimensions_width} × ${post.dimensions_height}`
-              : "Not available"}
-          </Info>
-          <Info title="Creator niche">{text(post.niche)}</Info>
-          <Info title="Audience">{text(post.target_audience)}</Info>
-          <Info title="First comment">{text(post.first_comment)}</Info>
-        </div>
-        <div className="mt-6 grid gap-5 sm:grid-cols-2">
-          <Info title="Hashtags">
-            <Tags values={strings(post.hashtags)} />
-          </Info>
-          <Info title="Mentions">
-            <Tags values={strings(post.mentions)} />
-          </Info>
-          <Info title="Tagged creators">
-            <Tags values={strings(post.tagged_users)} />
-          </Info>
-          <Info title="Brands mentioned">
-            <Tags values={strings(post.mentioned_brands)} />
-          </Info>
-          <Info title="Locations mentioned">
-            <Tags values={strings(post.mentioned_locations)} />
-          </Info>
-          <Info title="Calls to action">
-            <Tags values={strings(post.call_to_actions)} />
-          </Info>
-          <Info title="Content topics">
-            <Tags values={strings(post.topics)} />
-          </Info>
-        </div>
-      </Section>
-      <Section
-        title="Places found"
-        note="Map pins use saved or resolved locations"
-      >
-        <Places detail={detail} />
-      </Section>
-      <ExtractedComments detail={detail} />
-    </div>
-  );
-}
+  function changeTab(next: Tab) {
+    setTab(next);
+    const url = new URL(window.location.href);
+    url.hash = next === "overview" ? "" : next;
+    window.history.replaceState(window.history.state, "", url);
+  }
 
-function ApifyExtractionContent({ detail }: { detail: PostDetail }) {
-  const post = detail.post;
-  const hasExtractedContent =
-    (typeof post.transcript === "string" && post.transcript) ||
-    (typeof post.visible_text === "string" && post.visible_text);
-
-  return (
-    <div className="space-y-5">
-      <ApifyExtraction detail={detail} />
-      <TraceLog detail={detail} />
-      <ApifyTraceDetails detail={detail} />
-      {hasExtractedContent && (
-        <Section title="Spoken and visible content">
-          <div className="grid gap-5 lg:grid-cols-2">
-            {typeof post.transcript === "string" && post.transcript && (
-              <Info title="Audio transcript">
-                <p className="whitespace-pre-wrap text-zinc-300">
-                  {post.transcript}
-                </p>
-              </Info>
-            )}
-            {typeof post.visible_text === "string" && post.visible_text && (
-              <Info title="Text detected in media">
-                <p className="whitespace-pre-wrap text-zinc-300">
-                  {post.visible_text}
-                </p>
-              </Info>
-            )}
-          </div>
-        </Section>
-      )}
-      <Section
-        title="Extraction details"
-        note="Evidence, candidates, stages, and service activity"
-      >
-        <ExtractionPipeline detail={detail} />
-      </Section>
-    </div>
-  );
-}
-
-export default function PostDetailView({ detail }: { detail: PostDetail }) {
-  const [primaryTab, setPrimaryTab] = useState<PrimaryTab>("social");
-  const [extractionView, setExtractionView] =
-    useState<ExtractionView>("readable");
-  const extractionJson = {
-    apify: detail.related.apify ?? null,
-    trace: detail.related.trace ?? null,
-    trace_json: detail.related.trace_json ?? null,
-    extraction: detail.related.extraction ?? null,
-    spoken_content:
-      typeof detail.post.transcript === "string"
-        ? detail.post.transcript
-        : null,
-    visible_content:
-      typeof detail.post.visible_text === "string"
-        ? detail.post.visible_text
-        : null,
+  const rawJson = {
+    post,
+    apify: related.apify ?? null,
+    trace: related.trace ?? null,
+    trace_json: related.trace_json ?? null,
+    extraction: related.extraction ?? null,
+    token_usage: related.token_usage ?? null,
   };
 
   return (
     <div className="space-y-5">
-      <PostPreview post={detail.post} />
-      {detail.warnings?.length ? (
-        <div className="rounded-xl border border-amber-400/25 bg-amber-400/10 p-4 text-sm text-amber-100">
-          Some optional records could not be loaded for this post.
-        </div>
-      ) : null}
-
-      <div className="space-y-5">
-        <div
-          className="flex flex-wrap items-center gap-2"
-          role="tablist"
-          aria-label="Post details"
-        >
-          <button
-            type="button"
-            role="tab"
-            aria-selected={primaryTab === "social"}
-            onClick={() => setPrimaryTab("social")}
-            className={tabClass(primaryTab === "social")}
-          >
-            Social Post Details
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={primaryTab === "apify"}
-            onClick={() => setPrimaryTab("apify")}
-            className={tabClass(primaryTab === "apify")}
-          >
-            Extraction Details
-          </button>
-        </div>
-
-        {primaryTab === "social" ? (
-          <div role="tabpanel">
-            <SocialPostContent detail={detail} />
-          </div>
-        ) : (
-          <div role="tabpanel">
-            <div
-              className="mb-4 flex items-center gap-2"
-              role="tablist"
-              aria-label="Apify extraction view"
-            >
-              <button
-                type="button"
-                role="tab"
-                aria-selected={extractionView === "readable"}
-                onClick={() => setExtractionView("readable")}
-                className={tabClass(extractionView === "readable")}
+      <PageHeader
+        breadcrumb={
+          <nav aria-label="Breadcrumb">
+            <Link href={backHref} className="hover:text-ink hover:underline">
+              Posts
+            </Link>
+            <span aria-hidden className="mx-1.5">
+              /
+            </span>
+            <span aria-current="page">{shortCode || "Post"}</span>
+          </nav>
+        }
+        title={
+          <span className="flex items-center gap-3">
+            <Thumbnail
+              post={{
+                id: postId,
+                display_url: optional(post.display_url),
+                image_urls: strings(post.images),
+              }}
+              className="h-12 w-10 shrink-0"
+            />
+            <span className="min-w-0 truncate">@{author}</span>
+          </span>
+        }
+        description={
+          <span className="flex flex-wrap items-center gap-x-2 gap-y-1 capitalize">
+            <span>
+              {[post.platform, post.content_type].filter(Boolean).join(" · ")}
+            </span>
+            <span aria-hidden>·</span>
+            <span className="normal-case">
+              Added {fmt.date(post.created_at, true)}
+            </span>
+            <span aria-hidden>·</span>
+            <StatusBadge status={post.status} />
+          </span>
+        }
+        actions={
+          <>
+            <CopyButton value={postId} label="post ID">
+              Copy ID
+            </CopyButton>
+            {postUrl && (
+              <a
+                href={postUrl}
+                target="_blank"
+                rel="noreferrer"
+                className={buttonClass("secondary")}
               >
-                Readable View
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={extractionView === "json"}
-                onClick={() => setExtractionView("json")}
-                className={tabClass(extractionView === "json")}
-              >
-                JSON View
-              </button>
-            </div>
-            {extractionView === "readable" ? (
-              <ApifyExtractionContent detail={detail} />
-            ) : (
-              <pre className="max-h-[560px] overflow-auto rounded-xl border border-zinc-800 bg-[#09090b] p-4 font-mono text-xs leading-6 text-emerald-200">
-                {JSON.stringify(extractionJson, null, 2)}
-              </pre>
+                Open original ↗
+              </a>
             )}
+          </>
+        }
+      />
+
+      {health &&
+        (health.status === "failed" ||
+          health.status === "partial" ||
+          health.errors > 0) && (
+          <div
+            role="status"
+            className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-line bg-surface px-3 py-2 text-[13px]"
+          >
+            <span className="flex flex-wrap items-center gap-x-2 text-ink">
+              <span
+                aria-hidden
+                className={`h-1.5 w-1.5 rounded-full ${health.status === "failed" || health.errors ? "bg-bad" : "bg-warn"}`}
+              />
+              Latest extraction {health.status === "completed" ? "completed" : `finished ${health.status}`}
+              {" with "}
+              {health.errors} {health.errors === 1 ? "error" : "errors"} and{" "}
+              {health.warnings} {health.warnings === 1 ? "warning" : "warnings"}
+              {health.message && <span className="text-ink-3">· {health.message}</span>}
+            </span>
+            <button
+              type="button"
+              onClick={() => changeTab("extraction")}
+              className="cursor-pointer text-xs font-medium text-accent hover:underline"
+            >
+              Review issues
+            </button>
           </div>
         )}
+
+      {detail.warnings?.length ? (
+        <p
+          role="status"
+          className="rounded-md border border-line bg-warn-soft px-3 py-2 text-[13px] text-warn"
+        >
+          Some optional records could not be loaded: {detail.warnings.join("; ")}
+        </p>
+      ) : null}
+
+      <StatStrip
+        items={[
+          // Instagram reels report plays rather than views.
+          Number(post.views) > 0 || !(Number(post.video_plays) > 0)
+            ? { label: "Views", value: fmt.compact(post.views) }
+            : { label: "Plays", value: fmt.compact(post.video_plays) },
+          { label: "Likes", value: fmt.compact(post.likes) },
+          { label: "Comments", value: fmt.compact(post.comments) },
+          { label: "Shares", value: fmt.compact(post.shares) },
+          { label: "Places found", value: fmt.number(places) },
+          {
+            label: "Saved in app",
+            value: fmt.number(saves.total ?? 0),
+            hint:
+              typeof saves.users === "number" && saves.users > 0
+                ? `by ${fmt.number(saves.users)} ${saves.users === 1 ? "user" : "users"}`
+                : undefined,
+          },
+        ]}
+      />
+
+      <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_300px]">
+        <div className="min-w-0">
+          <Tabs<Tab>
+            label="Post sections"
+            idPrefix="post"
+            active={tab}
+            onChange={changeTab}
+            tabs={[
+              { id: "overview", label: "Overview" },
+              { id: "places", label: "Places", count: places },
+              { id: "comments", label: "Comments", count: comments },
+              {
+                id: "extraction",
+                label: "Extraction",
+                count: health && health.errors > 0 ? health.errors : null,
+              },
+              { id: "raw", label: "Raw data" },
+            ]}
+          />
+          <div className="mt-4">
+            <TabPanel id={tab} idPrefix="post">
+              {tab === "overview" && <Overview detail={detail} />}
+              {tab === "places" && (
+                <Places
+                  detail={detail}
+                  onInvestigate={(name) => {
+                    setPlaceQuery(name);
+                    changeTab("extraction");
+                  }}
+                />
+              )}
+              {tab === "comments" && <ExtractedComments detail={detail} />}
+              {tab === "extraction" && (
+                <ExtractionView key={placeQuery} detail={detail} placeQuery={placeQuery} />
+              )}
+              {tab === "raw" && (
+                <Panel
+                  title="Raw data"
+                  description="Normalized post plus every related record returned by the API"
+                  actions={
+                    <CopyButton
+                      value={JSON.stringify(rawJson, null, 2)}
+                      label="raw JSON"
+                    >
+                      Copy JSON
+                    </CopyButton>
+                  }
+                  flush
+                >
+                  <pre className="max-h-160 overflow-auto p-4 font-mono text-xs leading-5 text-ink-2">
+                    {JSON.stringify(rawJson, null, 2)}
+                  </pre>
+                </Panel>
+              )}
+            </TabPanel>
+          </div>
+        </div>
+
+        <aside className="space-y-4" aria-label="Post details">
+          <Requesters detail={detail} />
+          <Panel title="Details">
+            <FactList
+              items={[
+                [
+                  "Post ID",
+                  <span key="id" className="font-mono text-xs break-all">
+                    {postId}
+                  </span>,
+                ],
+                ["Short code", shortCode],
+                ["Creator name", optional(post.owner_full_name)],
+                [
+                  "Category",
+                  optional(post.primary_category)?.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase()) ?? null,
+                ],
+                [
+                  "Also tagged",
+                  strings(post.secondary_categories).join(", ") || null,
+                ],
+                ["Niche", optional(post.niche)],
+                ["Audience", optional(post.target_audience)],
+                [
+                  "Duration",
+                  typeof post.video_duration === "number"
+                    ? `${post.video_duration} s`
+                    : null,
+                ],
+                [
+                  "Dimensions",
+                  post.dimensions_width && post.dimensions_height
+                    ? `${post.dimensions_width} × ${post.dimensions_height}`
+                    : null,
+                ],
+                ["Video plays", fmt.number(post.video_plays, "")],
+                ["Platform saves", fmt.number(post.saves, "")],
+                ["Music", music || null],
+                ["Tokens used", fmt.number(tokens, "")],
+                [
+                  "Been here / want to go",
+                  typeof saves.total === "number" && saves.total > 0
+                    ? `${fmt.number(saves.been_here)} / ${fmt.number(saves.want_to_go)}`
+                    : null,
+                ],
+                [
+                  "Video",
+                  optional(post.video_url) ? (
+                    <a
+                      key="video"
+                      href={String(post.video_url)}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-accent hover:underline"
+                    >
+                      Open ↗
+                    </a>
+                  ) : null,
+                ],
+              ]}
+            />
+          </Panel>
+        </aside>
       </div>
     </div>
   );
 }
+

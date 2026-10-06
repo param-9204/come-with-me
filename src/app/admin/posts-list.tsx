@@ -1,299 +1,201 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
 
 import type { AdminPostSummary } from "@/lib/admin-posts";
-import Pagination from "./pagination";
+import Thumbnail from "./post-thumbnail";
+import { StatusBadge, cx, fmt } from "./ui";
 
-type SortKey =
-  | "created_at"
-  | "author_username"
-  | "location_name"
-  | "likes"
-  | "views";
+type SortKey = "created_at" | "views" | "likes" | "comments";
 type Props = {
   posts: AdminPostSummary[];
-  total: number;
-  page: number;
-  loading: boolean;
-  search: string;
-  onPageChange: (page: number) => void;
-  onOpen: (id: string) => void;
+  postHref: (id: string) => string;
+  sort: string;
+  ascending: boolean;
+  onSort: (sort: SortKey, ascending: boolean) => void;
 };
-const number = new Intl.NumberFormat("en");
-const date = (value: string | null) =>
-  value
-    ? new Intl.DateTimeFormat("en", {
-        day: "numeric",
-        month: "short",
-        year: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-      }).format(new Date(value))
-    : "—";
-const value = (item: unknown) =>
-  item === null || item === undefined ? "" : String(item);
 
+function SortHeader({
+  column,
+  label,
+  className,
+  sort,
+  ascending,
+  onSort,
+}: {
+  column: SortKey;
+  label: string;
+  className?: string;
+} & Pick<Props, "sort" | "ascending" | "onSort">) {
+  const active = sort === column;
+  return (
+    <th
+      scope="col"
+      aria-sort={active ? (ascending ? "ascending" : "descending") : "none"}
+      className={cx("px-3 py-2 font-medium", className)}
+    >
+      <button
+        type="button"
+        onClick={() => onSort(column, active ? !ascending : false)}
+        className={cx(
+          "inline-flex cursor-pointer items-center gap-1 hover:text-ink",
+          active && "text-ink",
+        )}
+      >
+        {label}
+        <span aria-hidden className="text-[10px]">
+          {active ? (ascending ? "▲" : "▼") : ""}
+        </span>
+      </button>
+    </th>
+  );
+}
+
+/**
+ * Posts table. Secondary columns drop out as the viewport narrows; on phones the
+ * post cell carries a one-line summary of what the hidden columns showed.
+ */
 export default function PostsList({
   posts,
-  total,
-  page,
-  loading,
-  search,
-  onPageChange,
-  onOpen,
+  postHref,
+  sort,
+  ascending,
+  onSort,
 }: Props) {
-  const [platform, setPlatform] = useState("");
-  const [type, setType] = useState("");
-  const [location, setLocation] = useState("");
-  const [sort, setSort] = useState<SortKey>("created_at");
-  const [descending, setDescending] = useState(true);
-  const pageSize = 15;
-  const filtered = useMemo(
-    () =>
-      posts
-        .filter((post) => {
-          const searchMatch =
-            !search.trim() ||
-            [
-              post.post_url,
-              post.author_username,
-              post.user_id,
-              post.user_name,
-              post.location_name,
-              post.location_address,
-              post.primary_category,
-              post.short_code,
-            ].some((item) =>
-              value(item).toLowerCase().includes(search.trim().toLowerCase()),
-            );
-          const locationMatch =
-            `${value(post.location_name)} ${value(post.location_address)}`
-              .toLowerCase()
-              .includes(location.trim().toLowerCase());
-          return (
-            searchMatch &&
-            (!platform || post.platform === platform) &&
-            (!type || post.content_type === type) &&
-            locationMatch
-          );
-        })
-        .sort((a, b) => {
-          const left =
-            sort === "likes" || sort === "views"
-              ? Number(a[sort] || 0)
-              : value(a[sort]).toLowerCase();
-          const right =
-            sort === "likes" || sort === "views"
-              ? Number(b[sort] || 0)
-              : value(b[sort]).toLowerCase();
-          const result =
-            typeof left === "number" && typeof right === "number"
-              ? left - right
-              : String(left).localeCompare(String(right));
-          return descending ? -result : result;
-        }),
-    [posts, platform, type, location, search, sort, descending],
-  );
-  const sortBy = (key: SortKey) => {
-    setDescending(
-      key === sort
-        ? !descending
-        : key === "created_at" || key === "likes" || key === "views",
-    );
-    setSort(key);
-  };
-  const pages = Math.max(1, Math.ceil(total / pageSize));
+  const router = useRouter();
 
   return (
-    <section className="rounded-2xl border border-zinc-800 bg-zinc-900/65 p-4 sm:p-5">
-      <div className="mb-4 flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-        <div>
-          <h2 className="font-bold text-white">Posts list</h2>
-          <p className="mt-1 text-xs text-zinc-500">
-            Search: {search || "all loaded fields"} · {total.toLocaleString()}{" "}
-            total posts
-          </p>
-        </div>
-        <div className="grid gap-2 sm:grid-cols-3">
-          <select
-            value={platform}
-            onChange={(event) => setPlatform(event.target.value)}
-            className="rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-200"
-          >
-            <option value="">All platforms</option>
-            <option value="instagram">Instagram</option>
-            <option value="tiktok">TikTok</option>
-          </select>
-          <select
-            value={type}
-            onChange={(event) => setType(event.target.value)}
-            className="rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-200"
-          >
-            <option value="">All formats</option>
-            <option value="reel">Reel</option>
-            <option value="post">Post</option>
-            <option value="video">Video</option>
-          </select>
-          <input
-            value={location}
-            onChange={(event) => setLocation(event.target.value)}
-            placeholder="Filter location"
-            className="rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-200 placeholder:text-zinc-600"
-          />
-        </div>
-      </div>
-      <div className="max-h-[65vh] overflow-auto rounded-xl border border-zinc-800">
-        <table className="min-w-[1450px] w-full text-left text-xs">
-          <thead className="sticky top-0 z-10 bg-zinc-950 text-[10px] uppercase tracking-[.12em] text-zinc-500">
-            <tr>
-              {[
-                ["Image", null],
-                ["Post URL", null],
-                ["User", null],
-                ["Creator", "author_username"],
-                ["Platform", null],
-                ["Location", "location_name"],
-                ["Category", null],
-                ["Created", "created_at"],
-                ["Views", "views"],
-                ["Likes", "likes"],
-                ["Comments", null],
-                ["Status", null],
-              ].map(([label, key]) => (
-                <th
-                  key={label}
-                  className="whitespace-nowrap border-b border-zinc-800 px-3 py-3"
-                >
-                  {key ? (
-                    <button
-                      onClick={() => sortBy(key as SortKey)}
-                      className="font-bold hover:text-zinc-200"
-                    >
-                      {label} {sort === key ? (descending ? "↓" : "↑") : "↕"}
-                    </button>
-                  ) : (
-                    label
-                  )}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {filtered.map((post) => {
-              const image = post.display_url || post.image_urls[0];
-              return (
-                <tr
-                  key={post.id}
-                  tabIndex={0}
-                  onClick={() => onOpen(post.id)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.preventDefault();
-                      onOpen(post.id);
-                    }
-                  }}
-                  className="cursor-pointer border-b border-zinc-800/80 text-zinc-300 transition hover:bg-zinc-800/50 focus:bg-zinc-800/50 focus:outline-none"
-                >
-                  <td className="px-3 py-2">
-                    <div className="grid h-14 w-11 place-items-center overflow-hidden rounded-md bg-zinc-800">
-                      {image ? (
-                        <img
-                          src={image}
-                          alt="Post"
-                          className="h-full w-full object-cover"
-                          loading="lazy"
-                          referrerPolicy="no-referrer"
-                          onError={(e) =>
-                            (e.currentTarget.style.display = "none")
-                          }
-                        />
-                      ) : (
-                        "◌"
-                      )}
+    <div className="overflow-x-auto">
+      <table className="w-full text-left text-[13px]">
+        <thead className="border-b border-line bg-subtle text-xs text-ink-3">
+          <tr>
+            <th scope="col" className="px-3 py-2 font-medium">
+              Post
+            </th>
+            <th scope="col" className="hidden px-3 py-2 font-medium whitespace-nowrap lg:table-cell">
+              Submitted by
+            </th>
+            <th scope="col" className="hidden px-3 py-2 font-medium md:table-cell">
+              Format
+            </th>
+            <th scope="col" className="hidden px-3 py-2 font-medium xl:table-cell">
+              Category
+            </th>
+            <SortHeader
+              sort={sort}
+              ascending={ascending}
+              onSort={onSort}
+              column="views"
+              label="Views"
+              className="hidden text-right md:table-cell"
+            />
+            <SortHeader
+              sort={sort}
+              ascending={ascending}
+              onSort={onSort}
+              column="likes"
+              label="Likes"
+              className="hidden text-right md:table-cell"
+            />
+            <th scope="col" className="px-3 py-2 font-medium">
+              Status
+            </th>
+            <SortHeader
+              sort={sort}
+              ascending={ascending}
+              onSort={onSort}
+              column="created_at"
+              label="Added"
+              className="hidden text-right sm:table-cell"
+            />
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-line">
+          {posts.map((post) => {
+            const href = postHref(post.id);
+            return (
+              <tr
+                key={post.id}
+                onClick={(event) => {
+                  if ((event.target as HTMLElement).closest("a")) return;
+                  router.push(href);
+                }}
+                className="cursor-pointer align-middle hover:bg-subtle"
+              >
+                <td className="w-full max-w-0 px-3 py-2">
+                  <div className="flex min-w-52 items-center gap-3">
+                    <Thumbnail post={post} className="h-11 w-9 shrink-0" />
+                    <div className="min-w-0">
+                      <Link
+                        href={href}
+                        className="block truncate font-medium text-ink hover:text-accent"
+                      >
+                        @{post.author_username || "unknown"}
+                      </Link>
+                      <p
+                        className="truncate text-xs text-ink-3"
+                        title={post.caption || undefined}
+                      >
+                        {post.caption?.split("\n")[0] || "No caption"}
+                      </p>
+                      <p
+                        className="mt-0.5 truncate text-xs text-ink-3 capitalize md:hidden"
+                        suppressHydrationWarning
+                      >
+                        {[
+                          post.platform,
+                          post.content_type,
+                          post.views ? `${fmt.compact(post.views)} views` : null,
+                          fmt.relative(post.created_at),
+                        ]
+                          .filter(Boolean)
+                          .join(" · ")}
+                      </p>
                     </div>
-                  </td>
-                  <td
-                    className="max-w-64 px-3 py-2"
-                    onClick={(event) => event.stopPropagation()}
-                    onKeyDown={(event) => event.stopPropagation()}
-                  >
-                    <a
-                      href={post.post_url || "#"}
-                      target="_blank"
-                      rel="noreferrer"
-                      onClick={(event) => event.stopPropagation()}
-                      className="block truncate font-medium text-indigo-300 hover:text-indigo-200"
+                  </div>
+                </td>
+                <td className="hidden px-3 py-2 lg:table-cell">
+                  {post.user_id ? (
+                    <Link
+                      href={`/admin/users/${post.user_id}`}
+                      className="block max-w-44 truncate text-ink-2 hover:text-accent hover:underline"
                     >
-                      {post.post_url || "No URL"}
-                    </a>
-                    <p className="mt-1 text-zinc-600">
-                      {post.short_code || "—"}
-                    </p>
-                  </td>
-                  <td className="px-3 py-2">
-                    <p className="font-medium text-zinc-200">
-                      {post.user_name || "Unassigned"}
-                    </p>
-                    <p className="mt-1 font-mono text-[10px] text-zinc-500">
-                      {post.user_id || "—"}
-                    </p>
-                    {post.user_phone && (
-                      <p className="mt-1 text-zinc-600">{post.user_phone}</p>
-                    )}
-                  </td>
-                  <td className="px-3 py-2">
-                    @{post.author_username || "unknown"}
-                  </td>
-                  <td className="px-3 py-2 capitalize">
-                    {[post.platform, post.content_type]
-                      .filter(Boolean)
-                      .join(" · ") || "—"}
-                  </td>
-                  <td className="max-w-52 px-3 py-2">
-                    <p className="font-medium text-zinc-200">
-                      {post.location_name || "—"}
-                    </p>
-                    <p className="mt-1 truncate text-zinc-500">
-                      {post.location_address || ""}
-                    </p>
-                  </td>
-                  <td className="px-3 py-2">{post.primary_category || "—"}</td>
-                  <td className="whitespace-nowrap px-3 py-2">
-                    {date(post.created_at)}
-                  </td>
-                  <td className="px-3 py-2">
-                    {number.format(post.views || 0)}
-                  </td>
-                  <td className="px-3 py-2">
-                    {number.format(post.likes || 0)}
-                  </td>
-                  <td className="px-3 py-2">
-                    {number.format(post.comments || 0)}
-                  </td>
-                  <td className="px-3 py-2 capitalize">{post.status || "—"}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-        {!filtered.length && (
-          <p className="p-8 text-center text-sm text-zinc-500">
-            No posts on this page match the selected filters.
-          </p>
-        )}
-      </div>
-      <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-        <p className="text-xs text-zinc-500">
-          Page {page} of {pages}
-        </p>
-        <Pagination
-          page={page}
-          totalPages={pages}
-          loading={loading}
-          onPageChange={onPageChange}
-        />
-      </div>
-    </section>
+                      {post.user_name || "Unnamed user"}
+                    </Link>
+                  ) : (
+                    <span className="text-ink-3">—</span>
+                  )}
+                </td>
+                <td className="hidden px-3 py-2 whitespace-nowrap text-ink-2 capitalize md:table-cell">
+                  {[post.platform, post.content_type].filter(Boolean).join(" · ")}
+                </td>
+                <td className="hidden max-w-40 truncate px-3 py-2 text-ink-2 capitalize xl:table-cell">
+                  {post.primary_category?.toLowerCase() || (
+                    <span className="text-ink-3">—</span>
+                  )}
+                </td>
+                <td className="hidden px-3 py-2 text-right text-ink-2 tabular-nums md:table-cell">
+                  {fmt.compact(post.views)}
+                </td>
+                <td className="hidden px-3 py-2 text-right text-ink-2 tabular-nums md:table-cell">
+                  {fmt.compact(post.likes)}
+                </td>
+                <td className="px-3 py-2">
+                  <StatusBadge status={post.status} />
+                </td>
+                <td
+                  className="hidden px-3 py-2 text-right whitespace-nowrap text-ink-3 sm:table-cell"
+                  title={fmt.date(post.created_at, true)}
+                  suppressHydrationWarning
+                >
+                  {fmt.relative(post.created_at)}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
   );
 }
