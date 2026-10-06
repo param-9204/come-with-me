@@ -552,6 +552,14 @@ export interface PlaceExtraction {
   explanation?: string;
   /** The evidence lines behind the name and location (trimmed), for audit/UI. */
   evidence_snippets?: Array<{ id: string; source: EvidenceSource; text: string; timestamps?: number[] }>;
+  /** Visual evidence used to place this venue in video/image frame order. */
+  frame_evidence?: {
+    frame_indexes: number[];
+    timestamps_seconds: number[];
+    evidence_ids: string[];
+  };
+  /** First visual position in this post; persisted on social_post_places only. */
+  sequence_position?: number;
   /** Maps search text for indirect mentions (words taken from evidence only). */
   search_query?: string;
   /**

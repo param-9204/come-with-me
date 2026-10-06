@@ -2,6 +2,7 @@ import { after, NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
 import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { DbService } from '@/lib/services/db.service';
+import { buildPlaceSequence } from '@/lib/services/place-sequence.service';
 import { AiEnrichmentService } from '@/lib/services/ai-enrichment.service';
 import { PipelineLog } from '@/lib/services/pipeline-log';
 import { ScraperService } from '@/lib/services/scraper.service';
@@ -179,6 +180,27 @@ function formatResponsePlaces(
 
 function responsePlaceIds(places: any[]): string[] {
   return places.map((place) => place?.id || place?.place_id).filter(Boolean);
+}
+
+/** Prefer the post-place rows; JSON evidence is only a pre-migration fallback. */
+async function placeSequenceForResponse(socialPostId: string | null | undefined, places: any[]) {
+  const persisted = await DbService.getPlaceSequenceForSocialPost(socialPostId);
+  if (persisted.length) return persisted;
+  return buildPlaceSequence(places.map((place) => ({
+    name: place?.name,
+    place_id: place?.id || place?.place_id || null,
+    frame_evidence: place?.frame_evidence,
+  })));
+}
+
+function orderResponsePlaces(places: any[], sequence: Awaited<ReturnType<typeof placeSequenceForResponse>>) {
+  const orderById = new Map(sequence.filter((item) => item.place_id).map((item) => [item.place_id!, item.sequence]));
+  const orderByName = new Map(sequence.map((item) => [String(item.name || '').trim().toLowerCase(), item.sequence]));
+  return [...places].sort((a, b) => {
+    const aOrder = orderById.get(a?.id || a?.place_id || '') ?? orderByName.get(String(a?.name || '').trim().toLowerCase()) ?? Number.POSITIVE_INFINITY;
+    const bOrder = orderById.get(b?.id || b?.place_id || '') ?? orderByName.get(String(b?.name || '').trim().toLowerCase()) ?? Number.POSITIVE_INFINITY;
+    return aOrder - bOrder;
+  });
 }
 
 /**
@@ -612,11 +634,12 @@ export async function POST(request: Request) {
 
       // A completed post is a cache hit. Return only the persisted result: do
       // not scrape, run OCR, call AI, or write a recovery result on this path.
-      const places = formatResponsePlaces(savedPlaces, {
+      const responsePlaces = formatResponsePlaces(savedPlaces, {
         authorUsername: cachedContent.authorUsername,
         sourceUrl: existingPost.post_url,
         platform: cachedContent.platform,
       });
+      const places = orderResponsePlaces(responsePlaces, await placeSequenceForResponse(existingPost.id, responsePlaces));
       const firstPlace = places.length > 0 ? places[0] : null;
       const responseData = {
         ...existingPost,
@@ -780,11 +803,12 @@ export async function POST(request: Request) {
       const key = `${String(place?.name || '').trim().toLowerCase()}|${String(place?.city || '').trim().toLowerCase()}`;
       return Boolean(place?.name) && !savedPlaceKeys.has(key);
     });
-    const places = formatResponsePlaces([...savedPlaces, ...responseOnlyPlaces], {
+    const responsePlaces = formatResponsePlaces([...savedPlaces, ...responseOnlyPlaces], {
       authorUsername: authorUsernameFromPost(completedPost),
       sourceUrl: completedPost.post_url,
       platform: completedPost.platform,
     });
+    const places = orderResponsePlaces(responsePlaces, await placeSequenceForResponse(completedPost.id, responsePlaces));
     const firstPlace = places.length > 0 ? places[0] : null;
 
     return NextResponse.json({
@@ -867,11 +891,12 @@ export async function GET(request: Request) {
       post = canonicalPost;
     }
 
-    const places = formatResponsePlaces(await DbService.getPlacesForSocialPost(post.id, post.post_url), {
+    const responsePlaces = formatResponsePlaces(await DbService.getPlacesForSocialPost(post.id, post.post_url), {
       authorUsername: authorUsernameFromPost(post),
       sourceUrl: post.post_url,
       platform: post.platform,
     });
+    const places = orderResponsePlaces(responsePlaces, await placeSequenceForResponse(post.id, responsePlaces));
     const firstPlace = places.length > 0 ? places[0] : null;
 
     return NextResponse.json({
