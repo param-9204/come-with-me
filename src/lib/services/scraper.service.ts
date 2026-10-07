@@ -250,14 +250,22 @@ export class ScraperService {
       raw.media_fallback = { status: 'source_url_missing', platform, actorId };
       return '';
     }
-    if (inputMode !== 'startUrls-object' && inputMode !== 'startUrls-string') {
+    if (inputMode !== 'startUrls-object' && inputMode !== 'startUrls-string' && inputMode !== 'videos') {
       raw.media_fallback = { status: 'unsupported_input_mode', platform, actorId, inputMode };
       return '';
     }
 
-    const input = inputMode === 'startUrls-object'
-      ? { startUrls: [{ url: sourceUrl }] }
-      : { workflow: 'videoUrls', startUrls: [sourceUrl], maxResults: 1, downloadMp4: true };
+    const input = inputMode === 'videos'
+      ? {
+        // streamers/youtube-video-downloader requires this schema. Persisting to
+        // Apify storage also gives the evidence pipeline a retrievable MP4 URL.
+        videos: [{ url: sourceUrl }],
+        storeInKVStore: true,
+        preferredFormat: 'mp4',
+      }
+      : inputMode === 'startUrls-object'
+        ? { startUrls: [{ url: sourceUrl }] }
+        : { workflow: 'videoUrls', startUrls: [sourceUrl], maxResults: 1, downloadMp4: true };
     const run = await this.getClient().actor(actorId).call(input);
     const datasetId = run?.defaultDatasetId || null;
     const keyValueStoreId = run?.defaultKeyValueStoreId || null;
@@ -546,10 +554,18 @@ export class ScraperService {
     );
     const contentId = text(raw.id) || text(raw.reelId) || text(raw.videoId) || text(raw.video_id) || Date.now().toString();
     const author = raw.author && typeof raw.author === 'object' ? raw.author : {};
+    const creatorName = text(raw.authorName) || text(raw.creatorName) || text(author.name);
+    const creatorUsername = text(raw.authorUsername) || text(raw.creatorUsername) || text(author.username);
+    // Facebook actors often expose only a numeric page ID as the username.
+    // Use the page's supplied display name in that case, while retaining an
+    // actual Facebook username whenever one is available.
+    const authorUsername = creatorUsername && !/^\d+$/.test(creatorUsername)
+      ? creatorUsername
+      : creatorName || creatorUsername || text(raw.creatorId) || 'unknown';
     const normalized: SocialContent = {
       platform: 'facebook', contentType: 'reel', contentId,
-      authorUsername: text(raw.authorUsername) || text(raw.creatorUsername) || text(raw.creatorId) || text(author.username) || 'unknown',
-      authorFullName: text(raw.authorName) || text(raw.creatorName) || text(author.name),
+      authorUsername,
+      authorFullName: creatorName,
       caption: text(raw.caption) || text(raw.description) || text(raw.text), videoUrl,
       displayUrl: this.firstHttpsUrl(raw.thumbnailUrl, raw.thumbnail_url, raw.thumbnail, raw.coverUrl, raw.imageUrl),
       images: [], shortCode: contentId,

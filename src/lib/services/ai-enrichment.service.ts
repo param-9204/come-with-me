@@ -1253,6 +1253,10 @@ function visualTextKey(text: string): string {
 /** Fewest distinct venue cards before on-screen text is treated as a card guide. */
 const MIN_VISUAL_CARDS = 3;
 
+/** A named venue sign plus dining language is a single physical venue, not a guide. */
+const HOSPITALITY_CONTEXT_RE = /\b(?:dine|dining|restaurant|cafe|cafÃ©|coffee|breakfast|brunch|lunch|dinner|menu|garden)\b/i;
+const HOSPITALITY_COPY_RE = /\b(?:dine|dining|garden|breakfast|brunch|lunch|dinner|coffee|cafe|cafÃ©|menu|open|hours?|only)\b/i;
+
 /** Website addresses and watermarks: "thenomadic.com", "www.x.co". */
 const WEB_ADDRESS_RE = /(?:^|\s)(?:www\.|https?:\/\/)|\b[\p{L}\p{N}-]+\.(?:com|net|org|co|io|in|uk|me|app|shop|store|tv)\b/iu;
 /**
@@ -1370,6 +1374,55 @@ export function generateVisualGuideCandidates(
   // behind the creator, a cup logo) are not a guide; the model call already
   // covers single labels.
   return candidates.length >= MIN_VISUAL_CARDS ? candidates : [];
+}
+
+/**
+ * A Reel can show one venue rather than a multi-card guide. When Vision marks
+ * a repeated named sign as scene text and the same frames contain dining
+ * language, retain that venue for normal evidence validation and geocoding.
+ */
+function generateSingleHospitalityVenueCandidates(bundle: EvidenceBundle): RawPlaceCandidate[] {
+  const screenItems = bundle.items.filter((item) => item.source === 'vision_ocr');
+  const contextFrames = new Set(
+    screenItems
+      .filter((item) => HOSPITALITY_CONTEXT_RE.test(item.text))
+      .flatMap((item) => item.frames || [])
+  );
+  if (contextFrames.size === 0) return [];
+
+  const candidates = screenItems
+    .filter((item) => item.scene === true && (item.frames || []).length >= 2)
+    .filter((item) => (item.frames || []).some((frame) => contextFrames.has(frame)))
+    .map((item) => ({ item, name: item.text.trim() }))
+    .filter(({ name }) => {
+      const key = visualTextKey(name);
+      const words = name.split(/\s+/).filter(Boolean);
+      return key.length >= 5 && words.length >= 2 && words.length <= 6 &&
+        !GENERIC_NAMES.has(key) && !HOSPITALITY_COPY_RE.test(name);
+    });
+
+  const unique = new Map<string, typeof candidates[number]>();
+  for (const candidate of candidates) {
+    const key = visualTextKey(candidate.name);
+    if (!unique.has(key)) unique.set(key, candidate);
+  }
+  if (unique.size !== 1) return [];
+
+  const { item, name } = [...unique.values()][0];
+  return [{
+    name,
+    mention_type: 'explicit',
+    role: 'featured',
+    name_evidence: [item.id],
+    location_evidence: [],
+    city: '',
+    neighborhood: '',
+    address: '',
+    base_category: 'RESTAURANTS',
+    category: 'RESTAURANTS',
+    description: '',
+    search_query: '',
+  }];
 }
 
 function generateFallbackAnalysis(content: SocialContent, bundle: EvidenceBundle, places: PlaceExtraction[]): Record<string, any> {
@@ -1505,6 +1558,22 @@ export class AiEnrichmentService {
               added,
               places: outcome.places.map((place) => place.name),
             }, 'info');
+          }
+        }
+
+        if (outcome.places.length === 0) {
+          const singleVenueCandidates = generateSingleHospitalityVenueCandidates(bundle);
+          if (singleVenueCandidates.length > 0) {
+            const singleVenueOutcome = await finalizeCandidates(singleVenueCandidates, bundle, content.authorUsername);
+            outcome = {
+              places: mergeSameEntities([...outcome.places, ...singleVenueOutcome.places], bundle),
+              rejected: [...outcome.rejected, ...singleVenueOutcome.rejected],
+            };
+            if (singleVenueOutcome.places.length > 0) {
+              plog('model', 'Recovered source-backed single hospitality venue from Vision frames', {
+                places: singleVenueOutcome.places.map((place) => place.name),
+              }, 'info');
+            }
           }
         }
 

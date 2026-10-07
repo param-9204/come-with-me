@@ -182,6 +182,14 @@ function authorUsernameFromPost(post: any): string | null {
       usableUsername(post?.raw_apify_data?.channelUsername) ||
       usableUsername(post?.author_username);
   }
+  if (post?.platform === 'facebook') {
+    const storedUsername = usableUsername(post?.author_username);
+    const creatorName = usableUsername(post?.raw_apify_data?.creatorName) ||
+      usableUsername(post?.raw_apify_data?.authorName);
+    return storedUsername && !/^\d+$/.test(storedUsername)
+      ? storedUsername
+      : creatorName || storedUsername || usableUsername(post?.raw_apify_data?.user?.username);
+  }
   return usableUsername(post?.author_username) || usableUsername(post?.raw_apify_data?.user?.username);
 }
 

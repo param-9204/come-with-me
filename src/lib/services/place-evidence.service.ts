@@ -750,9 +750,21 @@ function isCreatorOrAudio(name: string, bundle: EvidenceBundle): string | null {
  */
 function creatorOwnLocationLines(bundle: EvidenceBundle, places: ScorablePlace[], self: ScorablePlace): EvidenceItem[] {
   const others = places.filter((place) => place !== self && place.name && compact(place.name) !== compact(self.name || ''));
+  // A business can identify itself and show its pin entirely on-screen. Require
+  // both signals in the same frame so a creator watermark cannot use an
+  // unrelated location pin as venue evidence.
+  const selfNameFrames = new Set(
+    bundle.items
+      .filter((item) => isScreenText(item) && itemSupportsName(self.name || '', item))
+      .flatMap((item) => item.frames || [])
+  );
   return bundle.items.filter((item) =>
     ((item.source === 'caption' || item.source === 'comment_creator') &&
       PIN_RE.test(item.text) &&
+      !others.some((place) => itemSupportsName(place.name || '', item))) ||
+    (isScreenText(item) &&
+      PIN_RE.test(item.text) &&
+      (item.frames || []).some((frame) => selfNameFrames.has(frame)) &&
       !others.some((place) => itemSupportsName(place.name || '', item))) ||
     // A geotag naming the account itself is the business posting from its own
     // premises ("jawn.supply" tagged at "Jawn Supply", Dd4K-gwkVu2). A blogger's

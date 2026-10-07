@@ -21,6 +21,23 @@ function decodeTokenIssuer(token: string): string | null {
 }
 
 /**
+ * `proxy.ts` removes any client-supplied identity headers and sets this header
+ * only after Clerk has authenticated the request. This keeps mobile bearer
+ * authentication available even when direct token verification is unavailable.
+ */
+function authUserFromTrustedProxy(request?: Request) {
+  const clerkId = request?.headers.get('x-user-clerk-id');
+  if (!clerkId || !clerkId.startsWith('user_')) return null;
+
+  return {
+    id: uuidv5(clerkId, CLERK_UUID_NAMESPACE),
+    clerkId,
+    email: null,
+    tokenType: 'clerk_proxy' as const,
+  };
+}
+
+/**
  * Authenticates the request using Clerk's Server SDK or custom headers.
  *
  * Priority:
@@ -130,10 +147,18 @@ export async function getAuthUser(request?: Request) {
       }
 
       // Bearer token present but all methods failed — don't fall through to cookie auth
-      console.error('[Auth] ❌ Bearer token failed all verification. Returning null.');
+      const proxiedUser = authUserFromTrustedProxy(request);
+      if (proxiedUser) {
+        console.log('[Auth] Using Clerk identity verified by proxy. clerkId:', proxiedUser.clerkId);
+        return proxiedUser;
+      }
+
       return null;
     }
   }
+
+  const proxiedUser = authUserFromTrustedProxy(request);
+  if (proxiedUser) return proxiedUser;
 
   // ─── 2. Clerk auth() helper (cookie-based web session) ───────────────────────
   try {
