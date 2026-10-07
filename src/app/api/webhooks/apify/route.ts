@@ -42,13 +42,18 @@ export async function POST(request: Request) {
       throw new Error(`Failed to find post in database: ${fetchError?.message || 'Not found'}`);
     }
 
-    const actorId = post.platform === 'tiktok' 
-      ? 'clockworks/tiktok-scraper' 
-      : 'apify/instagram-scraper';
+    const actorId = post.platform === 'tiktok'
+      ? 'clockworks/tiktok-scraper'
+      : post.platform === 'youtube'
+        ? process.env.APIFY_YOUTUBE_METADATA_ACTOR_ID
+        : post.platform === 'facebook'
+          ? process.env.APIFY_FACEBOOK_REELS_METADATA_ACTOR_ID
+          : 'apify/instagram-scraper';
+    if (!actorId) throw new Error(`No metadata actor configured for ${post.platform}`);
 
     // 2. Fetch and normalize scraped data from Apify
     console.log(`[Apify Webhook] Fetching dataset ${defaultDatasetId} for post ${socialPostId}...`);
-    const { normalized, raw } = await ScraperService.fetchAndNormalize(defaultDatasetId, actorId);
+    const { normalized, raw } = await ScraperService.fetchAndNormalize(defaultDatasetId, actorId, post.post_url);
 
     // 3. Update database with basic card details and change status to 'scraped'
     console.log(`[Apify Webhook] Updating post ${socialPostId} in DB to 'scraped'...`);

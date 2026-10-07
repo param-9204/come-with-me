@@ -48,7 +48,7 @@ function originFor(request: Request): string {
 /** Claim the shared post before creating the user's job/access row. */
 async function claimSocialPostForMobileJob(
   cleanUrl: string,
-  platform: 'instagram' | 'tiktok',
+  platform: 'instagram' | 'tiktok' | 'youtube' | 'facebook',
   canonicalSourceKey: string,
   userId: string,
 ): Promise<{ post: any; created: boolean }> {
@@ -252,7 +252,9 @@ function ocrComparisonFromStoredPost(post: any) {
 function contentFromStoredPost(post: any): SocialContent {
   const raw = post?.raw_apify_data || {};
   const caption = post?.caption || raw?.description || '';
-  const platform = post?.platform === 'tiktok' ? 'tiktok' : 'instagram';
+  const platform = ['instagram', 'tiktok', 'youtube', 'facebook'].includes(post?.platform)
+    ? post.platform as SocialContent['platform']
+    : 'instagram';
   const contentType = ['post', 'reel', 'video'].includes(post?.content_type)
     ? post.content_type
     : 'post';
@@ -428,7 +430,7 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
       route: 'process-url', socialPostId, url, pipelineRunId, pipelineStartedAt,
     });
     failureLog.setRunInput({
-      platform: url.includes('tiktok.com') ? 'tiktok' : 'instagram',
+      platform: url.includes('tiktok.com') ? 'tiktok' : /(?:youtube\.com|youtu\.be)/i.test(url) ? 'youtube' : /(?:facebook\.com|fb\.watch)/i.test(url) ? 'facebook' : 'instagram',
       inputUrl: url,
       socialPostId,
       entrypoint: 'process-url',

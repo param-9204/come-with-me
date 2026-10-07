@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS public.social_post_accesses (
   user_id uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
   canonical_source_key text NOT NULL,
   source_url text NOT NULL,
-  platform text CHECK (platform IS NULL OR platform IN ('instagram', 'tiktok')),
+  platform text CHECK (platform IS NULL OR platform IN ('instagram', 'tiktok', 'youtube', 'facebook')),
   -- started/retry/joined/cache_hit are audit rows; job rows are mobile jobs.
   event text NOT NULL CHECK (event IN ('started', 'retry', 'joined_processing', 'cache_hit', 'job')),
   status text CHECK (status IS NULL OR status IN ('queued', 'processing', 'waiting', 'completed', 'failed')),

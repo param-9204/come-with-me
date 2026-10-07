@@ -7,7 +7,7 @@ export type UrlProcessingJob = {
   user_id: string;
   source_url: string;
   canonical_source_key: string;
-  platform: 'instagram' | 'tiktok';
+  platform: 'instagram' | 'tiktok' | 'youtube' | 'facebook';
   social_post_id: string | null;
   status: UrlProcessingJobStatus;
   attempt_count: number;
