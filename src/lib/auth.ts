@@ -1,6 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import { auth } from '@clerk/nextjs/server';
-import { verifyToken } from '@clerk/backend';
+import { createClerkClient, verifyToken } from '@clerk/backend';
 import { v5 as uuidv5 } from 'uuid';
 import * as jwt from 'jsonwebtoken';
 
@@ -38,6 +38,44 @@ function authUserFromTrustedProxy(request?: Request) {
 }
 
 /**
+ * Authenticate the complete incoming request with Clerk before falling back to
+ * the lower-level JWT verifier. This is the supported path for a mobile app
+ * sending its session token in `Authorization: Bearer <token>`.
+ */
+async function authUserFromClerkRequest(request?: Request) {
+  if (!request?.headers.get('authorization')) return null;
+
+  const secretKey = process.env.CLERK_SECRET_KEY;
+  const publishableKey = process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || process.env.CLERK_PUBLISHABLE_KEY;
+  if (!secretKey || !publishableKey) return null;
+
+  try {
+    const clerk = createClerkClient({ secretKey, publishableKey });
+    const state = await clerk.authenticateRequest(request, {
+      acceptsToken: ['session_token', 'oauth_token', 'api_key'],
+    });
+    if (!state.isAuthenticated) {
+      console.warn('[Auth] Clerk request authentication rejected Bearer token:', state.reason);
+      return null;
+    }
+
+    const authenticated = state.toAuth() as { userId?: string | null; subject?: string | null; sessionClaims?: { email?: string | null } };
+    const clerkId = authenticated.userId || authenticated.subject;
+    if (!clerkId) return null;
+
+    return {
+      id: uuidv5(clerkId, CLERK_UUID_NAMESPACE),
+      clerkId,
+      email: authenticated.sessionClaims?.email || null,
+      tokenType: 'clerk_request' as const,
+    };
+  } catch (error: any) {
+    console.warn('[Auth] Clerk request authentication failed:', error?.message || String(error));
+    return null;
+  }
+}
+
+/**
  * Authenticates the request using Clerk's Server SDK or custom headers.
  *
  * Priority:
@@ -53,7 +91,13 @@ export async function getAuthUser(request?: Request) {
 
     if (authHeader && authHeader.startsWith('Bearer ')) {
       const token = authHeader.split(' ')[1];
-      console.log('[Auth] Bearer token length:', token?.length, '| prefix:', token?.substring(0, 20));
+      console.log('[Auth] Bearer token present; length:', token?.length);
+
+      const requestAuthUser = await authUserFromClerkRequest(request);
+      if (requestAuthUser) {
+        console.log('[Auth] Clerk request authentication succeeded. clerkId:', requestAuthUser.clerkId);
+        return requestAuthUser;
+      }
 
       const secretKey = process.env.CLERK_SECRET_KEY;
       if (!secretKey) {
