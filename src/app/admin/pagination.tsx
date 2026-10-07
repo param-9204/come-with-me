@@ -1,10 +1,13 @@
 "use client";
 
+import { cx } from "./ui";
+
 type Props = {
   page: number;
   totalPages: number;
   loading?: boolean;
   onPageChange: (page: number) => void;
+  label?: string;
 };
 
 type PageItem = number | "ellipsis";
@@ -29,35 +32,37 @@ function pageItems(page: number, totalPages: number): PageItem[] {
   return items;
 }
 
+const itemClass =
+  "grid h-7 min-w-7 cursor-pointer place-items-center rounded-md px-1.5 text-xs font-medium tabular-nums transition-colors disabled:cursor-not-allowed disabled:opacity-40";
+
 export default function Pagination({
   page,
   totalPages,
   loading = false,
   onPageChange,
+  label = "Pagination",
 }: Props) {
+  if (totalPages <= 1) return null;
   const pages = pageItems(page, totalPages);
   const disabled = (targetPage: number) =>
     loading || targetPage < 1 || targetPage > totalPages || targetPage === page;
 
   return (
-    <nav
-      aria-label="Posts pagination"
-      className="flex flex-wrap items-center gap-1.5"
-    >
+    <nav aria-label={label} className="flex items-center gap-0.5">
       <button
         type="button"
         onClick={() => onPageChange(page - 1)}
         disabled={disabled(page - 1)}
         aria-label="Previous page"
-        className="grid h-8 w-8 place-items-center rounded-lg border border-zinc-700 text-zinc-300 transition hover:border-indigo-400 hover:text-indigo-200 disabled:cursor-not-allowed disabled:opacity-40"
+        className={cx(itemClass, "text-ink-2 hover:bg-subtle")}
       >
-        <span aria-hidden>←</span>
+        <span aria-hidden>‹</span>
       </button>
       {pages.map((item, index) =>
         item === "ellipsis" ? (
           <span
             key={`ellipsis-${index}`}
-            className="px-1 text-xs text-zinc-500"
+            className="px-1 text-xs text-ink-3"
             aria-hidden
           >
             …
@@ -70,7 +75,12 @@ export default function Pagination({
             disabled={disabled(item)}
             aria-current={item === page ? "page" : undefined}
             aria-label={`Page ${item}`}
-            className={`grid h-8 min-w-8 place-items-center rounded-lg border px-2 text-xs font-bold transition disabled:cursor-not-allowed ${item === page ? "border-indigo-400/40 bg-indigo-500/20 text-indigo-100" : "border-zinc-700 text-zinc-300 hover:border-indigo-400 hover:text-indigo-200"}`}
+            className={cx(
+              itemClass,
+              item === page
+                ? "bg-ink text-canvas disabled:opacity-100"
+                : "text-ink-2 hover:bg-subtle",
+            )}
           >
             {item}
           </button>
@@ -81,9 +91,9 @@ export default function Pagination({
         onClick={() => onPageChange(page + 1)}
         disabled={disabled(page + 1)}
         aria-label="Next page"
-        className="grid h-8 w-8 place-items-center rounded-lg border border-indigo-400/30 bg-indigo-500/15 text-indigo-200 transition hover:border-indigo-300 disabled:cursor-not-allowed disabled:opacity-40"
+        className={cx(itemClass, "text-ink-2 hover:bg-subtle")}
       >
-        <span aria-hidden>→</span>
+        <span aria-hidden>›</span>
       </button>
     </nav>
   );

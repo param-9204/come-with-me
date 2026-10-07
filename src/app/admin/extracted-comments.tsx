@@ -1,108 +1,71 @@
 "use client";
 
-import { useState } from "react";
+import { type Data, type PostDetail, record, records } from "./post-components";
+import { Panel, fmt } from "./ui";
 
-import { date, type Data, type PostDetail, Section } from "./post-components";
-
-function apifyComments(detail: PostDetail): Data[] {
-  const apify =
-    detail.related.apify &&
-    typeof detail.related.apify === "object" &&
-    !Array.isArray(detail.related.apify)
-      ? (detail.related.apify as Data)
-      : {};
-
-  return Array.isArray(apify.comments) ? (apify.comments as Data[]) : [];
+export function apifyComments(detail: PostDetail): Data[] {
+  return records(record(detail.related.apify).comments);
 }
+
+const optional = (value: unknown) =>
+  typeof value === "string" && value ? value : null;
 
 export default function ExtractedComments({ detail }: { detail: PostDetail }) {
   const comments = apifyComments(detail);
-  const [expanded, setExpanded] = useState(false);
 
   return (
-    <Section
-      title="Extracted comments"
-      note="Comments captured by Apify for this post"
+    <Panel
+      title="Comments"
+      description="Captured by Apify, in the order returned"
+      flush
     >
-      <button
-        type="button"
-        aria-expanded={expanded}
-        onClick={() => setExpanded((current) => !current)}
-        className="mb-4 flex w-full cursor-pointer items-center justify-between gap-3 rounded-lg px-1 py-1 text-left hover:bg-zinc-800/50"
-      >
-        <p className="text-sm text-zinc-400">
-          {comments.length
-            ? "Comments are ordered exactly as returned by Apify."
-            : "Apify did not return comments for this post."}
-        </p>
-        <span className="flex shrink-0 items-center gap-2">
-          <span className="rounded-lg bg-zinc-800 px-2.5 py-1 text-xs font-bold text-zinc-300">
-            {comments.length}
-          </span>
-          <span aria-hidden className="text-sm text-zinc-400">
-            {expanded ? "⌃" : "⌄"}
-          </span>
-        </span>
-      </button>
-
-      {expanded && comments.length > 0 && (
-        <div className="space-y-3">
+      {comments.length ? (
+        <ul className="divide-y divide-line">
           {comments.map((comment, index) => {
-            const author =
-              typeof comment.author === "string" && comment.author
-                ? comment.author
-                : null;
-            const name =
-              typeof comment.name === "string" && comment.name
-                ? comment.name
-                : null;
-            const createdAt =
-              typeof comment.created_at === "string" && comment.created_at
-                ? comment.created_at
-                : null;
-            const message =
-              typeof comment.message === "string" && comment.message
-                ? comment.message
-                : null;
-
+            const author = optional(comment.author);
+            const name = optional(comment.name);
+            const createdAt = optional(comment.created_at);
+            const message = optional(comment.message);
             return (
-              <article
-                key={`${author || name || "comment"}-${index}`}
-                className="rounded-lg border border-zinc-800 bg-zinc-950/60 p-3"
-              >
-                <div className="flex min-w-0 items-center gap-3">
-                  <p
-                    title={name || undefined}
-                    className="shrink-0 font-semibold text-zinc-100"
-                  >
+              <li key={`${author || name || "comment"}-${index}`} className="px-4 py-3">
+                <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5">
+                  <p className="text-[13px] font-medium text-ink">
                     {author ? `@${author}` : name || "Unknown commenter"}
+                    {author && name && (
+                      <span className="ml-1.5 font-normal text-ink-3">
+                        {name}
+                      </span>
+                    )}
                   </p>
-                  <p
-                    title={message || "No comment text was returned"}
-                    className="min-w-0 flex-1 truncate cursor-help text-sm text-zinc-300"
-                  >
-                    {message || "No comment text was returned"}
-                  </p>
-                  <div className="flex shrink-0 items-center gap-3 text-[11px] text-zinc-500">
+                  <p className="flex gap-3 text-xs text-ink-3">
                     {createdAt && (
-                      <time dateTime={createdAt}>{date(createdAt, true)}</time>
+                      <time dateTime={createdAt}>{fmt.date(createdAt, true)}</time>
                     )}
                     {typeof comment.likes === "number" && (
-                      <span>Likes: {comment.likes.toLocaleString()}</span>
+                      <span>{fmt.number(comment.likes)} likes</span>
                     )}
                     {typeof comment.replies === "number" && (
                       <span>
-                        {comment.replies.toLocaleString()}{" "}
+                        {fmt.number(comment.replies)}{" "}
                         {comment.replies === 1 ? "reply" : "replies"}
                       </span>
                     )}
-                  </div>
+                  </p>
                 </div>
-              </article>
+                <p className="mt-1 text-[13px] leading-6 whitespace-pre-wrap text-ink-2">
+                  {message || (
+                    <span className="text-ink-3">No comment text was returned</span>
+                  )}
+                </p>
+              </li>
             );
           })}
-        </div>
+        </ul>
+      ) : (
+        <p className="p-4 text-[13px] text-ink-3">
+          Apify did not return comments for this post.
+        </p>
       )}
-    </Section>
+    </Panel>
   );
 }

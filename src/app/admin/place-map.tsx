@@ -71,9 +71,9 @@ export default function PlaceMap({ latitude, longitude, label }: Props) {
       }).addTo(map);
       L.circleMarker([latitude, longitude], {
         radius: 8,
-        color: '#c4b5fd',
+        color: '#ffffff',
         weight: 3,
-        fillColor: '#4f46e5',
+        fillColor: '#c2410c',
         fillOpacity: 1,
       }).addTo(map).bindTooltip(label);
       mapRef.current = map;
@@ -86,5 +86,5 @@ export default function PlaceMap({ latitude, longitude, label }: Props) {
     };
   }, [elementId, label, latitude, longitude]);
 
-  return <div id={elementId} aria-label={`Map showing ${label}`} className="h-44 w-full bg-zinc-800" />;
+  return <div id={elementId} aria-label={`Map showing ${label}`} className="h-28 w-full bg-subtle" />;
 }

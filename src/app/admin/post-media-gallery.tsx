@@ -2,14 +2,16 @@
 
 import { useEffect, useMemo, useState } from "react";
 
+import { Panel } from "./ui";
+
 type Props = {
   imageUrls: string[];
   primaryImageUrl?: string | null;
 };
 
 function validImageUrls(imageUrls: string[], primaryImageUrl?: string | null) {
-  return [...new Set(imageUrls)]
-    .filter((url) => url !== primaryImageUrl)
+  return [...new Set([primaryImageUrl, ...imageUrls])]
+    .filter((url): url is string => typeof url === "string" && Boolean(url))
     .filter((url) => {
       try {
         const parsed = new URL(url);
@@ -66,30 +68,35 @@ function ValidatedMediaGallery({ candidates }: { candidates: string[] }) {
   if (images !== null && !images.length) return null;
 
   return (
-    <section className="rounded-2xl border border-zinc-800 bg-zinc-900/65 p-5 shadow-2xl shadow-black/10">
-      <div className="mb-5 flex flex-wrap items-end justify-between gap-2">
-        <h2 className="text-base font-bold text-white">Post media</h2>
-        <p className="text-xs text-zinc-500">
-          {images === null
-            ? "Checking media…"
-            : `${images.length} ${images.length === 1 ? "image" : "images"} available`}
-        </p>
-      </div>
+    <Panel
+      title="Media"
+      description={
+        images === null
+          ? "Checking which images still load…"
+          : `${images.length} ${images.length === 1 ? "image" : "images"}`
+      }
+    >
       {images === null ? (
-        <p className="text-sm text-zinc-500">Loading post media…</p>
+        <div className="flex gap-2" aria-hidden>
+          {candidates.slice(0, 5).map((url) => (
+            <div key={url} className="h-32 w-24 shrink-0 rounded-md bg-subtle" />
+          ))}
+        </div>
       ) : (
-        <div className="flex gap-3 overflow-x-auto pb-2">
-          {images.map((url) => (
-            <img
-              key={url}
-              src={url}
-              alt="Post media"
-              className="h-40 w-32 shrink-0 rounded-xl border border-zinc-800 object-cover"
-              referrerPolicy="no-referrer"
-            />
+        <div className="flex gap-2 overflow-x-auto pb-1">
+          {images.map((url, index) => (
+            <a key={url} href={url} target="_blank" rel="noreferrer" className="shrink-0">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={url}
+                alt={`Post media ${index + 1}`}
+                className="h-32 w-24 rounded-md border border-line object-cover"
+                referrerPolicy="no-referrer"
+              />
+            </a>
           ))}
         </div>
       )}
-    </section>
+    </Panel>
   );
 }

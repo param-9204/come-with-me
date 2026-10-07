@@ -1,9 +1,13 @@
-import AdminPostsDashboard from '../posts-dashboard';
+import PostDetailPage from "../post-detail-page";
 
-export const dynamic = 'force-dynamic';
+export const dynamic = "force-dynamic";
 
-export default async function AdminPostPage({ params }: { params: Promise<{ postId: string }> }) {
+export default async function AdminPostPage({
+  params,
+}: {
+  params: Promise<{ postId: string }>;
+}) {
   const { postId } = await params;
 
-  return <AdminPostsDashboard initialPosts={[]} totalPosts={0} nextOffset={null} initialPostId={postId} />;
+  return <PostDetailPage postId={postId} />;
 }
