@@ -576,6 +576,7 @@ export async function GET(_: Request, { params }: Params) {
     runsResult,
     tokenSummaryResult,
     stageRunsResult,
+    accessesResult,
   ] = await Promise.all([
     post.user_id
       ? supabaseAdmin
@@ -613,11 +614,20 @@ export async function GET(_: Request, { params }: Params) {
       .from("extraction_run_summary")
       .select("*")
       .eq("social_post_id", id)
+      // A re-processed post has several runs; summarise the latest one.
+      .order("created_at", { ascending: false })
+      .limit(1)
       .maybeSingle(),
     supabaseAdmin
       .from("extraction_stage_runs")
       .select("*")
       .eq("social_post_id", id),
+    supabaseAdmin
+      .from("social_post_accesses")
+      .select("user_id, event, created_at")
+      .eq("social_post_id", id)
+      .not("user_id", "is", null)
+      .order("created_at", { ascending: true }),
   ]);
 
   const relationErrors = [
@@ -629,36 +639,84 @@ export async function GET(_: Request, { params }: Params) {
     runsResult.error,
     tokenSummaryResult.error,
     stageRunsResult.error,
+    accessesResult.error,
   ].filter(
     (error) =>
       error &&
       !isMissingTableOrColumn(error as { code?: string; message?: string }),
   );
 
+  // Everyone who submitted this URL: the creator of the row plus later
+  // submissions recorded in social_post_accesses.
+  const requesterIds = [
+    ...new Set(
+      [
+        typeof post.user_id === "string" ? post.user_id : null,
+        ...(accessesResult.data ?? []).map((access) => access.user_id),
+      ].filter((value): value is string => typeof value === "string"),
+    ),
+  ];
+  const requesterProfiles = requesterIds.length
+    ? await supabaseAdmin
+        .from("profiles")
+        .select("id, display_name, email, avatar_url, created_at")
+        .in("id", requesterIds)
+    : { data: [] as Data[] };
+  const requesterById = new Map(
+    ((requesterProfiles.data ?? []) as Data[]).map((profile) => [
+      String(profile.id),
+      profile,
+    ]),
+  );
+  const requesters = requesterIds.map((userId) => {
+    const firstAccess = (accessesResult.data ?? []).find(
+      (access) => access.user_id === userId,
+    );
+    const profile = requesterById.get(userId) ?? {};
+    return {
+      user_id: userId,
+      display_name: text(profile.display_name),
+      email: text(profile.email),
+      avatar_url: text(profile.avatar_url),
+      is_creator: userId === post.user_id,
+      first_requested_at:
+        userId === post.user_id
+          ? text(post.created_at)
+          : text(firstAccess?.created_at),
+    };
+  });
+  const savedPlaces = savedPlacesResult.data ?? [];
+
   const runs = runsResult.data ?? [];
   const runIds = runs.map((run) => run.id).filter(Boolean);
+  // Audit tables written by the pipeline logger (migration v26).
   const telemetryPromise = runIds.length
     ? Promise.all([
         supabaseAdmin
-          .from("extraction_run_stages")
+          .from("extraction_stage_runs")
           .select("*")
           .in("run_id", runIds)
           .order("started_at", { ascending: true }),
         supabaseAdmin
-          .from("extraction_run_calls")
+          .from("extraction_run_events")
+          .select("id, run_id, occurred_at, elapsed_ms, stage, level, message, data")
+          .in("run_id", runIds)
+          .order("occurred_at", { ascending: true })
+          .order("id", { ascending: true })
+          .limit(5000),
+        supabaseAdmin
+          .from("extraction_place_candidates")
           .select("*")
           .in("run_id", runIds)
           .order("created_at", { ascending: true }),
         supabaseAdmin
-          .from("extraction_candidates")
-          .select("*")
+          .from("extraction_evidence")
+          .select(
+            "id, run_id, evidence_id, source_type, text_value, confidence, timestamps_sec, frame_indexes, provider, model, attributes",
+          )
           .in("run_id", runIds)
-          .order("created_at", { ascending: true }),
-        supabaseAdmin
-          .from("extraction_run_logs")
-          .select("*")
-          .in("run_id", runIds)
-          .order("created_at", { ascending: true }),
+          .order("id", { ascending: true })
+          .limit(5000),
       ])
     : [
         { data: [], error: null },
@@ -711,16 +769,66 @@ export async function GET(_: Request, { params }: Params) {
     ? getSocialPostTrace(extractionShortCode)
     : Promise.resolve({ trace: { available: false }, raw: {}, error: null });
   const [
-    [stagesResult, callsResult, candidatesResult, logsResult],
+    [operationsResult, eventsResult, candidatesResult, evidenceResult],
     locations,
     traceResult,
   ] = await Promise.all([telemetryPromise, locationsPromise, tracePromise]);
 
+  const operations = (operationsResult.data ?? []) as Data[];
+  const candidates = (candidatesResult.data ?? []) as Data[];
+  const events = (eventsResult.data ?? []) as Data[];
+  const evidenceById = new Map(
+    ((evidenceResult.data ?? []) as Data[]).map((item) => [
+      `${item.run_id}:${item.evidence_id}`,
+      item,
+    ]),
+  );
+  // Per-run, per-stage event totals for the legacy extraction summary.
+  const eventGroups = new Map<string, Data>();
+  for (const event of events) {
+    const key = `${event.run_id}:${event.stage}`;
+    const group = eventGroups.get(key) ?? {
+      run_id: event.run_id,
+      part: event.stage,
+      event_count: 0,
+      warn_count: 0,
+      error_count: 0,
+    };
+    group.event_count = Number(group.event_count) + 1;
+    if (event.level === "warn") group.warn_count = Number(group.warn_count) + 1;
+    if (event.level === "error")
+      group.error_count = Number(group.error_count) + 1;
+    eventGroups.set(key, group);
+  }
+  const eventCounts = [...eventGroups.values()];
+  // The legacy summary reads reason/evidence_snippets and latency/cost aliases.
+  for (const candidate of candidates) {
+    candidate.reason = candidate.decision_reason;
+    candidate.evidence_snippets = words(candidate.evidence_ids).flatMap(
+      (evidenceId) => {
+        const item = evidenceById.get(`${candidate.run_id}:${evidenceId}`);
+        return item
+          ? [
+              {
+                source: item.source_type,
+                text: item.text_value,
+                timestamps: item.timestamps_sec,
+              },
+            ]
+          : [];
+      },
+    );
+  }
+  for (const operation of operations) {
+    operation.latency_ms = operation.duration_ms;
+    operation.est_cost_usd = operation.estimated_cost_usd;
+  }
+
   const telemetryErrors = [
-    stagesResult.error,
-    callsResult.error,
+    operationsResult.error,
+    eventsResult.error,
     candidatesResult.error,
-    logsResult.error,
+    evidenceResult.error,
   ].filter(
     (error) =>
       error &&
@@ -750,12 +858,88 @@ export async function GET(_: Request, { params }: Params) {
       ),
       extraction: extractionView(
         runs,
-        stagesResult.data ?? [],
-        callsResult.data ?? [],
-        candidatesResult.data ?? [],
-        logsResult.data ?? [],
+        operations,
+        operations,
+        candidates,
+        eventCounts,
       ),
+      // Full audit trail per run, for the Extraction tab.
+      runs: runs.map((run) => ({
+        id: run.id,
+        external_run_id: text(run.external_run_id),
+        entrypoint: text(run.entrypoint),
+        platform: text(run.platform),
+        input_url: text(run.input_url),
+        status: text(run.status),
+        error_code: text(run.error_code),
+        error_message: text(run.error_message),
+        started_at: text(run.started_at),
+        finished_at: text(run.finished_at),
+        duration_ms: number(run.duration_ms),
+        result_summary: data(run.result_summary),
+      })),
+      operations: operations.map((operation) => ({
+        id: operation.id,
+        run_id: operation.run_id,
+        stage: text(operation.stage),
+        operation: text(operation.operation),
+        status: text(operation.status),
+        provider: text(operation.provider),
+        model: text(operation.model),
+        attempt: number(operation.attempt),
+        is_fallback: operation.is_fallback === true,
+        retryable:
+          typeof operation.retryable === "boolean" ? operation.retryable : null,
+        started_at: text(operation.started_at),
+        finished_at: text(operation.finished_at),
+        duration_ms: number(operation.duration_ms),
+        input_tokens: number(operation.input_tokens),
+        output_tokens: number(operation.output_tokens),
+        total_tokens: number(operation.total_tokens),
+        input_units: number(operation.input_units),
+        output_units: number(operation.output_units),
+        estimated_cost_usd: number(operation.estimated_cost_usd),
+        request_summary: data(operation.request_summary),
+        result_summary: data(operation.result_summary),
+        error_code: text(operation.error_code),
+        error_message: text(operation.error_message),
+      })),
+      events,
+      events_truncated: events.length >= 5000,
+      candidates: candidates.map((candidate) => ({
+        id: candidate.id,
+        run_id: candidate.run_id,
+        candidate_key: text(candidate.candidate_key),
+        place_id: text(candidate.place_id),
+        name: text(candidate.name),
+        category: text(candidate.category),
+        base_category: text(candidate.base_category),
+        city: text(candidate.city),
+        neighborhood: text(candidate.neighborhood),
+        address: text(candidate.address),
+        confidence: number(candidate.confidence),
+        mention_type: text(candidate.mention_type),
+        role: text(candidate.role),
+        decision: text(candidate.decision),
+        decision_reason: text(candidate.decision_reason),
+        evidence_ids: words(candidate.evidence_ids),
+        location_evidence_ids: words(candidate.location_evidence_ids),
+        evidence_sources: words(candidate.evidence_sources),
+        model_provider: text(candidate.model_provider),
+        model: text(candidate.model),
+        details: data(candidate.details),
+      })),
+      evidence: (evidenceResult.data ?? []) as Data[],
       locations,
+      requesters,
+      saves: {
+        total: savedPlaces.length,
+        users: new Set(savedPlaces.map((save) => save.user_id)).size,
+        been_here: savedPlaces.filter((save) => save.status === "BEEN_HERE")
+          .length,
+        want_to_go: savedPlaces.filter((save) => save.status === "WANT_TO_GO")
+          .length,
+      },
     },
     warnings: [...relationErrors, ...telemetryErrors].map(
       (error) =>
