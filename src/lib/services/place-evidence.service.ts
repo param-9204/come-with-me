@@ -758,12 +758,22 @@ function creatorOwnLocationLines(bundle: EvidenceBundle, places: ScorablePlace[]
       .filter((item) => isScreenText(item) && itemSupportsName(self.name || '', item))
       .flatMap((item) => item.frames || [])
   );
+  const isPhysicalVenueLocation = (item: EvidenceItem) =>
+    isScreenText(item) &&
+    /\b(?:shopping\s+(?:centre|center)|mall|plaza|market|square|(?:street|st|road|rd|avenue|ave|boulevard|blvd))\b/i.test(item.text);
   return bundle.items.filter((item) =>
     ((item.source === 'caption' || item.source === 'comment_creator') &&
       PIN_RE.test(item.text) &&
       !others.some((place) => itemSupportsName(place.name || '', item))) ||
     (isScreenText(item) &&
       PIN_RE.test(item.text) &&
+      (item.frames || []).some((frame) => selfNameFrames.has(frame)) &&
+      !others.some((place) => itemSupportsName(place.name || '', item))) ||
+    // A static business advert may write its branch location without a pin
+    // ("Platinum Square Shopping Centre, Rustenburg"). When it shares frames
+    // with the business name, it is equivalent to an explicit own-location
+    // signal, not a creator watermark.
+    (isPhysicalVenueLocation(item) &&
       (item.frames || []).some((frame) => selfNameFrames.has(frame)) &&
       !others.some((place) => itemSupportsName(place.name || '', item))) ||
     // A geotag naming the account itself is the business posting from its own
@@ -1076,7 +1086,7 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
       const otherVenues = places.filter((other) => other !== place && !!other.name && !isCityName(other.name)).length;
       const otherRepeated = repeatedVenues.size - (repeatedVenues.has(place) ? 1 : 0);
       const staticScreen = otherRepeated >= 3 && otherRepeated * 2 >= otherVenues;
-      if (visualGuideHeading && otherVenues > 0 && !staticScreen && support.every(isScreenText) && !support.some(isListItem) &&
+      if (visualGuideHeading && otherVenues > 0 && !staticScreen && ownVenueLocations.length === 0 && support.every(isScreenText) && !support.some(isListItem) &&
         repeatedFrames >= repeatedFrameMin) {
         reject('repeated visual guide title or watermark'); continue;
       }
