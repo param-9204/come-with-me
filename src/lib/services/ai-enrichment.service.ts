@@ -332,6 +332,36 @@ function validSuggestedTitle(value: unknown): string | null {
   return words.length >= 4 && words.length <= 5 ? title : null;
 }
 
+/**
+ * A model may omit the optional title even after it has returned grounded,
+ * accepted places. Keep the title contract useful in that case without
+ * inventing a venue, category, or location: the fallback states only the
+ * verified place count and, when it is unambiguous, their shared city.
+ */
+function suggestedTitleFromVerifiedPlaces(places: PlaceExtraction[]): string | null {
+  const accepted = places.filter((place) => Boolean(str(place.name)));
+  if (accepted.length === 0) return null;
+
+  const cityCounts = new Map<string, { city: string; count: number }>();
+  for (const place of accepted) {
+    const city = str(place.city).replace(/\s+/g, ' ');
+    const key = city.toLocaleLowerCase();
+    if (!key) continue;
+    const entry = cityCounts.get(key);
+    cityCounts.set(key, { city, count: (entry?.count || 0) + 1 });
+  }
+  const commonCity = [...cityCounts.values()]
+    .sort((a, b) => b.count - a.count)[0];
+  const cityWords = commonCity?.city.match(/[\p{L}\p{N}]+(?:['â€™-][\p{L}\p{N}]+)*/gu) || [];
+  const hasSharedShortCity = Boolean(commonCity && commonCity.count === accepted.length && cityWords.length <= 2);
+  const placeWord = accepted.length === 1 ? 'Place' : 'Places';
+  const title = hasSharedShortCity
+    ? `${accepted.length} ${commonCity!.city} ${placeWord} Guide`
+    : `${accepted.length} Featured ${placeWord} Guide`;
+
+  return validSuggestedTitle(title);
+}
+
 function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
   const candidate = str(value) as T;
   return allowed.includes(candidate) ? candidate : fallback;
@@ -1616,6 +1646,13 @@ export class AiEnrichmentService {
     const ocrAvailable = bundle.items.some((item) => item.source === 'ocr' || item.source === 'vision_ocr');
     const transcriptItems = bundle.items.filter((item) => item.source === 'speech');
     const transcriptText = transcriptItems.map((item) => item.text).join(' ');
+    const suggestedTitle = validSuggestedTitle(parsed.suggested_title) || suggestedTitleFromVerifiedPlaces(places);
+    if (!validSuggestedTitle(parsed.suggested_title) && suggestedTitle) {
+      plog('model', 'Used verified-place suggested title fallback', {
+        title: suggestedTitle,
+        placeCount: places.length,
+      });
+    }
 
     const analysis: AiAnalysisResult = {
       platform: content.platform,
@@ -1630,7 +1667,7 @@ export class AiEnrichmentService {
         dimensions: content.dimensions
           ? { ...content.dimensions, orientation: content.dimensions.height > content.dimensions.width ? 'vertical' : 'horizontal' }
           : null,
-        suggested_title: validSuggestedTitle(parsed.suggested_title),
+        suggested_title: suggestedTitle,
         summary: parsed.summary || '',
         primary_category: parsed.primary_category || '',
         secondary_categories: [],
