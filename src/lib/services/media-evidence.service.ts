@@ -390,9 +390,16 @@ export class MediaEvidenceService {
     }
 
     const transcript = mergeTranscripts(transcripts);
-    const warnings = [...new Set(
-      visionFrames.flatMap((frame) => frame.warning?.message ? [frame.warning.message] : [])
-    )];
+    const mediaFallback = raw && typeof raw === 'object'
+      ? (raw as { media_fallback?: { status?: unknown } }).media_fallback
+      : null;
+    const downloaderWarnings = !content.videoUrl && mediaFallback?.status === 'artifact_missing'
+      ? ['Full video media was unavailable from the downloader; only the available thumbnail/image was analyzed.']
+      : [];
+    const warnings = [...new Set([
+      ...downloaderWarnings,
+      ...visionFrames.flatMap((frame) => frame.warning?.message ? [frame.warning.message] : []),
+    ])];
     const visionFrameCount = visionFrames.length;
     const dualOcr = useFullFrameGptVision();
     plog('transcript', transcript ? 'Transcript' : 'No transcript', transcript ? {

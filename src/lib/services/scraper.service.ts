@@ -190,6 +190,39 @@ export class ScraperService {
     );
   }
 
+  /**
+   * Some download actors write the MP4 directly to their default key-value
+   * store instead of returning a media URL in the dataset. Read only likely
+   * media records and convert the selected record into a signed URL; the
+   * binary content itself is never loaded into this server.
+   */
+  private static async mediaUrlFromKeyValueStore(storeId: string): Promise<{ url: string; key: string | null }> {
+    const store = this.getClient().keyValueStore(storeId);
+    const { items } = await store.listKeys({ limit: 100 });
+    const mediaKey = /(?:video|media|download|mp4|webm|mov|file|asset|play)/i;
+    const candidates = [...items]
+      .filter((item) => mediaKey.test(item.key) || /^output$/i.test(item.key))
+      .sort((a, b) => Number(mediaKey.test(b.key)) - Number(mediaKey.test(a.key)))
+      .slice(0, 12);
+
+    for (const item of candidates) {
+      const record = await store.getRecord(item.key, { stream: true });
+      if (!record) continue;
+
+      // `stream: true` lets us inspect the content type without buffering a
+      // potentially large MP4. End the probe immediately.
+      record.value.destroy();
+      const contentType = record.contentType || '';
+      const isVideo = /^video\//i.test(contentType) ||
+        (/application\/octet-stream/i.test(contentType) && /\.(?:mp4|webm|mov)$/i.test(item.key));
+      if (!isVideo) continue;
+
+      return { url: await store.getRecordPublicUrl(item.key), key: item.key };
+    }
+
+    return { url: '', key: null };
+  }
+
   private static platformForActor(actorId: string): SocialContent['platform'] {
     const actor = actorId.toLowerCase();
     if (actor === String(process.env.APIFY_YOUTUBE_METADATA_ACTOR_ID || '').toLowerCase() || actor.includes('youtube')) return 'youtube';
@@ -226,22 +259,45 @@ export class ScraperService {
       ? { startUrls: [{ url: sourceUrl }] }
       : { workflow: 'videoUrls', startUrls: [sourceUrl], maxResults: 1, downloadMp4: true };
     const run = await this.getClient().actor(actorId).call(input);
-    if (!run?.defaultDatasetId) {
-      raw.media_fallback = { status: 'no_dataset', platform, actorId, runId: run?.id || null };
-      return '';
+    const datasetId = run?.defaultDatasetId || null;
+    const keyValueStoreId = run?.defaultKeyValueStoreId || null;
+    let mediaUrl = '';
+    let artifactSource: 'dataset' | 'key_value_store' | null = null;
+    let artifactKey: string | null = null;
+    let keyValueStoreError: string | null = null;
+
+    if (datasetId) {
+      const { items } = await this.getClient().dataset(datasetId).listItems({ limit: 10 });
+      mediaUrl = this.firstHttpsUrl(...(items || []).flatMap((item: any) => [
+        item.videoMp4Url, item.videoMp4UrlHd, item.videoMp4UrlSd, item.videoUrl,
+        item.downloadUrl, item.downloadLink, item.mediaUrl, item.fileUrl, item.mp4Url,
+        item.output?.url, item.output?.videoUrl, item.output?.downloadUrl, item.output?.fileUrl,
+        ...this.mediaUrlsFrom(item),
+      ]));
+      if (mediaUrl) artifactSource = 'dataset';
     }
-    const { items } = await this.getClient().dataset(run.defaultDatasetId).listItems({ limit: 1 });
-    const mediaUrl = this.firstHttpsUrl(...(items || []).flatMap((item: any) => [
-      item.videoMp4Url, item.videoMp4UrlHd, item.videoMp4UrlSd, item.videoUrl,
-      item.downloadUrl, item.downloadLink, item.mediaUrl, item.fileUrl, item.mp4Url,
-      ...this.mediaUrlsFrom(item),
-    ]));
+
+    if (!mediaUrl && keyValueStoreId) {
+      try {
+        const keyValueArtifact = await this.mediaUrlFromKeyValueStore(keyValueStoreId);
+        mediaUrl = keyValueArtifact.url;
+        artifactKey = keyValueArtifact.key;
+        if (mediaUrl) artifactSource = 'key_value_store';
+      } catch (error: unknown) {
+        keyValueStoreError = error instanceof Error ? error.message : String(error);
+        console.warn(`[Apify ${platform}] Could not inspect downloader key-value store:`, keyValueStoreError);
+      }
+    }
     raw.media_fallback = {
-      status: mediaUrl ? 'downloaded' : 'artifact_missing',
+      status: mediaUrl ? 'downloaded' : (datasetId || keyValueStoreId ? 'artifact_missing' : 'no_artifact_store'),
       platform,
       actorId,
       runId: run.id,
-      datasetId: run.defaultDatasetId,
+      datasetId,
+      keyValueStoreId,
+      artifactSource,
+      artifactKey,
+      keyValueStoreError,
     };
     return mediaUrl ? this.signApifyRecordUrl(mediaUrl) : '';
   }
@@ -460,7 +516,7 @@ export class ScraperService {
     );
     const contentId = text(raw.id) || text(raw.videoId) || text(raw.video_id) || text(raw.shortCode) || Date.now().toString();
     const caption = text(raw.description) || text(raw.caption) || text(raw.title);
-    const authorUsername = text(raw.channelHandle).replace(/^@/, '') || text(raw.channelId) || text(raw.channelName) || 'unknown';
+    const authorUsername = text(raw.channelName) || text(raw.channelHandle).replace(/^@/, '') || text(raw.channelUsername) || text(raw.channelId) || 'unknown';
     const normalized: SocialContent = {
       platform: 'youtube', contentType: 'video', contentId, authorUsername,
       authorFullName: text(raw.channelName) || text(raw.authorName), caption, videoUrl,

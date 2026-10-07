@@ -39,6 +39,22 @@ async function isUrlJobWorkerRequest(request: Request): Promise<boolean> {
   return Boolean(data?.id);
 }
 
+/**
+ * Older YouTube results could be marked complete after analyzing only a
+ * thumbnail because the downloader's `output.url` artifact was ignored.
+ * New runs persist `keyValueStoreId`, so this condition can recover those
+ * historical records once without reopening normal completed cache hits.
+ */
+function needsLegacyYouTubeMediaRecovery(post: unknown): boolean {
+  if (!post || typeof post !== 'object') return false;
+  const postData = post as { platform?: unknown; raw_apify_data?: unknown };
+  if (postData.platform !== 'youtube' || !postData.raw_apify_data || typeof postData.raw_apify_data !== 'object') return false;
+  const fallback = (postData.raw_apify_data as { media_fallback?: unknown }).media_fallback;
+  return Boolean(fallback && typeof fallback === 'object' &&
+    (fallback as { status?: unknown }).status === 'artifact_missing' &&
+    !Object.prototype.hasOwnProperty.call(fallback, 'keyValueStoreId'));
+}
+
 function originFor(request: Request): string {
   let origin = new URL(request.url).origin;
   if (origin.includes('localhost') || origin.includes('127.0.0.1')) origin = origin.replace('https://', 'http://');
@@ -65,7 +81,19 @@ async function claimSocialPostForMobileJob(
   const { data: existingPosts, error: existingError } = await existingQuery.order('created_at', { ascending: false });
   if (existingError) throw new Error(`Unable to read social post: ${existingError.message}`);
   const existing = existingPosts?.find((post) => post.status === 'completed') || existingPosts?.[0];
-  if (existing) return { post: existing, created: false };
+  if (existing) {
+    if (!needsLegacyYouTubeMediaRecovery(existing)) return { post: existing, created: false };
+    const { data: recovered, error: recoveryError } = await supabaseAdmin
+      .from('social_posts')
+      .update({ status: 'pending', error_message: null })
+      .eq('id', existing.id)
+      .select('*')
+      .single();
+    if (recoveryError || !recovered) {
+      throw new Error(`Unable to recover incomplete YouTube media: ${recoveryError?.message || 'missing post'}`);
+    }
+    return { post: recovered, created: true };
+  }
 
   const contentId = `pending_${uuidv4()}`;
   if (supportsCanonicalIdentity) {
@@ -146,6 +174,12 @@ function usableUsername(value: unknown): string | null {
 }
 
 function authorUsernameFromPost(post: any): string | null {
+  if (post?.platform === 'youtube') {
+    return usableUsername(post?.raw_apify_data?.channelName) ||
+      usableUsername(post?.raw_apify_data?.channelHandle) ||
+      usableUsername(post?.raw_apify_data?.channelUsername) ||
+      usableUsername(post?.author_username);
+  }
   return usableUsername(post?.author_username) || usableUsername(post?.raw_apify_data?.user?.username);
 }
 
@@ -511,7 +545,38 @@ export async function POST(request: Request) {
       // reel as one source while still allowing other users to have jobs.
       const existingJob = await UrlProcessingJobsService.getJobForUserAndSource(finalUserId, canonicalSourceKey);
       if (existingJob) {
-        const workerScheduled = ['queued', 'waiting'].includes(existingJob.status);
+        let recoveredLegacyYoutubeMedia = false;
+        if (existingJob.status === 'completed' && existingJob.social_post_id) {
+          const { data: existingPost, error: postError } = await supabaseAdmin
+            .from('social_posts')
+            .select('*')
+            .eq('id', existingJob.social_post_id)
+            .maybeSingle();
+          if (postError) throw new Error(`Unable to read existing social post: ${postError.message}`);
+          if (needsLegacyYouTubeMediaRecovery(existingPost)) {
+            const { error: postRecoveryError } = await supabaseAdmin
+              .from('social_posts')
+              .update({ status: 'pending', error_message: null })
+              .eq('id', existingPost.id);
+            if (postRecoveryError) throw new Error(`Unable to recover incomplete YouTube media: ${postRecoveryError.message}`);
+
+            const { error: jobRecoveryError } = await supabaseAdmin
+              .from('social_post_accesses')
+              .update({
+                status: 'queued',
+                result: null,
+                last_error: null,
+                attempt_count: 0,
+                run_after: new Date().toISOString(),
+              })
+              .eq('id', existingJob.id)
+              .eq('event', 'job');
+            if (jobRecoveryError) throw new Error(`Unable to requeue incomplete YouTube media: ${jobRecoveryError.message}`);
+            recoveredLegacyYoutubeMedia = true;
+          }
+        }
+        const jobStatus = recoveredLegacyYoutubeMedia ? 'queued' : existingJob.status;
+        const workerScheduled = recoveredLegacyYoutubeMedia || ['queued', 'waiting'].includes(existingJob.status);
         if (workerScheduled) {
           const workerId = `repeat-${uuidv4()}`;
           after(async () => {
@@ -527,7 +592,7 @@ export async function POST(request: Request) {
           reused: true,
           jobId: existingJob.id,
           socialPostId: existingJob.social_post_id,
-          status: existingJob.status,
+          status: jobStatus,
           suggested_title: typeof existingJob.result?.suggested_title === 'string'
             ? existingJob.result.suggested_title
             : null,
