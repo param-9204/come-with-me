@@ -109,6 +109,7 @@ export interface PipelineRunInput {
   platform?: string | null;
   inputUrl?: string | null;
   socialPostId?: string | null;
+  uploadedImageId?: string | null;
   entrypoint?: string | null;
   contentId?: string | null;
   contentType?: string | null;
@@ -400,6 +401,7 @@ export class PipelineLog {
     // execution-level link; this direct key makes a complete post trace
     // queryable without joining through extraction_runs first.
     const socialPostId = this.input.socialPostId || this.context.socialPostId || null;
+    const uploadedImageId = this.input.uploadedImageId || this.context.uploadedImageId || null;
     const inputSnapshot = safeRecord({
       contentId: this.input.contentId || null,
       contentType: this.input.contentType || null,
@@ -415,6 +417,7 @@ export class PipelineLog {
       // Only when known: a request that does not know the post must not
       // clear the id an earlier or parallel request of the same run saved.
       ...(socialPostId ? { social_post_id: socialPostId } : {}),
+      ...(uploadedImageId ? { uploaded_image_id: uploadedImageId } : {}),
       platform: this.input.platform || this.context.platform || null,
       input_url: this.input.inputUrl || this.context.url || null,
       entrypoint: this.input.entrypoint || this.context.route || null,
@@ -432,6 +435,7 @@ export class PipelineLog {
     const events = this.events.slice(0, MAX_DB_EVENTS).map((event) => ({
       run_id: this.pipelineRunId,
       social_post_id: socialPostId,
+      uploaded_image_id: uploadedImageId,
       occurred_at: event.at,
       elapsed_ms: event.ms,
       stage: event.stage,
@@ -448,6 +452,7 @@ export class PipelineLog {
       const { error } = await supabaseAdmin.from('extraction_stage_runs').insert(this.operations.map((operation) => ({
         run_id: this.pipelineRunId,
         social_post_id: socialPostId,
+        uploaded_image_id: uploadedImageId,
         stage: operation.stage,
         operation: operation.operation,
         status: operation.status,
@@ -478,6 +483,7 @@ export class PipelineLog {
       const rows = [...new Map(this.evidence.map((item) => [item.evidenceId, item])).values()].map((item) => ({
         run_id: this.pipelineRunId,
         social_post_id: socialPostId,
+        uploaded_image_id: uploadedImageId,
         evidence_id: item.evidenceId,
         source_type: item.sourceType,
         text_value: item.textValue,
@@ -497,6 +503,7 @@ export class PipelineLog {
       const rows = [...this.candidates.values()].map((candidate) => ({
         run_id: this.pipelineRunId,
         social_post_id: socialPostId,
+        uploaded_image_id: uploadedImageId,
         candidate_key: candidate.candidateKey,
         place_id: candidate.placeId,
         name: candidate.name,

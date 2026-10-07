@@ -531,6 +531,205 @@ function extractionView(
   });
 }
 
+const namesFromAnalysis = (value: unknown) =>
+  Array.isArray(value)
+    ? value
+        .map((item) =>
+          typeof item === "string"
+            ? item.trim()
+            : firstText(data(item).name, data(item).text),
+        )
+        .filter((item): item is string => Boolean(item))
+    : [];
+
+/**
+ * Image uploads are not social_posts, but the dashboard intentionally presents
+ * them in the same directory. Build the same detail contract from the upload's
+ * persisted analysis and its shared social_post_places links.
+ */
+async function uploadedImageDetail(id: string) {
+  const { data: upload, error: uploadError } = await supabaseAdmin
+    .from("uploaded_images")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+
+  if (uploadError)
+    return NextResponse.json({ error: uploadError.message }, { status: 500 });
+  if (!upload) return null;
+
+  const uploadRow = data(upload);
+  const analysis = data(uploadRow.ai_analysis);
+  const content = data(analysis.content);
+  const captionAnalysis = data(analysis.caption_analysis);
+  const entities = data(analysis.entities);
+  const visual = data(analysis.visual_analysis);
+  const audio = data(analysis.audio_analysis);
+  const promotion = data(analysis.promotion);
+  const audience = data(analysis.audience);
+  const influencer = data(analysis.influencer_analysis);
+  const uploadProcessing = data(analysis.upload_processing);
+  const uploadedImageUrls = words(uploadRow.image_urls);
+
+  const [profileResult, linksResult] = await Promise.all([
+    text(uploadRow.user_id)
+      ? supabaseAdmin
+          .from("profiles")
+          .select("id, display_name, email, avatar_url")
+          .eq("id", text(uploadRow.user_id)!)
+          .maybeSingle()
+      : Promise.resolve({ data: null, error: null }),
+    supabaseAdmin
+      .from("social_post_places")
+      .select("id, place_id, confidence, explanation, evidence, created_at")
+      .eq("uploaded_image_id", id)
+      .order("created_at", { ascending: false }),
+  ]);
+  const [runsResult, stagesResult, eventsResult, candidatesResult, evidenceResult] =
+    await Promise.all([
+      supabaseAdmin.from("extraction_runs").select("*").eq("uploaded_image_id", id).order("started_at", { ascending: false }),
+      supabaseAdmin.from("extraction_stage_runs").select("*").eq("uploaded_image_id", id).order("started_at", { ascending: true }),
+      supabaseAdmin.from("extraction_run_events").select("*").eq("uploaded_image_id", id).order("occurred_at", { ascending: true }),
+      supabaseAdmin.from("extraction_place_candidates").select("*").eq("uploaded_image_id", id).order("created_at", { ascending: true }),
+      supabaseAdmin.from("extraction_evidence").select("*").eq("uploaded_image_id", id).order("created_at", { ascending: true }),
+    ]);
+  const runIds = (runsResult.data ?? []).map((run) => run.id).filter(Boolean);
+  // extraction_run_summary is a PostgreSQL view. Older deployments do not
+  // expose new columns through it, so read it through its stable run id.
+  const summaryResult = runIds.length
+    ? await supabaseAdmin
+        .from("extraction_run_summary")
+        .select("*")
+        .in("id", runIds)
+        .order("started_at", { ascending: false })
+        .limit(1)
+    : { data: [], error: null };
+
+  const linkRows = (linksResult.data ?? []) as Data[];
+  const placeIds = linkRows
+    .map((link) => text(link.place_id))
+    .filter((placeId): placeId is string => Boolean(placeId));
+  const placesResult = placeIds.length
+    ? await supabaseAdmin.from("places").select("*").in("id", placeIds)
+    : { data: [] as Data[], error: null };
+  const placesById = new Map(
+    ((placesResult.data ?? []) as Data[]).map((place) => [String(place.id), place]),
+  );
+  const placeLinks = linkRows.map((link) => ({
+    ...link,
+    places: placesById.get(String(link.place_id)) ?? null,
+  }));
+  const locations = placeLinks.flatMap((link) => {
+    const place = data(link.places);
+    if (!Object.keys(place).length) return [];
+    return [{
+      place_id: String(place.id),
+      address: text(place.address),
+      latitude:
+        place.latitude === null || place.latitude === undefined
+          ? null
+          : number(place.latitude),
+      longitude:
+        place.longitude === null || place.longitude === undefined
+          ? null
+          : number(place.longitude),
+    }];
+  });
+  const frameTexts = [
+    ...(Array.isArray(uploadProcessing.vision_frames)
+      ? uploadProcessing.vision_frames.flatMap((frame) => words(data(frame).texts))
+      : []),
+    ...(Array.isArray(uploadProcessing.ocr_frames)
+      ? uploadProcessing.ocr_frames.flatMap((frame) => words(data(frame).texts))
+      : []),
+  ];
+  const visibleText = [
+    ...new Set([...namesFromAnalysis(visual.visible_text), ...frameTexts]),
+  ].join("\n");
+
+  return NextResponse.json({
+    success: true,
+    post: {
+      id,
+      platform: "upload",
+      content_type: "image",
+      author_username: "image-upload",
+      owner_full_name: null,
+      caption: text(uploadRow.caption) || "",
+      display_url: uploadedImageUrls[0] || null,
+      images: uploadedImageUrls,
+      post_url: null,
+      status: text(uploadRow.status) || "pending",
+      created_at: text(uploadRow.created_at),
+      updated_at: text(uploadRow.updated_at),
+      primary_category: firstText(content.primary_category, analysis.primary_category),
+      secondary_categories: words(content.secondary_categories),
+      content_summary: firstText(content.summary, captionAnalysis.summary),
+      suggested_title: text(content.suggested_title),
+      topics: words(content.topics),
+      hashtags: words(captionAnalysis.hashtags),
+      mentions: words(captionAnalysis.mentions),
+      mentioned_brands: [...new Set([
+        ...namesFromAnalysis(entities.brands),
+        ...words(visual.brands_visible),
+      ])],
+      mentioned_locations: [...new Set([
+        ...namesFromAnalysis(entities.locations),
+        ...words(visual.locations_visible),
+      ])],
+      call_to_actions: words(promotion.call_to_actions),
+      niche: text(influencer.niche),
+      target_audience: text(audience.primary_audience),
+      transcript: text(audio.transcript),
+      visible_text: visibleText || null,
+      file_names: words(uploadRow.file_names),
+      error_message: text(uploadRow.error_message),
+      ai_analysis: analysis,
+    },
+    related: {
+      primary_place: null,
+      direct_places: [],
+      place_links: placeLinks,
+      locations,
+      apify: { available: false },
+      post_reference: { url: null, short_code: null },
+      trace: null,
+      trace_json: null,
+      token_usage: tokenUsageView(summaryResult.data?.[0], stagesResult.data ?? []),
+      extraction: [],
+      runs: runsResult.data ?? [],
+      operations: stagesResult.data ?? [],
+      events: eventsResult.data ?? [],
+      candidates: candidatesResult.data ?? [],
+      evidence: evidenceResult.data ?? [],
+      requesters: profileResult.data
+        ? [{
+            ...profileResult.data,
+            user_id: uploadRow.user_id,
+            is_creator: true,
+            first_requested_at: uploadRow.created_at,
+          }]
+        : [],
+      saves: { total: 0, users: 0, been_here: 0, want_to_go: 0 },
+      upload: {
+        file_names: words(uploadRow.file_names),
+        image_urls: uploadedImageUrls,
+        storage_paths: words(uploadRow.storage_paths),
+        error_message: text(uploadRow.error_message),
+        analysis,
+        processing: uploadProcessing,
+      },
+    },
+    warnings: [
+      linksResult.error, placesResult.error, profileResult.error,
+      runsResult.error, summaryResult.error, stagesResult.error, eventsResult.error,
+      candidatesResult.error, evidenceResult.error,
+    ]
+      .filter(Boolean)
+      .map((error) => (error as { message: string }).message),
+  });
+}
+
 /**
  * GET /api/admin/posts/:id
  *
@@ -556,7 +755,11 @@ export async function GET(_: Request, { params }: Params) {
   }
 
   if (!post) {
-    return NextResponse.json({ error: "Post not found" }, { status: 404 });
+    const uploadResponse = await uploadedImageDetail(id);
+    return (
+      uploadResponse ??
+      NextResponse.json({ error: "Post not found" }, { status: 404 })
+    );
   }
   const normalizedPost = normalizeAdminPost(post);
   const runUrlToken = postUrlToken(normalizedPost.post_url);

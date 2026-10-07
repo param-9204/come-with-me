@@ -65,6 +65,58 @@ function Caption({ caption }: { caption: string | null }) {
   );
 }
 
+function UploadVisionAnalysis({ post }: { post: PostDetail["post"] }) {
+  if (post.platform !== "upload") return null;
+  const analysis = record(post.ai_analysis);
+  const visual = record(analysis.visual_analysis);
+  const processing = record(analysis.upload_processing);
+  const visionFrames = Array.isArray(processing.vision_frames)
+    ? processing.vision_frames.length
+    : 0;
+  const ocrFrames = Array.isArray(processing.ocr_frames)
+    ? processing.ocr_frames.length
+    : 0;
+  const allGroups: Array<[string, string[]]> = [
+    ["Brands", strings(visual.brands_visible)],
+    ["Products", strings(visual.products_visible)],
+    ["Locations", strings(visual.locations_visible)],
+    ["People", strings(visual.people_visible)],
+    ["Objects", strings(visual.objects_visible)],
+    ["Logos", strings(visual.logos_visible)],
+  ];
+  const groups = allGroups.filter(([, values]) => values.length > 0);
+
+  if (!groups.length && !optional(post.visible_text)) return null;
+  return (
+    <Panel
+      title="Visual AI analysis"
+      description={`Stored GPT/Vision findings from the uploaded image processing${visionFrames || ocrFrames ? ` (${visionFrames} Vision, ${ocrFrames} OCR frame${ocrFrames === 1 ? "" : "s"})` : ""}.`}
+    >
+      {optional(post.visible_text) && (
+        <div>
+          <p className="mb-1 text-xs text-ink-3">Text detected in image</p>
+          <p className="text-[13px] leading-6 whitespace-pre-wrap text-ink-2">
+            {String(post.visible_text)}
+          </p>
+        </div>
+      )}
+      {groups.length > 0 && (
+        <dl className="mt-4 divide-y divide-line border-t border-line">
+          {groups.map(([label, values]) => (
+            <div
+              key={label}
+              className="grid gap-1 py-2.5 sm:grid-cols-[160px_minmax(0,1fr)]"
+            >
+              <dt className="text-xs text-ink-3 sm:pt-0.5">{label}</dt>
+              <dd><Chips values={values} /></dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </Panel>
+  );
+}
+
 function Overview({ detail }: { detail: PostDetail }) {
   const post = detail.post;
   const tagGroups: Array<[string, string[]]> = [
@@ -123,6 +175,7 @@ function Overview({ detail }: { detail: PostDetail }) {
           </p>
         )}
       </Panel>
+      <UploadVisionAnalysis post={post} />
       {(transcript || visibleText) && (
         <Panel title="Spoken and on-screen text">
           <div className="space-y-2">
@@ -246,6 +299,7 @@ export default function PostDetailView({
     trace_json: related.trace_json ?? null,
     extraction: related.extraction ?? null,
     token_usage: related.token_usage ?? null,
+    upload: related.upload ?? null,
   };
 
   return (

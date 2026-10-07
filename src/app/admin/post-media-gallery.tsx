@@ -10,8 +10,8 @@ type Props = {
 };
 
 function validImageUrls(imageUrls: string[], primaryImageUrl?: string | null) {
-  return [...new Set(imageUrls)]
-    .filter((url) => url !== primaryImageUrl)
+  return [...new Set([primaryImageUrl, ...imageUrls])]
+    .filter((url): url is string => typeof url === "string" && Boolean(url))
     .filter((url) => {
       try {
         const parsed = new URL(url);

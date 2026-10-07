@@ -5,7 +5,7 @@ import { DbService } from '@/lib/services/db.service';
 import { AiEnrichmentService } from '@/lib/services/ai-enrichment.service';
 import { MediaEvidenceService } from '@/lib/services/media-evidence.service';
 import { SupabaseImageStorageService } from '@/lib/services/supabase-image-storage.service';
-import { PipelineLog } from '@/lib/services/pipeline-log';
+import { PipelineLog, plog, recordPipelineEvidence, recordPlaceCandidate, withPipelineLog } from '@/lib/services/pipeline-log';
 import { ScraperService } from '@/lib/services/scraper.service';
 import type { ApifyOcrFrameResult, GptVisionFrameResult, SocialContent, TranscriptSegment } from '@/lib/types/social';
 import type { AudioUploadRef } from '@/lib/services/media-evidence.service';
@@ -249,6 +249,8 @@ async function handleImageUpload(request: Request, authUser: Awaited<ReturnType<
 
   let storagePaths: string[] = [];
   let uploadedImageId: string | null = null;
+  const log = new PipelineLog(`image-upload-${Date.now()}`, { route: 'process-url', platform: 'upload' });
+  return withPipelineLog(log, async () => {
   try {
     const storageOwner = finalUserId || 'local-postman';
     const uploads = await Promise.all(files.map((file) => SupabaseImageStorageService.upload(file, storageOwner)));
@@ -264,7 +266,22 @@ async function handleImageUpload(request: Request, authUser: Awaited<ReturnType<
     uploadedImageId = uploaded.id;
 
     const content = uploadContent(uploaded.id, imageUrls, caption);
+    log.runId = uploaded.id;
+    Object.assign(log.context, { uploadedImageId: uploaded.id, url: imageUrls[0] || null });
+    log.setRunInput({
+      platform: 'upload',
+      inputUrl: imageUrls[0] || null,
+      uploadedImageId: uploaded.id,
+      entrypoint: 'process-url:image-upload',
+      contentId: uploaded.id,
+      contentType: 'image',
+      caption,
+      metadata: { imageCount: imageUrls.length, fileNames: files.map((file) => file.name) },
+    });
+    plog('run', 'Image upload analysis started', { imageCount: imageUrls.length });
     const media = await MediaEvidenceService.collect(content, content.rawApifyData, { persistAudio: false });
+    const evidence = AiEnrichmentService.buildEvidence(content, media);
+    recordPipelineEvidence(evidence.items);
     const enrichment = await AiEnrichmentService.analyzeContent(content, content.rawApifyData, {
       ocrFrames: media.ocrFrames,
       visionFrames: media.visionFrames,
@@ -276,6 +293,14 @@ async function handleImageUpload(request: Request, authUser: Awaited<ReturnType<
       if (placeId) await DbService.linkPlaceToUploadedImage(uploaded.id, placeId, place);
       return { place, placeId };
     }));
+    saveResults.forEach(({ place, placeId }, index) =>
+      recordPlaceCandidate(
+        `upload:${index}:${String(place.name || '').toLowerCase()}`,
+        place,
+        placeId ? 'accepted' : 'unresolved',
+        { placeId, reason: placeId ? 'Saved and linked to uploaded image.' : 'Could not save with a verified location.' },
+      ),
+    );
     const savedPlaces = await DbService.getPlacesForUploadedImage(uploaded.id);
     const savedKeys = new Set(savedPlaces.map((place: any) => `${String(place.name || '').trim().toLowerCase()}|${String(place.city || '').trim().toLowerCase()}`));
     const unresolvedPlaces = saveResults
@@ -291,10 +316,35 @@ async function handleImageUpload(request: Request, authUser: Awaited<ReturnType<
       ...(enrichment?.warning ? [enrichment.warning] : []),
       ...(unresolvedPlaces.length ? [`${unresolvedPlaces.length} place(s) could not be saved with a verified location.`] : []),
     ])];
-    await DbService.completeUploadedImage(uploaded.id, enrichment?.analysis || null);
-
     const gptTexts = [...new Set(media.visionFrames.flatMap((frame) => frame.texts || []))];
     const ocrTexts = [...new Set(media.ocrFrames.flatMap((frame) => frame.texts || []))];
+    await DbService.completeUploadedImage(uploaded.id, {
+      ...(enrichment?.analysis || {}),
+      upload_processing: {
+        transcript: media.transcriptText || null,
+        warnings,
+        // Keep the text-level OCR/Vision evidence needed by the dashboard;
+        // raw OCR provider payloads are intentionally not duplicated here.
+        ocr_frames: media.ocrFrames.map((frame) => ({
+          frameIndex: frame.frameIndex,
+          timestamp: frame.timestamp,
+          texts: frame.texts,
+          rawConfidence: frame.rawConfidence,
+          method: frame.method,
+          lines: frame.lines,
+          wordStats: frame.wordStats,
+        })),
+        vision_frames: media.visionFrames,
+      },
+    });
+    log.setResult({
+      returnedPlaceCount: placesToSave.length,
+      persistedPlaceCount: saveResults.filter((result) => Boolean(result.placeId)).length,
+      unresolvedPlaceCount: unresolvedPlaces.length,
+      imageCount: imageUrls.length,
+      visionFrameCount: media.visionFrames.length,
+      ocrFrameCount: media.ocrFrames.length,
+    }, warnings.length ? 'partial' : 'completed');
     return NextResponse.json({
       success: true,
       partial: warnings.length > 0,
@@ -320,10 +370,16 @@ async function handleImageUpload(request: Request, authUser: Awaited<ReturnType<
     });
   } catch (error: any) {
     const message = error?.message || 'Image upload processing failed';
+    log.fail(error, { uploadedImageId, failedStage: 'image-upload' });
     if (uploadedImageId) await DbService.failUploadedImage(uploadedImageId, message);
     else await SupabaseImageStorageService.remove(storagePaths);
     return NextResponse.json({ success: false, error: message }, { status: 500 });
   }
+  finally {
+    log.flush();
+    await log.flushDatabase();
+  }
+  });
 }
 
 /**

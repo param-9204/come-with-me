@@ -574,7 +574,10 @@ export class DbService {
     return data;
   }
 
-  static async completeUploadedImage(id: string, analysis: AiAnalysisResult | null): Promise<void> {
+  static async completeUploadedImage(
+    id: string,
+    analysis: AiAnalysisResult | Record<string, unknown> | null,
+  ): Promise<void> {
     const { error } = await supabaseAdmin
       .from('uploaded_images')
       .update({ status: 'completed', ai_analysis: analysis || {}, error_message: null, updated_at: new Date().toISOString() })
