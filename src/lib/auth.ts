@@ -3,6 +3,7 @@ import { auth } from '@clerk/nextjs/server';
 import { createClerkClient, verifyToken } from '@clerk/backend';
 import { v5 as uuidv5 } from 'uuid';
 import * as jwt from 'jsonwebtoken';
+import { createRemoteJWKSet, jwtVerify, type JWTVerifyResult } from 'jose';
 
 // A static namespace UUID for deterministic UUID v5 generation.
 const CLERK_UUID_NAMESPACE = '1b671a64-40d5-491e-99b0-da01ff1f3341';
@@ -16,6 +17,52 @@ function decodeTokenIssuer(token: string): string | null {
     const decoded = jwt.decode(token, { complete: true }) as any;
     return decoded?.payload?.iss || null;
   } catch {
+    return null;
+  }
+}
+
+const crossInstanceJwks = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
+
+/**
+ * Verify a token issued by the mobile Clerk instance. The issuer must be
+ * explicitly configured; never trust a JWKS URL supplied only by an unverified
+ * token claim.
+ */
+async function verifyTrustedMobileClerkToken(token: string, issuer: string | null) {
+  const trustedIssuer = process.env.CLERK_MOBILE_ISSUER?.trim().replace(/\/$/, '');
+  const normalizedIssuer = issuer?.trim().replace(/\/$/, '');
+  if (!trustedIssuer || !normalizedIssuer || normalizedIssuer !== trustedIssuer) {
+    console.error('[Auth] Mobile Clerk issuer is not trusted by this deployment.', {
+      tokenIssuer: normalizedIssuer || null,
+      mobileIssuerConfigured: !!trustedIssuer,
+    });
+    return null;
+  }
+
+  try {
+    const jwksUrl = new URL(`${trustedIssuer}/.well-known/jwks.json`);
+    if (jwksUrl.protocol !== 'https:' || !jwksUrl.hostname.endsWith('.clerk.accounts.dev')) {
+      console.error('[Auth] CLERK_MOBILE_ISSUER is not a supported Clerk issuer.');
+      return null;
+    }
+
+    let jwks = crossInstanceJwks.get(trustedIssuer);
+    if (!jwks) {
+      jwks = createRemoteJWKSet(jwksUrl);
+      crossInstanceJwks.set(trustedIssuer, jwks);
+    }
+    const verified: JWTVerifyResult = await jwtVerify(token, jwks, { issuer: trustedIssuer });
+    const clerkId = typeof verified.payload.sub === 'string' ? verified.payload.sub : null;
+    if (!clerkId?.startsWith('user_')) return null;
+
+    return {
+      id: uuidv5(clerkId, CLERK_UUID_NAMESPACE),
+      clerkId,
+      email: typeof verified.payload.email === 'string' ? verified.payload.email : null,
+      tokenType: 'clerk_mobile_issuer' as const,
+    };
+  } catch (error: any) {
+    console.error('[Auth] Trusted mobile Clerk JWT verification failed:', error?.message || String(error));
     return null;
   }
 }
@@ -55,7 +102,10 @@ async function authUserFromClerkRequest(request?: Request) {
       acceptsToken: ['session_token', 'oauth_token', 'api_key'],
     });
     if (!state.isAuthenticated) {
-      console.warn('[Auth] Clerk request authentication rejected Bearer token:', state.reason);
+      console.error('[Auth] Clerk request authentication rejected Bearer token:', {
+        reason: state.reason,
+        message: state.message,
+      });
       return null;
     }
 
@@ -70,7 +120,7 @@ async function authUserFromClerkRequest(request?: Request) {
       tokenType: 'clerk_request' as const,
     };
   } catch (error: any) {
-    console.warn('[Auth] Clerk request authentication failed:', error?.message || String(error));
+    console.error('[Auth] Clerk request authentication failed:', error?.message || String(error));
     return null;
   }
 }
@@ -129,6 +179,12 @@ export async function getAuthUser(request?: Request) {
           //    This handles test-instance vs live-instance token mismatch.
           const issuer = decodeTokenIssuer(token);
           console.log('[Auth] Token issuer (iss):', issuer);
+
+          const mobileIssuerUser = await verifyTrustedMobileClerkToken(token, issuer);
+          if (mobileIssuerUser) {
+            console.log('[Auth] Clerk JWT verified with trusted mobile issuer. clerkId:', mobileIssuerUser.clerkId);
+            return mobileIssuerUser;
+          }
 
           if (issuer && issuer.includes('clerk')) {
             try {
