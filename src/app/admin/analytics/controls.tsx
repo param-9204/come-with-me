@@ -74,7 +74,7 @@ export function RangeControls({
             className={cx(
               "h-7 cursor-pointer rounded px-2.5 text-xs font-medium",
               range.key === item.key
-                ? "bg-ink text-canvas"
+                ? "bg-accent text-canvas"
                 : "text-ink-2 hover:bg-subtle",
             )}
           >
@@ -89,7 +89,7 @@ export function RangeControls({
           className={cx(
             "h-7 cursor-pointer rounded px-2.5 text-xs font-medium",
             range.key === "custom"
-              ? "bg-ink text-canvas"
+              ? "bg-accent text-canvas"
               : "text-ink-2 hover:bg-subtle",
           )}
         >

@@ -73,7 +73,7 @@ export default function PlaceMap({ latitude, longitude, label }: Props) {
         radius: 8,
         color: '#ffffff',
         weight: 3,
-        fillColor: '#c2410c',
+        fillColor: '#7A1626',
         fillOpacity: 1,
       }).addTo(map).bindTooltip(label);
       mapRef.current = map;

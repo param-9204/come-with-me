@@ -818,7 +818,7 @@ export default function Page() {
             <button
               type="submit"
               disabled={isLoading}
-              className="flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium px-5 py-2.5 rounded-lg transition-colors min-w-[120px]"
+              className="flex items-center justify-center gap-2 bg-[#7A1626] hover:bg-[#5F111E] disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium px-5 py-2.5 rounded-lg transition-colors min-w-[120px]"
             >
               {isLoading ? (
                 <>
