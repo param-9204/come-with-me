@@ -214,49 +214,46 @@ export default function PostsBrowser({
           />
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <select
-            aria-label="Platform"
+          <AdminSelect
+            label="Platform"
             value={searchParams.get("platform") ?? ""}
-            onChange={(event) => update({ platform: event.target.value })}
-            className={inputClass}
-          >
-            <option value="">All platforms</option>
-            {platforms.map((platform) => (
-              <option key={platform} value={platform}>
-                {PLATFORM_LABELS[platform] ??
-                  platform.charAt(0).toUpperCase() + platform.slice(1)}
-              </option>
-            ))}
-          </select>
-          <select
-            aria-label="Format"
+            onChange={(platform) => update({ platform })}
+            options={[
+              { value: "", label: "All platforms" },
+              ...platforms.map((platform) => ({
+                value: platform,
+                label:
+                  PLATFORM_LABELS[platform] ??
+                  platform.charAt(0).toUpperCase() + platform.slice(1),
+              })),
+            ]}
+            className="min-w-30"
+          />
+          <AdminSelect
+            label="Format"
             value={searchParams.get("type") ?? ""}
-            onChange={(event) => update({ type: event.target.value })}
-            className={inputClass}
-          >
-            <option value="">All formats</option>
-            <option value="reel">Reel</option>
-            <option value="post">Post</option>
-            <option value="video">Video</option>
-          </select>
-          <select
-            aria-label="Sort"
+            onChange={(type) => update({ type })}
+            options={[
+              { value: "", label: "All formats" },
+              { value: "reel", label: "Reel" },
+              { value: "post", label: "Post" },
+              { value: "video", label: "Video" },
+            ]}
+            className="min-w-28"
+          />
+          <AdminSelect
+            label="Sort"
             value={sortValue}
-            onChange={(event) => {
-              const [sort, dir] = event.target.value.split(":");
+            onChange={(value) => {
+              const [sort, dir] = value.split(":");
               update({
                 sort: sort === "created_at" ? null : sort,
                 dir: dir === "asc" ? "asc" : null,
               });
             }}
-            className={inputClass}
-          >
-            {SORT_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
+            options={SORT_OPTIONS}
+            className="min-w-36"
+          />
           <div
             role="group"
             aria-label="Layout"
