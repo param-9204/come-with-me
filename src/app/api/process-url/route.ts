@@ -251,11 +251,19 @@ const MAX_IMAGE_UPLOADS = 10;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif']);
 
-/** Resolve an authenticated owner when there is one. */
-async function resolveImageUploadUser(authUser: Awaited<ReturnType<typeof getAuthUser>>): Promise<string | null> {
+/**
+ * Resolve an authenticated owner using the same Clerk identity sources as the
+ * JSON URL-processing path. `proxy.ts` strips client-supplied identity headers
+ * and sets x-user-id only after Clerk has authenticated the request.
+ */
+async function resolveImageUploadUser(
+  request: Request,
+  authUser: Awaited<ReturnType<typeof getAuthUser>>,
+): Promise<string | null> {
+  const proxyUserId = request.headers.get('x-user-id');
   return resolveProfileId({
     clerkId: authUser?.clerkId,
-    userIdInput: authUser?.id,
+    userIdInput: proxyUserId || authUser?.id,
     email: authUser?.email,
   });
 }
@@ -290,7 +298,7 @@ function uploadContent(uploadId: string, imageUrls: string[], caption: string): 
 }
 
 async function handleImageUpload(request: Request, authUser: Awaited<ReturnType<typeof getAuthUser>>) {
-  const finalUserId = await resolveImageUploadUser(authUser);
+  const finalUserId = await resolveImageUploadUser(request, authUser);
   const isLocalDevelopment = process.env.NODE_ENV === 'development';
   if (!finalUserId && !isLocalDevelopment) {
     return NextResponse.json({ success: false, error: 'Authentication is required for image uploads' }, { status: 401 });
