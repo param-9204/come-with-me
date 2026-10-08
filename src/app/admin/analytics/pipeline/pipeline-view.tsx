@@ -23,6 +23,7 @@ import {
   rangeLabel,
   useUrlUpdate,
 } from "../controls";
+import { AdminSelect } from "../../ui-client";
 
 type Metric = "runs" | "failedRuns" | "errors" | "cost";
 const METRICS: Array<{ key: Metric; label: string }> = [
@@ -272,19 +273,19 @@ export default function PipelineView({ report }: { report: PipelineReport }) {
 
       <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
         <RangeControls key={`${range.from}-${range.to}`} range={range} update={update} />
-        <select
-          aria-label="Platform"
+        <AdminSelect
+          label="Platform"
           value={report.scope.platform ?? ""}
-          onChange={(event) => update({ platform: event.target.value })}
-          className={cx(inputClass, "self-start")}
-        >
-          <option value="">All platforms</option>
-          {report.platforms.map((platform) => (
-            <option key={platform} value={platform}>
-              {platformName(platform)}
-            </option>
-          ))}
-        </select>
+          onChange={(platform) => update({ platform })}
+          options={[
+            { value: "", label: "All platforms" },
+            ...report.platforms.map((platform) => ({
+              value: platform,
+              label: platformName(platform),
+            })),
+          ]}
+          className="min-w-30 self-start"
+        />
       </div>
 
       {loggingStart && range.from < loggingStart && (
