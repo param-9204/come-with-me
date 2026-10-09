@@ -4,6 +4,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { resolveCanonicalSocialSource } from '@/lib/social-source';
 import { UrlProcessingJobsService } from '@/lib/services/url-processing-jobs.service';
+import { ImageProcessingJobsService } from '@/lib/services/image-processing-jobs.service';
 
 export const maxDuration = 300;
 
@@ -85,7 +86,7 @@ export async function POST(request: Request) {
   }
 }
 
-/** GET /api/url-jobs?id=<job UUID> - mobile can poll only its own job. */
+/** GET /api/url-jobs?id=<job UUID> - mobile can poll only its own URL or image job. */
 export async function GET(request: Request) {
   try {
     const userId = await authenticatedProfileId(request);
@@ -94,7 +95,11 @@ export async function GET(request: Request) {
     if (!id) return NextResponse.json({ success: false, error: 'id is required' }, { status: 400 });
 
     const job = await UrlProcessingJobsService.getJobForUser(id, userId);
-    if (!job) return NextResponse.json({ success: false, error: 'Job not found' }, { status: 404 });
+    if (!job) {
+      const imageJob = await ImageProcessingJobsService.getJobForUser(id, userId);
+      if (imageJob) return NextResponse.json({ success: true, job: imageJob });
+      return NextResponse.json({ success: false, error: 'Job not found' }, { status: 404 });
+    }
     return NextResponse.json({
       success: true,
       job: {

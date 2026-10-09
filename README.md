@@ -41,17 +41,27 @@ It supports an explicitly configured HTTPS production Clerk domain as well;
 replace the value when mobile migrates to its production Clerk instance.
 The client must send a current Clerk session token in `Authorization: Bearer …`.
 
-Multipart image uploads finish processing before returning HTTP `200`. The JSON
-contains `success: true`, `status: "completed"`, `processing: false`,
-`uploadedImageId`, and the extracted `places` and `placeIds` directly. The mobile
-image handler should consume this result immediately; images have no `jobId`.
-URL submissions continue to return a `jobId` for the existing polling flow.
+Authenticated multipart image uploads store the images and return HTTP `202`
+with `success: true`, `status: "queued"`, `jobId`, and `uploadedImageId`. The upload
+record's ID is the image job ID. Analysis runs after the response, independently
+of the URL worker, and stores the complete result on the upload record.
+
+Poll `GET /api/url-jobs?id=<jobId>` using the same Bearer token. Only the verified
+upload owner can retrieve the job. A completed image job returns the extracted
+`places`, `placeIds`, `suggested_title`, and other result fields in `job.result`;
+failed jobs expose their error in `job.error`. Polling does not rerun extraction.
+A pending production upload older than six minutes reports a timeout rather than
+leaving mobile polling indefinitely. Image jobs require no new migration.
+The anonymous local Postman flow continues to return its result directly.
+
+Run `npm run test:image-jobs` for submission, background completion, polling,
+ownership, failure, and URL regression checks using provider and database fixtures.
 
 Run `npm run test:image-auth` for authentication and upload regression checks.
 They use real RSA signatures and JWKS verification, with provider and persistence
 fixtures rather than live Clerk sessions or database writes. After deploying,
-retry a real image upload and confirm the `[Auth] Clerk JWT verified with trusted
-mobile issuer` log and a successful upload response.
+retry a real image upload, confirm the `[Auth] Clerk JWT verified with trusted
+mobile issuer` log, and poll its returned job ID until the result is completed.
 
 ## Google Maps setup
 

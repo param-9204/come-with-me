@@ -330,8 +330,6 @@ async function handleImageUpload(request: Request, authUser: Awaited<ReturnType<
 
   let storagePaths: string[] = [];
   let uploadedImageId: string | null = null;
-  const log = new PipelineLog(`image-upload-${Date.now()}`, { route: 'process-url', platform: 'upload' });
-  return withPipelineLog(log, async () => {
   try {
     const storageOwner = finalUserId || 'local-postman';
     const uploads = await Promise.all(files.map((file) => SupabaseImageStorageService.upload(file, storageOwner)));
@@ -345,7 +343,57 @@ async function handleImageUpload(request: Request, authUser: Awaited<ReturnType<
       caption,
     });
     uploadedImageId = uploaded.id;
+    const fileNames = files.map((file) => file.name);
 
+    // Keep the development-only anonymous Postman flow synchronous: it has no
+    // authenticated owner with which to authorize job polling.
+    if (!finalUserId) {
+      return await processUploadedImage(uploaded, imageUrls, caption, finalUserId, fileNames);
+    }
+
+    after(async () => {
+      try {
+        await processUploadedImage(uploaded, imageUrls, caption, finalUserId, fileNames);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Image upload processing failed';
+        console.error('[Image Upload API] Background analysis failed:', message);
+        try {
+          await DbService.failUploadedImage(uploaded.id, message);
+        } catch (persistError) {
+          console.error('[Image Upload API] Failed to record background analysis failure:', persistError);
+        }
+      }
+    });
+
+    return NextResponse.json({
+      success: true,
+      jobId: uploaded.id,
+      uploadedImageId: uploaded.id,
+      socialPostId: null,
+      status: 'queued',
+      suggested_title: null,
+      workerScheduled: true,
+      warning: null,
+    }, { status: 202 });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Image upload processing failed';
+    console.error('[Image Upload API] Unable to submit image job:', message);
+    if (uploadedImageId) await DbService.failUploadedImage(uploadedImageId, message);
+    else await SupabaseImageStorageService.remove(storagePaths);
+    return NextResponse.json({ success: false, error: message }, { status: 500 });
+  }
+}
+
+async function processUploadedImage(
+  uploaded: { id: string },
+  imageUrls: string[],
+  caption: string,
+  finalUserId: string | null,
+  fileNames: string[],
+) {
+  const log = new PipelineLog(`image-upload-${Date.now()}`, { route: 'process-url', platform: 'upload' });
+  return withPipelineLog(log, async () => {
+  try {
     const content = uploadContent(uploaded.id, imageUrls, caption);
     log.runId = uploaded.id;
     Object.assign(log.context, { uploadedImageId: uploaded.id, url: imageUrls[0] || null });
@@ -357,7 +405,7 @@ async function handleImageUpload(request: Request, authUser: Awaited<ReturnType<
       contentId: uploaded.id,
       contentType: 'image',
       caption,
-      metadata: { imageCount: imageUrls.length, fileNames: files.map((file) => file.name) },
+      metadata: { imageCount: imageUrls.length, fileNames },
     });
     plog('run', 'Image upload analysis started', { imageCount: imageUrls.length });
     const media = await MediaEvidenceService.collect(content, content.rawApifyData, { persistAudio: false });
@@ -399,36 +447,7 @@ async function handleImageUpload(request: Request, authUser: Awaited<ReturnType<
     ])];
     const gptTexts = [...new Set(media.visionFrames.flatMap((frame) => frame.texts || []))];
     const ocrTexts = [...new Set(media.ocrFrames.flatMap((frame) => frame.texts || []))];
-    await DbService.completeUploadedImage(uploaded.id, {
-      ...(enrichment?.analysis || {}),
-      upload_processing: {
-        transcript: media.transcriptText || null,
-        warnings,
-        // Keep the text-level OCR/Vision evidence needed by the dashboard;
-        // raw OCR provider payloads are intentionally not duplicated here.
-        ocr_frames: media.ocrFrames.map((frame) => ({
-          frameIndex: frame.frameIndex,
-          timestamp: frame.timestamp,
-          texts: frame.texts,
-          rawConfidence: frame.rawConfidence,
-          method: frame.method,
-          lines: frame.lines,
-          wordStats: frame.wordStats,
-        })),
-        vision_frames: media.visionFrames,
-      },
-    });
-    log.setResult({
-      returnedPlaceCount: placesToSave.length,
-      persistedPlaceCount: saveResults.filter((result) => Boolean(result.placeId)).length,
-      unresolvedPlaceCount: unresolvedPlaces.length,
-      imageCount: imageUrls.length,
-      visionFrameCount: media.visionFrames.length,
-      ocrFrameCount: media.ocrFrames.length,
-    }, warnings.length ? 'partial' : 'completed');
-    // Image analysis finishes in this request; mobile can consume the places
-    // directly without creating or polling a URL processing job.
-    return NextResponse.json({
+    const result = {
       success: true,
       status: 'completed',
       processing: false,
@@ -452,12 +471,40 @@ async function handleImageUpload(request: Request, authUser: Awaited<ReturnType<
         gptVision: { frames: media.visionFrames, allTexts: gptTexts, allBrands: [], allLocations: [], allPrices: [], allCtas: [], totalFramesProcessed: media.visionFrames.length, processingTimeMs: 0 },
       },
       audioUpload: null,
-    }, { status: 200 });
-  } catch (error: any) {
-    const message = error?.message || 'Image upload processing failed';
-    log.fail(error, { uploadedImageId, failedStage: 'image-upload' });
-    if (uploadedImageId) await DbService.failUploadedImage(uploadedImageId, message);
-    else await SupabaseImageStorageService.remove(storagePaths);
+    };
+    await DbService.completeUploadedImage(uploaded.id, {
+      ...(enrichment?.analysis || {}),
+      upload_processing: {
+        transcript: media.transcriptText || null,
+        warnings,
+        // Persist the complete response for job polling, including unresolved
+        // places and warnings, so polling never reruns extraction.
+        result,
+        ocr_frames: media.ocrFrames.map((frame) => ({
+          frameIndex: frame.frameIndex,
+          timestamp: frame.timestamp,
+          texts: frame.texts,
+          rawConfidence: frame.rawConfidence,
+          method: frame.method,
+          lines: frame.lines,
+          wordStats: frame.wordStats,
+        })),
+        vision_frames: media.visionFrames,
+      },
+    });
+    log.setResult({
+      returnedPlaceCount: placesToSave.length,
+      persistedPlaceCount: saveResults.filter((saved) => Boolean(saved.placeId)).length,
+      unresolvedPlaceCount: unresolvedPlaces.length,
+      imageCount: imageUrls.length,
+      visionFrameCount: media.visionFrames.length,
+      ocrFrameCount: media.ocrFrames.length,
+    }, warnings.length ? 'partial' : 'completed');
+    return NextResponse.json(result, { status: 200 });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Image upload processing failed';
+    log.fail(error, { uploadedImageId: uploaded.id, failedStage: 'image-upload' });
+    await DbService.failUploadedImage(uploaded.id, message);
     return NextResponse.json({ success: false, error: message }, { status: 500 });
   }
   finally {

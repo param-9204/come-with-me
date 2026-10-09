@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
-    "test:image-auth": "node tests/image-auth.test.cjs"
+    "test:image-auth": "node tests/image-auth.test.cjs",
+    "test:image-jobs": "node --test tests/image-jobs.test.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.122.0",
