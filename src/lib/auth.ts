@@ -10,12 +10,14 @@ const CLERK_UUID_NAMESPACE = '1b671a64-40d5-491e-99b0-da01ff1f3341';
 
 /**
  * Decode a JWT and extract the issuer claim without verifying the signature.
- * Used to find the correct Clerk JWKS endpoint for a token from a different instance.
+ * Used only to select the explicitly configured mobile issuer verifier.
  */
 function decodeTokenIssuer(token: string): string | null {
   try {
-    const decoded = jwt.decode(token, { complete: true }) as any;
-    return decoded?.payload?.iss || null;
+    const decoded = jwt.decode(token);
+    return decoded && typeof decoded === 'object' && typeof decoded.iss === 'string'
+      ? decoded.iss
+      : null;
   } catch {
     return null;
   }
@@ -30,28 +32,35 @@ const crossInstanceJwks = new Map<string, ReturnType<typeof createRemoteJWKSet>>
  */
 async function verifyTrustedMobileClerkToken(token: string, issuer: string | null) {
   const trustedIssuer = process.env.CLERK_MOBILE_ISSUER?.trim().replace(/\/$/, '');
-  const normalizedIssuer = issuer?.trim().replace(/\/$/, '');
-  if (!trustedIssuer || !normalizedIssuer || normalizedIssuer !== trustedIssuer) {
+  if (!trustedIssuer || issuer !== trustedIssuer) {
     console.error('[Auth] Mobile Clerk issuer is not trusted by this deployment. Configure CLERK_MOBILE_ISSUER to the trusted mobile Clerk issuer and redeploy.', {
-      tokenIssuer: normalizedIssuer || null,
+      tokenIssuer: issuer,
       mobileIssuerConfigured: !!trustedIssuer,
     });
     return null;
   }
 
   try {
-    const jwksUrl = new URL(`${trustedIssuer}/.well-known/jwks.json`);
-    if (jwksUrl.protocol !== 'https:' || !jwksUrl.hostname.endsWith('.clerk.accounts.dev')) {
-      console.error('[Auth] CLERK_MOBILE_ISSUER is not a supported Clerk issuer.');
+    const issuerUrl = new URL(trustedIssuer);
+    // Both development and production Clerk instances are supported, including
+    // custom domains. Only the explicitly configured HTTPS origin is trusted.
+    if (issuerUrl.protocol !== 'https:' || issuerUrl.origin !== trustedIssuer) {
+      console.error('[Auth] CLERK_MOBILE_ISSUER must be an HTTPS origin without credentials, a path, query, or fragment.');
       return null;
     }
+    const jwksUrl = new URL('/.well-known/jwks.json', issuerUrl);
 
     let jwks = crossInstanceJwks.get(trustedIssuer);
     if (!jwks) {
       jwks = createRemoteJWKSet(jwksUrl);
       crossInstanceJwks.set(trustedIssuer, jwks);
     }
-    const verified: JWTVerifyResult = await jwtVerify(token, jwks, { issuer: trustedIssuer });
+    const verified: JWTVerifyResult = await jwtVerify(token, jwks, {
+      issuer: trustedIssuer,
+      algorithms: ['RS256'],
+      requiredClaims: ['sub', 'exp', 'nbf', 'iat'],
+      clockTolerance: 5, // Match Clerk's default five-second clock skew.
+    });
     const clerkId = typeof verified.payload.sub === 'string' ? verified.payload.sub : null;
     if (!clerkId?.startsWith('user_')) return null;
 

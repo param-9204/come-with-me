@@ -16,6 +16,37 @@ bun dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
+## Mobile image-upload authentication
+
+Image uploads require a verified user in deployed environments. URL submissions
+can proceed without verifying a Bearer token, so a successful URL submission does
+not confirm that the mobile token is accepted.
+
+When mobile and web use different Clerk instances, keep the existing web Clerk
+keys and explicitly trust the mobile instance with this server-only setting:
+
+```env
+CLERK_MOBILE_ISSUER=https://guiding-grub-3189.clerk.accounts.dev
+```
+
+This is the mobile issuer identified in the upload logs. Set the same variable in
+Vercel **Project Settings → Environment Variables** for **Production**, and for
+**Preview** if the app calls preview deployments, then redeploy. Local `.env`
+changes do not update Vercel. Environment changes apply to new deployments only:
+[Vercel environment variables](https://vercel.com/docs/environment-variables).
+
+The fallback accepts only tokens signed by the configured issuer, checks RS256,
+the issuer, expiration and activation time, and requires a Clerk user subject.
+It supports an explicitly configured HTTPS production Clerk domain as well;
+replace the value when mobile migrates to its production Clerk instance.
+The client must send a current Clerk session token in `Authorization: Bearer …`.
+
+Run `npm run test:image-auth` for authentication and upload regression checks.
+They use real RSA signatures and JWKS verification, with provider and persistence
+fixtures rather than live Clerk sessions or database writes. After deploying,
+retry a real image upload and confirm the `[Auth] Clerk JWT verified with trusted
+mobile issuer` log and a successful upload response.
+
 ## Google Maps setup
 
 Place resolution uses Google Maps only. Add a server-side key to `.env`:
