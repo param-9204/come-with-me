@@ -46,16 +46,19 @@ with `success: true`, `status: "queued"`, `jobId`, and `uploadedImageId`. The up
 record's ID is the image job ID. Analysis runs after the response, independently
 of the URL worker, and stores the complete result on the upload record.
 
-Poll `GET /api/url-jobs?id=<jobId>` using the same Bearer token. Only the verified
-upload owner can retrieve the job. A completed image job returns the extracted
-`places`, `placeIds`, `suggested_title`, and other result fields in `job.result`;
-failed jobs expose their error in `job.error`. Polling does not rerun extraction.
+Poll `GET /api/process-url/<jobId>` using the same Bearer token on every GET
+request. Only the verified upload owner can retrieve the image job. The mobile
+endpoint returns `jobId`, `status`, `uploadedImageId`, `suggested_title`, `error`,
+and `result`. A completed image job includes the extracted `places`, `placeIds`,
+and other result fields in `result`; failed jobs expose their error in `error`.
+The alternative `GET /api/url-jobs?id=<jobId>` continues to return those fields
+inside `job`. Polling does not rerun extraction.
 A pending production upload older than six minutes reports a timeout rather than
 leaving mobile polling indefinitely. Image jobs require no new migration.
 The anonymous local Postman flow continues to return its result directly.
 
-Run `npm run test:image-jobs` for submission, background completion, polling,
-ownership, failure, and URL regression checks using provider and database fixtures.
+Run `npm run test:image-jobs` for mobile polling, ownership, failure, and URL
+response regression checks using authentication and database fixtures.
 
 Run `npm run test:image-auth` for authentication and upload regression checks.
 They use real RSA signatures and JWKS verification, with provider and persistence
