@@ -43,8 +43,18 @@ The client must send a current Clerk session token in `Authorization: Bearer …
 
 Authenticated multipart image uploads store the images and return HTTP `202`
 with `success: true`, `status: "queued"`, `jobId`, and `uploadedImageId`. The upload
-record's ID is the image job ID. Analysis runs after the response, independently
-of the URL worker, and stores the complete result on the upload record.
+record's ID is the image job ID. Apply
+`supabase/migration_v36_uploaded_image_accesses.sql` after v30/v31, the platform
+extension in v32, and v34. It adds `social_post_accesses.uploaded_image_id` as a
+foreign key to `uploaded_images.id` and backfills all existing uploads. Each image
+has one `event: "job"`, `platform: "upload"` row, with the same ID as the upload.
+Database triggers synchronize the owner, status, error, and complete saved result
+atomically when an upload is created or updated. Deleting an upload removes its
+access rows. Anonymous local uploads are recorded with a null owner and remain
+inaccessible through authenticated image-job APIs.
+Analysis runs after the response, independently of the URL worker; URL workers
+and URL lookups exclude image jobs. Image polling reads the shared job table,
+with a fallback for older uploads during migration rollout.
 
 Poll `GET /api/process-url/<jobId>` using the same Bearer token on every GET
 request. Only the verified upload owner can retrieve the image job. The mobile
@@ -61,11 +71,20 @@ social post matches. Images remain in `uploaded_images`, so `socialPostId` stays
 null. Mobile code must use `uploadedImageId` or the returned image result when
 handling image jobs, rather than require an ID from `social_posts`.
 A pending production upload older than six minutes reports a timeout rather than
-leaving mobile polling indefinitely. Image jobs require no new migration.
+leaving mobile polling indefinitely.
 The anonymous local Postman flow continues to return its result directly.
 
-Run `npm run test:image-jobs` for mobile polling, ownership, failure, and URL
-response regression checks using authentication and database fixtures.
+Run the image-access database checks with:
+
+```powershell
+npm.cmd install --prefix tmp/image-job-db-check --no-save --package-lock=false @electric-sql/pglite
+node --test tests/image-accesses-db.test.mjs
+```
+
+These execute the migration, backfill, triggers, constraints, RLS, and worker
+claims in an isolated PostgreSQL runtime, with the actual services and polling
+routes. The test dependency stays under ignored `tmp`; production dependencies
+are unchanged. Apply v36 in the Supabase SQL Editor before redeploying the API.
 
 Run `npm run test:image-auth` for authentication and upload regression checks.
 They use real RSA signatures and JWKS verification, with provider and persistence

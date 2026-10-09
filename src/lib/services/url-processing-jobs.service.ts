@@ -58,6 +58,7 @@ export class UrlProcessingJobsService {
       .eq('id', id)
       .eq('user_id', userId)
       .eq('event', 'job')
+      .in('platform', ['instagram', 'tiktok', 'youtube', 'facebook'])
       .maybeSingle();
     if (error) throw new Error(`Unable to read processing job: ${error.message}`);
     return data as UrlProcessingJob | null;
@@ -75,6 +76,7 @@ export class UrlProcessingJobsService {
       .eq('user_id', userId)
       .eq('canonical_source_key', canonicalSourceKey)
       .eq('event', 'job')
+      .in('platform', ['instagram', 'tiktok', 'youtube', 'facebook'])
       .order('created_at', { ascending: true })
       .limit(1)
       .maybeSingle();
@@ -89,6 +91,7 @@ export class UrlProcessingJobsService {
       .select(JOB_COLUMNS)
       .eq('id', id)
       .eq('event', 'job')
+      .in('platform', ['instagram', 'tiktok', 'youtube', 'facebook'])
       .maybeSingle();
     if (error) throw new Error(`Unable to read processing job: ${error.message}`);
     return data as UrlProcessingJob | null;
