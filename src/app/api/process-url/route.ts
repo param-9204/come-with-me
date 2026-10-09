@@ -426,8 +426,12 @@ async function handleImageUpload(request: Request, authUser: Awaited<ReturnType<
       visionFrameCount: media.visionFrames.length,
       ocrFrameCount: media.ocrFrames.length,
     }, warnings.length ? 'partial' : 'completed');
+    // Image analysis finishes in this request; mobile can consume the places
+    // directly without creating or polling a URL processing job.
     return NextResponse.json({
       success: true,
+      status: 'completed',
+      processing: false,
       partial: warnings.length > 0,
       error: warnings.length ? warnings.join(' ') : null,
       warnings,
@@ -448,7 +452,7 @@ async function handleImageUpload(request: Request, authUser: Awaited<ReturnType<
         gptVision: { frames: media.visionFrames, allTexts: gptTexts, allBrands: [], allLocations: [], allPrices: [], allCtas: [], totalFramesProcessed: media.visionFrames.length, processingTimeMs: 0 },
       },
       audioUpload: null,
-    });
+    }, { status: 200 });
   } catch (error: any) {
     const message = error?.message || 'Image upload processing failed';
     log.fail(error, { uploadedImageId, failedStage: 'image-upload' });

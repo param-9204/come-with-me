@@ -41,6 +41,12 @@ It supports an explicitly configured HTTPS production Clerk domain as well;
 replace the value when mobile migrates to its production Clerk instance.
 The client must send a current Clerk session token in `Authorization: Bearer …`.
 
+Multipart image uploads finish processing before returning HTTP `200`. The JSON
+contains `success: true`, `status: "completed"`, `processing: false`,
+`uploadedImageId`, and the extracted `places` and `placeIds` directly. The mobile
+image handler should consume this result immediately; images have no `jobId`.
+URL submissions continue to return a `jobId` for the existing polling flow.
+
 Run `npm run test:image-auth` for authentication and upload regression checks.
 They use real RSA signatures and JWKS verification, with provider and persistence
 fixtures rather than live Clerk sessions or database writes. After deploying,
