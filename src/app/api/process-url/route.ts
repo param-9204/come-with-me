@@ -252,18 +252,15 @@ const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif']);
 
 /**
- * Resolve an authenticated owner using the same Clerk identity sources as the
- * JSON URL-processing path. `proxy.ts` strips client-supplied identity headers
- * and sets x-user-id only after Clerk has authenticated the request.
+ * Resolve the upload owner from the verified identity returned by getAuthUser.
+ * Client-supplied form fields and identity headers cannot establish ownership.
  */
 async function resolveImageUploadUser(
-  request: Request,
   authUser: Awaited<ReturnType<typeof getAuthUser>>,
 ): Promise<string | null> {
-  const proxyUserId = request.headers.get('x-user-id');
   return resolveProfileId({
     clerkId: authUser?.clerkId,
-    userIdInput: proxyUserId || authUser?.id,
+    userIdInput: authUser?.id,
     email: authUser?.email,
   });
 }
@@ -298,10 +295,22 @@ function uploadContent(uploadId: string, imageUrls: string[], caption: string): 
 }
 
 async function handleImageUpload(request: Request, authUser: Awaited<ReturnType<typeof getAuthUser>>) {
-  const finalUserId = await resolveImageUploadUser(request, authUser);
   const isLocalDevelopment = process.env.NODE_ENV === 'development';
-  if (!finalUserId && !isLocalDevelopment) {
-    return NextResponse.json({ success: false, error: 'Authentication is required for image uploads' }, { status: 401 });
+  if (!authUser && !isLocalDevelopment) {
+    return NextResponse.json({
+      success: false,
+      code: 'AUTHENTICATION_REQUIRED',
+      error: 'Authentication is required for image uploads',
+    }, { status: 401 });
+  }
+  const finalUserId = authUser ? await resolveImageUploadUser(authUser) : null;
+  if (authUser && !finalUserId) {
+    console.error('[Image Upload API] Verified identity could not be resolved to a profile.');
+    return NextResponse.json({
+      success: false,
+      code: 'PROFILE_RESOLUTION_FAILED',
+      error: 'Unable to resolve the authenticated upload owner. Please retry.',
+    }, { status: 500 });
   }
 
   const formData = await request.formData();
@@ -709,7 +718,7 @@ export async function POST(request: Request) {
     //    Mobile sends clerk_user_id; a verified Clerk token can provide it instead.
     const authUser = await getAuthUser(request);
     if ((request.headers.get('content-type') || '').toLowerCase().includes('multipart/form-data')) {
-      return handleImageUpload(request, authUser);
+      return await handleImageUpload(request, authUser);
     }
     const headerUserId = request.headers.get('x-user-id');
     const body = await request.json();

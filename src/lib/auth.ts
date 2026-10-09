@@ -32,7 +32,7 @@ async function verifyTrustedMobileClerkToken(token: string, issuer: string | nul
   const trustedIssuer = process.env.CLERK_MOBILE_ISSUER?.trim().replace(/\/$/, '');
   const normalizedIssuer = issuer?.trim().replace(/\/$/, '');
   if (!trustedIssuer || !normalizedIssuer || normalizedIssuer !== trustedIssuer) {
-    console.error('[Auth] Mobile Clerk issuer is not trusted by this deployment.', {
+    console.error('[Auth] Mobile Clerk issuer is not trusted by this deployment. Configure CLERK_MOBILE_ISSUER to the trusted mobile Clerk issuer and redeploy.', {
       tokenIssuer: normalizedIssuer || null,
       mobileIssuerConfigured: !!trustedIssuer,
     });
@@ -174,53 +174,15 @@ export async function getAuthUser(request?: Request) {
         } catch (clerkError: any) {
           console.error('[Auth] ❌ Clerk JWT verification failed (primary key):', clerkError.message);
 
-          // B. JWKS kid mismatch — the mobile token may come from a different Clerk instance.
-          //    Decode the token issuer and fetch JWKS directly from that instance.
-          //    This handles test-instance vs live-instance token mismatch.
-          const issuer = decodeTokenIssuer(token);
-          console.log('[Auth] Token issuer (iss):', issuer);
-
-          const mobileIssuerUser = await verifyTrustedMobileClerkToken(token, issuer);
-          if (mobileIssuerUser) {
-            console.log('[Auth] Clerk JWT verified with trusted mobile issuer. clerkId:', mobileIssuerUser.clerkId);
-            return mobileIssuerUser;
-          }
-
-          if (issuer && issuer.includes('clerk')) {
-            try {
-              // verifyToken accepts jwtKey as a raw JWKS URL or a PEM,
-              // but the cleanest cross-instance approach is: fetch JWKS from the issuer.
-              const jwksUrl = `${issuer}/.well-known/jwks.json`;
-              console.log('[Auth] Fetching JWKS from:', jwksUrl);
-
-              const jwksRes = await fetch(jwksUrl);
-              if (jwksRes.ok) {
-                const jwks = await jwksRes.json();
-                // Use the raw JWKS JSON string as jwtKey (Clerk backend supports this)
-                const verified = await verifyToken(token, {
-                  jwtKey: JSON.stringify(jwks),
-                  authorizedParties: [],
-                });
-                const clerkId = verified.sub;
-                if (clerkId) {
-                  const userUuid = uuidv5(clerkId, CLERK_UUID_NAMESPACE);
-                  const email = (verified as any).email || (verified as any)?.sessionClaims?.email || null;
-                  console.log('[Auth] ✅ Clerk JWT verified (cross-instance JWKS). clerkId:', clerkId);
-                  return {
-                    id: userUuid,
-                    clerkId,
-                    email,
-                    tokenType: 'clerk_jwt' as const,
-                  };
-                }
-              } else {
-                console.error('[Auth] Failed to fetch JWKS from issuer:', jwksRes.status);
-              }
-            } catch (crossErr: any) {
-              console.error('[Auth] ❌ Cross-instance Clerk JWT verification failed:', crossErr.message);
-            }
-          }
         }
+      }
+
+      // Mobile may use a different Clerk instance. Its issuer must be explicitly
+      // trusted, and its JWT signature must verify against that issuer's JWKS.
+      const mobileIssuerUser = await verifyTrustedMobileClerkToken(token, decodeTokenIssuer(token));
+      if (mobileIssuerUser) {
+        console.log('[Auth] Clerk JWT verified with trusted mobile issuer. clerkId:', mobileIssuerUser.clerkId);
+        return mobileIssuerUser;
       }
 
       // C. Supabase JWT fallback (if mobile uses Supabase Auth)
