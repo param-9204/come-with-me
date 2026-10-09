@@ -58,7 +58,7 @@ with a fallback for older uploads during migration rollout.
 
 Poll `GET /api/process-url/<jobId>` using the same Bearer token on every GET
 request. Only the verified upload owner can retrieve the image job. The mobile
-endpoint returns `jobId`, `status`, `uploadedImageId`, `suggested_title`, `error`,
+endpoint returns `jobId`, `status`, `uploadedImageId`, `sourceType: "uploaded_image"`, `suggested_title`, `error`,
 and `result`. A completed image job includes the extracted `places`, `placeIds`,
 and other result fields in `result`; failed jobs expose their error in `error`.
 The alternative `GET /api/url-jobs?id=<jobId>` continues to return those fields
@@ -67,8 +67,9 @@ Completed mobile image polls also expose `data`, `places`, and the other saved
 result fields at the top level. Fetch an image result with
 `GET /api/process-url?uploadedImageId=<uploadedImageId>` and the same Bearer token;
 `GET /api/process-url?id=<uploadedImageId>` also resolves an owned image when no
-social post matches. Images remain in `uploaded_images`, so `socialPostId` stays
-null. Mobile code must use `uploadedImageId` or the returned image result when
+social post matches. Image responses omit `socialPostId` and `socialPostStatus`,
+including older saved results; URL responses retain those fields. Mobile code
+must preserve `uploadedImageId`, `sourceType`, `data`, `places`, and `result` when
 handling image jobs, rather than require an ID from `social_posts`.
 A pending production upload older than six minutes reports a timeout rather than
 leaving mobile polling indefinitely.

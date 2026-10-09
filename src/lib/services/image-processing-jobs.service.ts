@@ -5,6 +5,18 @@ import { supabaseAdmin } from '@/lib/supabase';
 const IMAGE_JOB_TIMEOUT_MS = 6 * 60_000;
 const IMAGE_JOB_TIMEOUT_MESSAGE = 'Image processing timed out. Please upload the images again.';
 
+/** Normalize older saved image results without mutating their persisted data. */
+function imageResultForResponse(
+  result: Record<string, unknown> | null | undefined,
+  uploadedImageId: string,
+): Record<string, unknown> | null {
+  if (!result) return null;
+  const imageResult = { ...result };
+  delete imageResult.socialPostId;
+  delete imageResult.socialPostStatus;
+  return { ...imageResult, uploadedImageId, sourceType: 'uploaded_image' };
+}
+
 export class ImageProcessingJobsService {
   /** Upload IDs are image job IDs; only the verified upload owner can poll. */
   static async getJobForUser(id: string, userId: string) {
@@ -27,13 +39,13 @@ export class ImageProcessingJobsService {
         id: job.id,
         sourceUrl: job.source_url || null,
         status,
-        socialPostId: null,
+        sourceType: 'uploaded_image',
         uploadedImageId: job.uploaded_image_id,
         attemptCount: 1,
         maxAttempts: 1,
         retryAt: null,
         error: timedOut ? IMAGE_JOB_TIMEOUT_MESSAGE : status === 'failed' ? job.last_error : null,
-        result: status === 'completed' ? job.result : null,
+        result: status === 'completed' ? imageResultForResponse(job.result, job.uploaded_image_id) : null,
         createdAt: job.created_at,
         updatedAt: job.updated_at,
       };
@@ -57,13 +69,13 @@ export class ImageProcessingJobsService {
       id: upload.id,
       sourceUrl: upload.image_urls?.[0] || null,
       status,
-      socialPostId: null,
+      sourceType: 'uploaded_image',
       uploadedImageId: upload.id,
       attemptCount: 1,
       maxAttempts: 1,
       retryAt: null,
       error: timedOut ? IMAGE_JOB_TIMEOUT_MESSAGE : status === 'failed' ? upload.error_message : null,
-      result: status === 'completed' ? upload.ai_analysis?.upload_processing?.result || null : null,
+      result: status === 'completed' ? imageResultForResponse(upload.ai_analysis?.upload_processing?.result, upload.id) : null,
       createdAt: upload.created_at,
       updatedAt: upload.updated_at,
     };

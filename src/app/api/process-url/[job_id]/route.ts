@@ -30,7 +30,7 @@ export async function GET(
         success: true,
         jobId: imageJob.id,
         status: imageJob.status,
-        socialPostId: imageJob.socialPostId,
+        sourceType: imageJob.sourceType,
         uploadedImageId: imageJob.uploadedImageId,
         attemptCount: imageJob.attemptCount,
         maxAttempts: imageJob.maxAttempts,
