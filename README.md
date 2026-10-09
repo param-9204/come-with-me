@@ -53,6 +53,13 @@ and `result`. A completed image job includes the extracted `places`, `placeIds`,
 and other result fields in `result`; failed jobs expose their error in `error`.
 The alternative `GET /api/url-jobs?id=<jobId>` continues to return those fields
 inside `job`. Polling does not rerun extraction.
+Completed mobile image polls also expose `data`, `places`, and the other saved
+result fields at the top level. Fetch an image result with
+`GET /api/process-url?uploadedImageId=<uploadedImageId>` and the same Bearer token;
+`GET /api/process-url?id=<uploadedImageId>` also resolves an owned image when no
+social post matches. Images remain in `uploaded_images`, so `socialPostId` stays
+null. Mobile code must use `uploadedImageId` or the returned image result when
+handling image jobs, rather than require an ID from `social_posts`.
 A pending production upload older than six minutes reports a timeout rather than
 leaving mobile polling indefinitely. Image jobs require no new migration.
 The anonymous local Postman flow continues to return its result directly.

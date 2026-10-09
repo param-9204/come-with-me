@@ -13,6 +13,7 @@ import type { AudioUploadRef } from '@/lib/services/media-evidence.service';
 import { v4 as uuidv4 } from 'uuid';
 import { resolveCanonicalSocialSource } from '@/lib/social-source';
 import { UrlProcessingJobsService, type UrlProcessingJobStatus } from '@/lib/services/url-processing-jobs.service';
+import { ImageProcessingJobsService } from '@/lib/services/image-processing-jobs.service';
 import { urlJobWorkerSecret } from '@/lib/url-job-worker';
 
 export const maxDuration = 300;
@@ -1186,11 +1187,30 @@ export async function POST(request: Request) {
   }
 }
 
+async function uploadedImageResponse(request: Request, uploadedImageId: string) {
+  const user = await getAuthUser(request);
+  const userId = user && await resolveProfileId({ clerkId: user.clerkId, userIdInput: user.id, email: user.email });
+  const job = userId && await ImageProcessingJobsService.getJobForUser(uploadedImageId, userId);
+  if (!job) return NextResponse.json({ success: false, error: 'Post not found' }, { status: 404 });
+
+  return NextResponse.json(job.result || {
+    success: job.status !== 'failed',
+    status: job.status,
+    processing: job.status === 'processing',
+    socialPostId: null,
+    uploadedImageId: job.uploadedImageId,
+    error: job.error,
+  }, { headers: { 'Cache-Control': 'private, no-store' } });
+}
+
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
     const id = searchParams.get('id');
     const url = searchParams.get('url');
+    const uploadedImageId = searchParams.get('uploadedImageId');
+
+    if (uploadedImageId) return await uploadedImageResponse(request, uploadedImageId);
 
     if (!id && !url) {
       return NextResponse.json({ error: 'id or url is required' }, { status: 400 });
@@ -1222,6 +1242,7 @@ export async function GET(request: Request) {
     }
 
     if (!posts || posts.length === 0) {
+      if (id) return await uploadedImageResponse(request, id);
       return NextResponse.json({ success: false, error: 'Post not found' }, { status: 404 });
     }
 

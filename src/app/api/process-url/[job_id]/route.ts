@@ -24,6 +24,9 @@ export async function GET(
       if (!imageJob) return NextResponse.json({ success: false, error: 'Job not found' }, { status: 404 });
 
       return NextResponse.json({
+        // Completed image jobs expose the same result fields as post retrieval,
+        // while retaining result for clients that read the polling envelope.
+        ...(imageJob.result || {}),
         success: true,
         jobId: imageJob.id,
         status: imageJob.status,
