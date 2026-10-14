@@ -336,11 +336,26 @@ function validSuggestedTitle(value: unknown): string | null {
  * A model may omit the optional title even after it has returned grounded,
  * accepted places. Keep the title contract useful in that case without
  * inventing a venue, category, or location: the fallback states only the
- * verified place count and, when it is unambiguous, their shared city.
+ * verified geographic focus when available, otherwise the place count and,
+ * when it is unambiguous, their shared city.
  */
-function suggestedTitleFromVerifiedPlaces(places: PlaceExtraction[]): string | null {
+function suggestedTitleFromVerifiedPlaces(places: PlaceExtraction[], geographicFocus: unknown): string | null {
   const accepted = places.filter((place) => Boolean(str(place.name)));
   if (accepted.length === 0) return null;
+
+  const focuses = new Map<string, string>();
+  for (const value of strList(geographicFocus)) {
+    const focus = value.replace(/\s+/g, ' ');
+    focuses.set(focus.toLocaleLowerCase(), focus);
+  }
+  if (focuses.size === 1) {
+    const focus = [...focuses.values()][0];
+    const focusWords = focus.match(/[\p{L}\p{N}]+(?:['-][\p{L}\p{N}]+)*/gu) || [];
+    if (focusWords.length <= 2) {
+      const focusedTitle = validSuggestedTitle(`${focus} Travel Destinations Guide`);
+      if (focusedTitle) return focusedTitle;
+    }
+  }
 
   const cityCounts = new Map<string, { city: string; count: number }>();
   for (const place of accepted) {
@@ -1715,7 +1730,7 @@ export class AiEnrichmentService {
     const ocrAvailable = bundle.items.some((item) => item.source === 'ocr' || item.source === 'vision_ocr');
     const transcriptItems = bundle.items.filter((item) => item.source === 'speech');
     const transcriptText = transcriptItems.map((item) => item.text).join(' ');
-    const suggestedTitle = validSuggestedTitle(parsed.suggested_title) || suggestedTitleFromVerifiedPlaces(places);
+    const suggestedTitle = validSuggestedTitle(parsed.suggested_title) || suggestedTitleFromVerifiedPlaces(places, parsed.geographic_focus);
     if (!validSuggestedTitle(parsed.suggested_title) && suggestedTitle) {
       plog('model', 'Used verified-place suggested title fallback', {
         title: suggestedTitle,
