@@ -1,6 +1,7 @@
 import { executeAICall, supportsTemperature } from './ai-client';
 import { LocationService } from './location.service';
 import { plog } from './pipeline-log';
+import { isCountryName, stripCountryFromCity } from '@/lib/country';
 import {
   BASE_CATEGORIES, GENERIC_NAMES, buildEvidence, formatEvidenceForPrompt, mergeSameEntities, normalizeForMatch, resolveHiddenGem,
   sanitizeCandidateLocation, scoreAndFilterCandidates,
@@ -191,14 +192,14 @@ METHOD — work through these steps in order
 4. FIELDS. Split each candidate's text into fields:
    - name: the venue's own name only, as written. Remove words that are not part of the name: cuisine or type tags ("Hangawi-korean" → "Hangawi", "Uptown thai- Thai" → "Uptown thai"), notes and rules ("Indian accent - children under 10 not allowed" → "Indian accent", "NY dosas - food cart" → "NY dosas"), prices, hours, ratings, numbering, emoji, pins, "@", and a trailing phrase that only repeats the city ("Salswee in NYC" → "Salswee"). Keep words that belong to the name ("Tamarind Tribeca", "Joe's Pizza", "Franchia Vegan"). Put the removed descriptive words in "description".
    - address: a street address written with the place (same line, list item, slide or moment), copied exactly ("140 N. 2nd", "209 Chestnut St"). A line that is only an address is never a place: attach it to the venue on the same line, slide or moment. A street sign in the scene ("W 23 St") is not an address.
-   - neighborhood and city: from step 2, in this order: the place's own line, then its section, then the whole post. When the place's own line names another town, state or country ("📍 Weehawken NJ Waterfront"), that is its city, even in a post about a different city.
+   - neighborhood and city: from step 2, in this order: the place's own line, then its section, then the whole post. When the place's own line names another town or city ("📍 Weehawken Waterfront"), that is its city. NEVER put a country name (e.g. "China", "United States", "France", "Japan") in the city field.
 5. ROLE. featured = shown, visited, reviewed · recommended = suggested but not shown · mentioned_only = comparison, joke, "better than X", passing reference, other people's suggestions · background = visible but not the subject (a logo on a cup, a passing sign, a photo credit). Every entry of the creator's own guide, list or itinerary is featured or recommended, never mentioned_only ("Day 2 - Evening plans @brasseriecognac", "SHOPS: Vowels, PHOS").
 6. CHECK. Count the list items and venue labels you found in step 3 and make sure every one is in "places"; a venue listed twice is returned once. Never stop early, summarise, or trust a stated count ("top 5" with 7 entries → 7).
 
 WHAT IS A PLACE
 A specific, named, physical location someone can visit: restaurant, cafe, bar, club, shop, market, food cart or truck, hotel, museum, gallery, park, beach, trail, viewpoint, landmark, street, or a town/island that is itself the destination.
 Not places: people, the creator, DJs/artists, the audio track, brands or products with no specific location (a drink brand, an app), dishes, events without a venue, generic phrases ("this cafe", "the best pizza spot"), website addresses and watermarks.
-A city, state, or country that only says WHERE the other places are is location context: put it in those places' "city" field instead of returning it as a place.
+A city or neighborhood that only says WHERE the other places are is location context: put the city name in those places' "city" field instead of returning it as a place. NEVER put a country name in the "city" field; if only a country is mentioned with no city, leave "city" as "".
 
 NAME
 - Fix an OCR letter error only when another line confirms the spelling (O3 "CAFE LUMIFRE" + A1 "Café Lumière" → "Café Lumière").
@@ -359,9 +360,11 @@ function suggestedTitleFromVerifiedPlaces(places: PlaceExtraction[], geographicF
 
   const cityCounts = new Map<string, { city: string; count: number }>();
   for (const place of accepted) {
-    const city = str(place.city).replace(/\s+/g, ' ');
+    const rawCity = str(place.city).replace(/\s+/g, ' ');
+    const stripped = stripCountryFromCity(rawCity);
+    const city = isCountryName(stripped) ? '' : stripped;
     const key = city.toLocaleLowerCase();
-    if (!key) continue;
+    if (!key || isCountryName(key)) continue;
     const entry = cityCounts.get(key);
     cityCounts.set(key, { city, count: (entry?.count || 0) + 1 });
   }
@@ -466,13 +469,16 @@ export function parseCandidates(raw: string): RawPlaceCandidate[] {
     // matching the venue ("Hangawi-korean" vs Google's "Hangawi").
     const { name, note } = splitNameDescriptor(cleanedName, str(value.city));
     const description = str(value.description) || note;
+    const rawCity = str(value.city);
+    const cleanedCity = stripCountryFromCity(rawCity);
+    const candidateCity = isCountryName(cleanedCity) ? '' : cleanedCity;
     candidates.push({
       name,
       mention_type: oneOf(value.mention_type, MENTION_TYPES, 'explicit'),
       role: oneOf(value.role, ROLES, 'featured'),
       name_evidence: strList(value.name_evidence),
       location_evidence: strList(value.location_evidence),
-      city: str(value.city),
+      city: candidateCity,
       neighborhood: str(value.neighborhood),
       address: str(value.address),
       base_category: base,
@@ -760,8 +766,10 @@ function applySharedGeoContext(
 
   const cityCounts = new Map<string, { display: string; count: number }>();
   for (const place of places) {
-    const city = (place.city || '').trim();
-    if (!city) continue;
+    const rawCity = (place.city || '').trim();
+    const stripped = stripCountryFromCity(rawCity);
+    const city = isCountryName(stripped) ? '' : stripped;
+    if (!city || isCountryName(city)) continue;
     const key = city.toLowerCase();
     const prev = cityCounts.get(key);
     cityCounts.set(key, { display: prev?.display || city, count: (prev?.count || 0) + 1 });

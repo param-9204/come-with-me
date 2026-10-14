@@ -2,6 +2,7 @@ import { supabaseAdmin } from '../supabase';
 import { resolveProfileId } from '../auth';
 import type { SocialContent, AiAnalysisResult, ApifyOcrFrameResult, GptVisionFrameResult, PlaceExtraction, PlaceCategory } from '../types/social';
 import { LocationService, type GeocodeResult } from './location.service';
+import { isCountryName } from '@/lib/country';
 import { AiEnrichmentService } from './ai-enrichment.service';
 import { ScraperService } from './scraper.service';
 import { googleTypeConflict, reconcileCategoryWithGoogle } from './place-evidence.service';
@@ -269,7 +270,7 @@ export class DbService {
     try {
       let coords = await LocationService.geocodePlace(
         placeData.map_name || placeData.name,
-        city || '',
+        city || placeData.city || '',
         address,
         neighborhood,
         { kind: LocationService.kindForCategory(placeData.base_category || placeData.category) }
@@ -431,7 +432,7 @@ export class DbService {
 
     // Ensure the city is recorded in our cities table
     const cityName = LocationService.cleanCityName(city);
-    if (cityName) {
+    if (cityName && !isCountryName(cityName)) {
       try {
         // Query cities table first to avoid redundant geocoding & upsert
         const { data: existingCity } = await supabaseAdmin

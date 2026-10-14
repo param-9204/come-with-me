@@ -1,6 +1,7 @@
 import * as stringSimilarity from 'string-similarity';
 import { plog, recordPipelineOperation } from './pipeline-log';
 import { MapboxService, type MapboxFeature } from './mapbox.service';
+import { isCountryName, getCountryCode, stripCountryFromCity } from '@/lib/country';
 
 export type GeocodeResult = {
   lat: number | null;
@@ -57,10 +58,11 @@ const EUROPEAN_NUMBER_FIRST_RE = new RegExp(String.raw`^\d{1,5}(?:\s?(?:bis|ter|
 const EUROPEAN_NUMBER_LAST_RE = new RegExp(String.raw`^(?:(?:${EUROPEAN_STREET_WORDS})\.?\s+\p{L}.*|\p{L}+(?:straße|strasse|gasse|weg|platz|allee|straat|laan|gracht))\s\d{1,5}[a-z]?$`, 'iu');
 /** Words that follow a number in prose or list headings, never a street name. */
 const ADDRESS_COUNT_WORDS = new Set([
-  'stars', 'days', 'nights', 'hours', 'hrs', 'minutes', 'mins', 'people', 'guests', 'reasons', 'spots', 'places', 'things',
+  'stars', 'days', 'nights', 'hours', 'hrs', 'minutes', 'mins', 'people', 'guests', 'reasons', 'spots', 'places', 'place', 'things',
   'ways', 'items', 'dollars', 'euros', 'bucks', 'percent', 'years', 'times', 'courses', 'dishes', 'restaurants', 'cafes',
   'bars', 'best', 'top', 'must', 'favorite', 'favourite', 'blocks', 'floors', 'stories', 'pieces', 'slices', 'tips', 'steps',
   'likes', 'followers', 'views', 'comments', 'guys', 'girls', 'friends', 'photos', 'min', 'km', 'miles', 'cozy', 'new',
+  'beautiful', 'stunning', 'breathtaking', 'destinations', 'attractions', 'wonders', 'gems', 'locations',
 ]);
 
 /**
@@ -176,6 +178,26 @@ const CITY_ALIASES: Record<string, CityInfo> = {
   blr: { name: 'Bengaluru', country: 'IN' },
   bangalore: { name: 'Bengaluru', country: 'IN' },
   bengaluru: { name: 'Bengaluru', country: 'IN' },
+  taizhou: { name: 'Taizhou', country: 'CN' },
+  'tai zhou': { name: 'Taizhou', country: 'CN' },
+  'tai zhou shi': { name: 'Taizhou', country: 'CN' },
+  xianju: { name: 'Taizhou', country: 'CN' },
+  'xian ju': { name: 'Taizhou', country: 'CN' },
+  shenxianju: { name: 'Taizhou', country: 'CN' },
+  'shen xian ju': { name: 'Taizhou', country: 'CN' },
+  hangzhou: { name: 'Hangzhou', country: 'CN' },
+  'hang zhou': { name: 'Hangzhou', country: 'CN' },
+  shanghai: { name: 'Shanghai', country: 'CN' },
+  beijing: { name: 'Beijing', country: 'CN' },
+  shenzhen: { name: 'Shenzhen', country: 'CN' },
+  guangzhou: { name: 'Guangzhou', country: 'CN' },
+  chengdu: { name: 'Chengdu', country: 'CN' },
+  xian: { name: "Xi'an", country: 'CN' },
+  'xi an': { name: "Xi'an", country: 'CN' },
+  chongqing: { name: 'Chongqing', country: 'CN' },
+  suzhou: { name: 'Suzhou', country: 'CN' },
+  wuhan: { name: 'Wuhan', country: 'CN' },
+  nanjing: { name: 'Nanjing', country: 'CN' },
 };
 
 /** Google Maps is the only geocoding provider used by this service. */
@@ -205,9 +227,13 @@ export class LocationService {
 
   static cleanCityName(city: string | null | undefined): string {
     if (!city?.trim()) return '';
-    let cleaned = city.trim().split(',')[0].trim();
+    const withoutCountry = stripCountryFromCity(city);
+    if (!withoutCountry || isCountryName(withoutCountry)) return '';
+    let cleaned = withoutCountry.trim().split(',')[0].trim();
+    if (isCountryName(cleaned)) return '';
     cleaned = cleaned.replace(/^(city|town|borough|village|county|municipality|township)\s+of\s+/i, '');
     const normalized = this.normalize(cleaned);
+    if (isCountryName(normalized)) return '';
     if (CITY_ALIASES[normalized]) return CITY_ALIASES[normalized].name;
 
     const legitimateCityNames = new Set([
@@ -218,14 +244,15 @@ export class LocationService {
       'foster city', 'yuba city', 'cathedral city', 'sun city', 'universal city', 'city of industry',
     ]);
     if (!legitimateCityNames.has(normalized)) {
-      cleaned = cleaned.replace(/\s+(city|county|township|borough|municipality)$/i, '');
+      cleaned = cleaned.replace(/\s+(city|county|township|borough|municipality|shi|sheng|xian)$/i, '');
     }
     const normalizedAfterSuffixRemoval = this.normalize(cleaned);
+    if (isCountryName(normalizedAfterSuffixRemoval)) return '';
     if (CITY_ALIASES[normalizedAfterSuffixRemoval]) return CITY_ALIASES[normalizedAfterSuffixRemoval].name;
     if (cleaned === cleaned.toLowerCase() || cleaned === cleaned.toUpperCase()) {
       cleaned = cleaned.replace(/\w\S*/g, (word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase());
     }
-    return cleaned;
+    return isCountryName(cleaned) ? '' : cleaned;
   }
 
   static detectCityFromText(text: string | null | undefined): string {
@@ -248,7 +275,17 @@ export class LocationService {
 
   private static cityInfo(city: string): CityInfo {
     const cleaned = this.cleanCityName(city);
-    return CITY_ALIASES[this.normalize(cleaned)] || { name: cleaned };
+    if (!cleaned) {
+      const countryCode = getCountryCode(city);
+      if (countryCode) {
+        return { name: '', country: countryCode };
+      }
+      return { name: '' };
+    }
+    const aliasInfo = CITY_ALIASES[this.normalize(cleaned)];
+    if (aliasInfo) return aliasInfo;
+    const countryCode = getCountryCode(city) || (city.includes(',') ? getCountryCode(city.split(',').pop()?.trim()) : null);
+    return countryCode ? { name: cleaned, country: countryCode } : { name: cleaned };
   }
 
   /**
@@ -483,8 +520,10 @@ export class LocationService {
 
   private static googlePlaceCity(place: GooglePlace): string | null {
     const components = place.addressComponents || [];
-    const city = this.componentValue(components, ['locality', 'postal_town', 'administrative_area_level_3']);
-    return city ? this.cleanCityName(city) : null;
+    const city = this.componentValue(components, ['locality', 'postal_town', 'administrative_area_level_3', 'administrative_area_level_2']);
+    if (!city) return null;
+    const cleaned = this.cleanCityName(city);
+    return isCountryName(cleaned) ? null : (cleaned || null);
   }
 
   private static googlePlaceNeighborhood(place: GooglePlace): string | null {
@@ -594,11 +633,12 @@ export class LocationService {
     const lat = place.location?.latitude;
     const lng = place.location?.longitude;
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) return this.emptyResult();
+    const city = this.googlePlaceCity(place) || this.cleanCityName(fallbackCity) || null;
     return {
       lat: lat as number,
       lng: lng as number,
       formattedAddress: place.formattedAddress || null,
-      city: this.googlePlaceCity(place) || this.cleanCityName(fallbackCity) || null,
+      city: isCountryName(city) ? null : city,
       neighborhood: this.googlePlaceNeighborhood(place),
       // A Mapbox id must never be stored or used as a Google place id.
       placeId: place.provider === 'mapbox' ? null : place.id || null,
@@ -708,11 +748,13 @@ export class LocationService {
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) return this.emptyResult();
     const components = result.address_components || [];
     const read = (types: string[]) => components.find((item) => item.types?.some((type) => types.includes(type)))?.long_name || null;
+    const rawCity = read(['locality', 'postal_town', 'administrative_area_level_3', 'administrative_area_level_2']) || fallbackCity;
+    const cleanedCity = this.cleanCityName(rawCity);
     return {
       lat: lat as number,
       lng: lng as number,
       formattedAddress: result.formatted_address || null,
-      city: this.cleanCityName(read(['locality', 'postal_town', 'administrative_area_level_3']) || fallbackCity) || null,
+      city: isCountryName(cleanedCity) ? null : (cleanedCity || null),
       neighborhood: read(['neighborhood', 'sublocality_level_2']),
     };
   }
@@ -730,10 +772,10 @@ export class LocationService {
     if (/^\d{4}\s+(?:by|in|from|for|with|was|were|is|are|founded|established|opened|created|built|since|two|three|four|five|six|seven|eight|nine|ten)\b/i.test(address)) {
       return '';
     }
-    // List headings such as "5 cozy restaurants" are commonly mangled by OCR
-    // into a fake address like "5 cozy Street". Never use them to constrain a
-    // provider lookup or satisfy the persistence address gate.
-    if (/^\d{1,6}\s+(?:cozy|best|top|great|favorite|popular|new|nice|amazing|restaurants?|cafes?|bars?|places?|spots?)\b/i.test(address)) {
+    // List headings such as "5 cozy restaurants" or "5 Beautiful Places" are commonly
+    // mangled by OCR into a fake address like "5 cozy Street" or "5 Beautiful Place".
+    // Never use them to constrain a provider lookup or satisfy the persistence address gate.
+    if (/^\d{1,6}\s+(?:cozy|best|top|great|favorite|favourite|popular|new|nice|amazing|beautiful|stunning|breathtaking|secret|hidden|iconic|famous|epic|underrated|insane|cool|must|must-see|restaurants?|cafes?|bars?|places?|spots?|destinations?|attractions?|wonders?|gems?|locations?)\b/i.test(address)) {
       return '';
     }
     // Do not let a sentence fragment such as "17 courses Street" or OCR noise
@@ -762,7 +804,7 @@ export class LocationService {
       .trim()
       .toLowerCase();
     // Prose around a number ("children under 10 not allowed") is not a street.
-    const rejectedStreetWords = /\b(?:we|courses?|eats?|ways?|things?|restaurants?|cafes?|bars?|spots?|places?|best|top|favorite|must|not|under|allowed|kids|children|people|minutes?|mins?|hours?|years?)\b/i;
+    const rejectedStreetWords = /\b(?:we|courses?|eats?|ways?|things?|restaurants?|cafes?|bars?|spots?|places?|best|top|favorite|favourite|beautiful|stunning|breathtaking|secret|hidden|iconic|famous|epic|destinations?|attractions?|wonders?|gems?|locations?|must|not|under|allowed|kids|children|people|minutes?|mins?|hours?|years?)\b/i;
     if ((!streetPart && !hasNumberedStreetName) || rejectedStreetWords.test(streetPart)) return '';
     return address;
   }
@@ -846,13 +888,13 @@ export class LocationService {
         city: cityInfo.name,
       }, 'warn');
     }
-    if (!cleanName && !cleanAddress && !cityInfo.name && !cleanNeighborhood) return null;
-    if (cleanAddress && !cityInfo.name) {
+    if (!cleanName && !cleanAddress && !cityInfo.name && !cityInfo.country && !cleanNeighborhood) return null;
+    if (cleanAddress && !cityInfo.name && !cityInfo.country) {
       plog('geocode', 'Street address without a city; not looked up', { place: name, address: cleanAddress }, 'warn');
       return null;
     }
 
-    const query = [cleanName, cleanAddress, cityInfo.name].filter(Boolean).join(', ').slice(0, 256);
+    const query = [cleanName, cleanAddress, cityInfo.name || (cityInfo.country && !cleanAddress ? (city || '') : '')].filter(Boolean).join(', ').slice(0, 256);
     return { cleanName, cleanAddress, cleanNeighborhood, cityInfo, query, kind };
   }
 
@@ -885,7 +927,7 @@ export class LocationService {
               : kind === 'street' && !street ? 'not the street itself (a business or stop on it)'
                 : !identityMatches ? `name differs (similarity ${Math.round(name.score * 100) / 100})`
                   : cityInfo.country && country && country !== cityInfo.country ? `different country (${country})`
-                    : !this.cityMatches(cityInfo.name, [this.googlePlaceCity(place) || ''], resultAddress) ? 'different city'
+                    : cityInfo.name && !this.cityMatches(cityInfo.name, [this.googlePlaceCity(place) || ''], resultAddress) ? 'different city'
                       : cleanNeighborhood && resultNeighborhood && !this.contextNamesMatch(cleanNeighborhood, [resultNeighborhood])
                         ? `different neighbourhood (${resultNeighborhood})`
                         : null;

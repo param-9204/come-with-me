@@ -1,5 +1,6 @@
 import * as stringSimilarity from 'string-similarity';
 import { LocationService } from './location.service';
+import { isCountryName, stripCountryFromCity } from '@/lib/country';
 import { plog } from './pipeline-log';
 import type {
   ApifyOcrFrameResult, EvidenceItem, EvidenceSource, GptVisionFrameResult,
@@ -827,6 +828,10 @@ export function sanitizeCandidateLocation<T extends { city: string; neighborhood
   const items = bundle.items.filter((item) => item.source !== 'account');
 
   if (next.city.trim()) {
+    const strippedCity = stripCountryFromCity(next.city);
+    next.city = isCountryName(strippedCity) ? '' : strippedCity;
+  }
+  if (next.city.trim()) {
     const supporting = items.filter((item) => cityMentionedIn(next.city, item));
     if (supporting.length) supporting.forEach((item) => groundedLocationIds.add(item.id));
     else next.city = '';
@@ -1212,7 +1217,13 @@ export function mergeSameEntities(places: PlaceExtraction[], bundle: EvidenceBun
     const combined: PlaceExtraction = {
       ...existing,
       name: preferredName(existing, place),
-      city: existing.city || place.city,
+      city: (() => {
+        const c1 = stripCountryFromCity(existing.city);
+        const valid1 = isCountryName(c1) ? '' : c1;
+        if (valid1) return valid1;
+        const c2 = stripCountryFromCity(place.city);
+        return isCountryName(c2) ? '' : c2;
+      })(),
       neighborhood: existing.neighborhood || place.neighborhood,
       address: existing.address || place.address,
       description: existing.description || place.description,
