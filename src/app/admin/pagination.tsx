@@ -78,7 +78,7 @@ export default function Pagination({
             className={cx(
               itemClass,
               item === page
-                ? "bg-ink text-canvas disabled:opacity-100"
+                ? "bg-accent text-canvas disabled:opacity-100"
                 : "text-ink-2 hover:bg-subtle",
             )}
           >

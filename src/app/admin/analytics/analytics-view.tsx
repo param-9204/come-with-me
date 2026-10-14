@@ -13,9 +13,9 @@ import {
   buttonClass,
   cx,
   fmt,
-  inputClass,
 } from "../ui";
 import UsersTable from "../users-table";
+import { AdminSelect } from "../ui-client";
 import {
   AnalyticsNav,
   RangeControls,
@@ -97,32 +97,32 @@ export default function AnalyticsView({ report }: { report: AnalyticsReport }) {
       >
         <RangeControls key={`${range.from}-${range.to}`} range={range} update={update} />
         <div className="flex flex-wrap items-center gap-2">
-          <select
-            aria-label="Platform"
+          <AdminSelect
+            label="Platform"
             value={scope.platform ?? ""}
-            onChange={(event) => update({ platform: event.target.value })}
-            className={inputClass}
-          >
-            <option value="">All platforms</option>
-            {report.platforms.map((platform) => (
-              <option key={platform} value={platform}>
-                {platformName(platform)}
-              </option>
-            ))}
-          </select>
-          <select
-            aria-label="User"
+            onChange={(platform) => update({ platform })}
+            options={[
+              { value: "", label: "All platforms" },
+              ...report.platforms.map((platform) => ({
+                value: platform,
+                label: platformName(platform),
+              })),
+            ]}
+            className="min-w-30"
+          />
+          <AdminSelect
+            label="User"
             value={scope.userId ?? ""}
-            onChange={(event) => update({ user: event.target.value })}
-            className={cx(inputClass, "max-w-56")}
-          >
-            <option value="">All users</option>
-            {sortedUsers.map((user) => (
-              <option key={user.id} value={user.id}>
-                {user.name || user.email || user.id}
-              </option>
-            ))}
-          </select>
+            onChange={(user) => update({ user })}
+            options={[
+              { value: "", label: "All users" },
+              ...sortedUsers.map((user) => ({
+                value: user.id,
+                label: user.name || user.email || user.id,
+              })),
+            ]}
+            className="w-56 max-w-full"
+          />
         </div>
       </div>
 

@@ -1,7 +1,6 @@
 import { clerkMiddleware } from '@clerk/nextjs/server';
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
-import { getAuthUser } from '@/lib/auth';
 
 /**
  * Next.js Proxy (formerly middleware).
@@ -23,18 +22,20 @@ export default clerkMiddleware(async (clerkAuth, request: NextRequest) => {
     return NextResponse.next();
   }
 
-  // 2. Authenticate and inject x-user-* headers for downstream route handlers
-  const user = await getAuthUser(request);
+  // 2. Read auth from Clerk's proxy callback. The route-handler auth() helper
+  // is not available while this proxy callback is running.
+  const authObject = await clerkAuth();
+  const clerkUserId = authObject.userId;
 
   const requestHeaders = new Headers(request.headers);
   requestHeaders.delete('x-user-id');
   requestHeaders.delete('x-user-clerk-id');
   requestHeaders.delete('x-user-email');
 
-  if (user) {
-    requestHeaders.set('x-user-id', user.id);
-    requestHeaders.set('x-user-clerk-id', user.clerkId || '');
-    requestHeaders.set('x-user-email', user.email || '');
+  if (clerkUserId) {
+    // process-url resolves Clerk IDs to the internal profile UUID itself.
+    requestHeaders.set('x-user-id', clerkUserId);
+    requestHeaders.set('x-user-clerk-id', clerkUserId);
   }
 
   const response = NextResponse.next({
@@ -61,7 +62,7 @@ export default clerkMiddleware(async (clerkAuth, request: NextRequest) => {
         timestamp: new Date().toISOString(),
         method: request.method,
         path: pathname,
-        userId: user?.id || null,
+        userId: clerkUserId || null,
         ip,
         userAgent,
         status: response.status,

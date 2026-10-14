@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { ScraperService } from '@/lib/services/scraper.service';
 import { PipelineLog, recordPipelineOperation, withPipelineLog } from '@/lib/services/pipeline-log';
+import { processingErrorDetails } from '@/lib/processing-error';
 
 export async function GET(request: Request) {
   const log = new PipelineLog(`scrape-status-${Date.now()}`, { route: 'scrape-status' });
@@ -13,7 +14,7 @@ export async function GET(request: Request) {
     const pipelineStartedAt = searchParams.get('pipelineStartedAt');
     const inputUrl = searchParams.get('url');
     log.adoptPipelineRun(pipelineRunId, pipelineStartedAt);
-    log.setRunInput({ inputUrl, entrypoint: 'scrape-status', platform: inputUrl?.includes('tiktok.com') ? 'tiktok' : inputUrl ? 'instagram' : null });
+    log.setRunInput({ inputUrl, entrypoint: 'scrape-status', platform: inputUrl?.includes('tiktok.com') ? 'tiktok' : inputUrl && /(?:youtube\.com|youtu\.be)/i.test(inputUrl) ? 'youtube' : inputUrl && /(?:facebook\.com|fb\.watch)/i.test(inputUrl) ? 'facebook' : inputUrl ? 'instagram' : null });
 
     if (!runId || !actorId) {
       return NextResponse.json({ error: 'Missing required query parameters: runId and actorId' }, { status: 400 });
@@ -30,7 +31,7 @@ export async function GET(request: Request) {
     });
 
     if (status === 'SUCCEEDED' && defaultDatasetId) {
-      const { normalized, raw } = await ScraperService.fetchAndNormalize(defaultDatasetId, actorId);
+      const { normalized, raw } = await ScraperService.fetchAndNormalize(defaultDatasetId, actorId, inputUrl || undefined);
       const accessFailure = [raw?.error, raw?.http_error_reason, raw?.errorDescription]
         .filter((value) => typeof value === 'string')
         .join(' ');
@@ -65,10 +66,13 @@ export async function GET(request: Request) {
     });
   } catch (error: any) {
     log.fail(error);
+    const details = processingErrorDetails(error);
     return NextResponse.json({
       success: false,
-      error: error.message || 'Failed to get scrape status',
-    }, { status: 500 });
+      error: details.message,
+      code: details.code,
+      retryable: details.retryable,
+    }, { status: details.httpStatus });
     } finally {
       log.flush();
       await log.flushDatabase();

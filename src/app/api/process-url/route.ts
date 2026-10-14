@@ -2,14 +2,19 @@ import { after, NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
 import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { DbService } from '@/lib/services/db.service';
+import { buildPlaceSequence } from '@/lib/services/place-sequence.service';
 import { AiEnrichmentService } from '@/lib/services/ai-enrichment.service';
-import { PipelineLog } from '@/lib/services/pipeline-log';
+import { MediaEvidenceService } from '@/lib/services/media-evidence.service';
+import { SupabaseImageStorageService } from '@/lib/services/supabase-image-storage.service';
+import { PipelineLog, plog, recordPipelineEvidence, recordPlaceCandidate, withPipelineLog } from '@/lib/services/pipeline-log';
 import { ScraperService } from '@/lib/services/scraper.service';
 import type { ApifyOcrFrameResult, GptVisionFrameResult, SocialContent, TranscriptSegment } from '@/lib/types/social';
 import type { AudioUploadRef } from '@/lib/services/media-evidence.service';
 import { v4 as uuidv4 } from 'uuid';
 import { resolveCanonicalSocialSource } from '@/lib/social-source';
 import { UrlProcessingJobsService, type UrlProcessingJobStatus } from '@/lib/services/url-processing-jobs.service';
+import { processingErrorDetails } from '@/lib/processing-error';
+import { ImageProcessingJobsService } from '@/lib/services/image-processing-jobs.service';
 import { urlJobWorkerSecret } from '@/lib/url-job-worker';
 
 export const maxDuration = 300;
@@ -38,6 +43,22 @@ async function isUrlJobWorkerRequest(request: Request): Promise<boolean> {
   return Boolean(data?.id);
 }
 
+/**
+ * Older YouTube results could be marked complete after analyzing only a
+ * thumbnail because the downloader's `output.url` artifact was ignored.
+ * New runs persist `keyValueStoreId`, so this condition can recover those
+ * historical records once without reopening normal completed cache hits.
+ */
+function needsLegacyYouTubeMediaRecovery(post: unknown): boolean {
+  if (!post || typeof post !== 'object') return false;
+  const postData = post as { platform?: unknown; raw_apify_data?: unknown };
+  if (postData.platform !== 'youtube' || !postData.raw_apify_data || typeof postData.raw_apify_data !== 'object') return false;
+  const fallback = (postData.raw_apify_data as { media_fallback?: unknown }).media_fallback;
+  return Boolean(fallback && typeof fallback === 'object' &&
+    (fallback as { status?: unknown }).status === 'artifact_missing' &&
+    !Object.prototype.hasOwnProperty.call(fallback, 'keyValueStoreId'));
+}
+
 function originFor(request: Request): string {
   let origin = new URL(request.url).origin;
   if (origin.includes('localhost') || origin.includes('127.0.0.1')) origin = origin.replace('https://', 'http://');
@@ -47,7 +68,7 @@ function originFor(request: Request): string {
 /** Claim the shared post before creating the user's job/access row. */
 async function claimSocialPostForMobileJob(
   cleanUrl: string,
-  platform: 'instagram' | 'tiktok',
+  platform: 'instagram' | 'tiktok' | 'youtube' | 'facebook',
   canonicalSourceKey: string,
   userId: string,
 ): Promise<{ post: any; created: boolean }> {
@@ -64,7 +85,19 @@ async function claimSocialPostForMobileJob(
   const { data: existingPosts, error: existingError } = await existingQuery.order('created_at', { ascending: false });
   if (existingError) throw new Error(`Unable to read social post: ${existingError.message}`);
   const existing = existingPosts?.find((post) => post.status === 'completed') || existingPosts?.[0];
-  if (existing) return { post: existing, created: false };
+  if (existing) {
+    if (!needsLegacyYouTubeMediaRecovery(existing)) return { post: existing, created: false };
+    const { data: recovered, error: recoveryError } = await supabaseAdmin
+      .from('social_posts')
+      .update({ status: 'pending', error_message: null })
+      .eq('id', existing.id)
+      .select('*')
+      .single();
+    if (recoveryError || !recovered) {
+      throw new Error(`Unable to recover incomplete YouTube media: ${recoveryError?.message || 'missing post'}`);
+    }
+    return { post: recovered, created: true };
+  }
 
   const contentId = `pending_${uuidv4()}`;
   if (supportsCanonicalIdentity) {
@@ -145,6 +178,20 @@ function usableUsername(value: unknown): string | null {
 }
 
 function authorUsernameFromPost(post: any): string | null {
+  if (post?.platform === 'youtube') {
+    return usableUsername(post?.raw_apify_data?.channelName) ||
+      usableUsername(post?.raw_apify_data?.channelHandle) ||
+      usableUsername(post?.raw_apify_data?.channelUsername) ||
+      usableUsername(post?.author_username);
+  }
+  if (post?.platform === 'facebook') {
+    const storedUsername = usableUsername(post?.author_username);
+    const creatorName = usableUsername(post?.raw_apify_data?.creatorName) ||
+      usableUsername(post?.raw_apify_data?.authorName);
+    return storedUsername && !/^\d+$/.test(storedUsername)
+      ? storedUsername
+      : creatorName || storedUsername || usableUsername(post?.raw_apify_data?.user?.username);
+  }
   return usableUsername(post?.author_username) || usableUsername(post?.raw_apify_data?.user?.username);
 }
 
@@ -179,6 +226,294 @@ function formatResponsePlaces(
 
 function responsePlaceIds(places: any[]): string[] {
   return places.map((place) => place?.id || place?.place_id).filter(Boolean);
+}
+
+/** Prefer the post-place rows; JSON evidence is only a pre-migration fallback. */
+async function placeSequenceForResponse(socialPostId: string | null | undefined, places: any[]) {
+  const persisted = await DbService.getPlaceSequenceForSocialPost(socialPostId);
+  if (persisted.length) return persisted;
+  return buildPlaceSequence(places.map((place) => ({
+    name: place?.name,
+    place_id: place?.id || place?.place_id || null,
+    frame_evidence: place?.frame_evidence,
+  })));
+}
+
+function orderResponsePlaces(places: any[], sequence: Awaited<ReturnType<typeof placeSequenceForResponse>>) {
+  const orderById = new Map(sequence.filter((item) => item.place_id).map((item) => [item.place_id!, item.sequence]));
+  const orderByName = new Map(sequence.map((item) => [String(item.name || '').trim().toLowerCase(), item.sequence]));
+  return [...places].sort((a, b) => {
+    const aOrder = orderById.get(a?.id || a?.place_id || '') ?? orderByName.get(String(a?.name || '').trim().toLowerCase()) ?? Number.POSITIVE_INFINITY;
+    const bOrder = orderById.get(b?.id || b?.place_id || '') ?? orderByName.get(String(b?.name || '').trim().toLowerCase()) ?? Number.POSITIVE_INFINITY;
+    return aOrder - bOrder;
+  });
+}
+
+const MAX_IMAGE_UPLOADS = 10;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif']);
+
+/**
+ * Resolve the upload owner from the verified identity returned by getAuthUser.
+ * Client-supplied form fields and identity headers cannot establish ownership.
+ */
+async function resolveImageUploadUser(
+  authUser: Awaited<ReturnType<typeof getAuthUser>>,
+): Promise<string | null> {
+  return resolveProfileId({
+    clerkId: authUser?.clerkId,
+    userIdInput: authUser?.id,
+    email: authUser?.email,
+  });
+}
+
+function isImageFile(value: FormDataEntryValue): value is File {
+  return typeof value !== 'string' && typeof (value as File).arrayBuffer === 'function';
+}
+
+function uploadContent(uploadId: string, imageUrls: string[], caption: string): SocialContent {
+  return {
+    platform: 'upload',
+    contentId: uploadId,
+    contentType: 'post',
+    authorUsername: 'upload',
+    authorFullName: '',
+    caption,
+    displayUrl: imageUrls[0] || '',
+    images: imageUrls,
+    shortCode: '',
+    metrics: { likes: null, views: null, plays: null, comments: null, shares: null, saves: null },
+    hashtags: tokensFromText(caption, '#'),
+    mentions: tokensFromText(caption, '@'),
+    taggedUsers: [],
+    musicInfo: null,
+    videoDuration: null,
+    dimensions: null,
+    paidPartnership: false,
+    productType: null,
+    publishedAt: new Date().toISOString(),
+    rawApifyData: { uploaded_image_id: uploadId, image_urls: imageUrls },
+  };
+}
+
+async function handleImageUpload(request: Request, authUser: Awaited<ReturnType<typeof getAuthUser>>) {
+  const isLocalDevelopment = process.env.NODE_ENV === 'development';
+  if (!authUser && !isLocalDevelopment) {
+    return NextResponse.json({
+      success: false,
+      code: 'AUTHENTICATION_REQUIRED',
+      error: 'Authentication is required for image uploads',
+    }, { status: 401 });
+  }
+  const finalUserId = authUser ? await resolveImageUploadUser(authUser) : null;
+  if (authUser && !finalUserId) {
+    console.error('[Image Upload API] Verified identity could not be resolved to a profile.');
+    return NextResponse.json({
+      success: false,
+      code: 'PROFILE_RESOLUTION_FAILED',
+      error: 'Unable to resolve the authenticated upload owner. Please retry.',
+    }, { status: 500 });
+  }
+
+  const formData = await request.formData();
+  const files = formData.getAll('images').filter(isImageFile);
+  const captionValue = formData.get('caption');
+  const caption = typeof captionValue === 'string' ? captionValue.trim() : '';
+  if (files.length === 0 || files.length > MAX_IMAGE_UPLOADS) {
+    return NextResponse.json({ success: false, error: `images must contain 1 to ${MAX_IMAGE_UPLOADS} files` }, { status: 400 });
+  }
+  const invalid = files.find((file) => !IMAGE_MIME_TYPES.has(file.type.toLowerCase()) || file.size <= 0 || file.size > MAX_IMAGE_BYTES);
+  if (invalid) {
+    return NextResponse.json({
+      success: false,
+      error: `Each image must be JPEG, PNG, WebP, HEIC, or HEIF and no larger than ${MAX_IMAGE_BYTES / 1024 / 1024}MB`,
+    }, { status: 400 });
+  }
+
+  let storagePaths: string[] = [];
+  let uploadedImageId: string | null = null;
+  try {
+    const storageOwner = finalUserId || 'local-postman';
+    const uploads = await Promise.all(files.map((file) => SupabaseImageStorageService.upload(file, storageOwner)));
+    storagePaths = uploads.map((upload) => upload.storagePath);
+    const imageUrls = uploads.map((upload) => upload.publicUrl);
+    const uploaded = await DbService.createUploadedImage({
+      userId: finalUserId,
+      fileNames: files.map((file) => file.name),
+      storagePaths,
+      imageUrls,
+      caption,
+    });
+    uploadedImageId = uploaded.id;
+    const fileNames = files.map((file) => file.name);
+
+    // Keep the development-only anonymous Postman flow synchronous: it has no
+    // authenticated owner with which to authorize job polling.
+    if (!finalUserId) {
+      return await processUploadedImage(uploaded, imageUrls, caption, finalUserId, fileNames);
+    }
+
+    after(async () => {
+      try {
+        await processUploadedImage(uploaded, imageUrls, caption, finalUserId, fileNames);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Image upload processing failed';
+        console.error('[Image Upload API] Background analysis failed:', message);
+        try {
+          await DbService.failUploadedImage(uploaded.id, message);
+        } catch (persistError) {
+          console.error('[Image Upload API] Failed to record background analysis failure:', persistError);
+        }
+      }
+    });
+
+    return NextResponse.json({
+      success: true,
+      jobId: uploaded.id,
+      uploadedImageId: uploaded.id,
+      sourceType: 'uploaded_image',
+      status: 'queued',
+      suggested_title: null,
+      workerScheduled: true,
+      warning: null,
+    }, { status: 202 });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Image upload processing failed';
+    console.error('[Image Upload API] Unable to submit image job:', message);
+    if (uploadedImageId) await DbService.failUploadedImage(uploadedImageId, message);
+    else await SupabaseImageStorageService.remove(storagePaths);
+    return NextResponse.json({ success: false, error: message }, { status: 500 });
+  }
+}
+
+async function processUploadedImage(
+  uploaded: { id: string },
+  imageUrls: string[],
+  caption: string,
+  finalUserId: string | null,
+  fileNames: string[],
+) {
+  const log = new PipelineLog(`image-upload-${Date.now()}`, { route: 'process-url', platform: 'upload' });
+  return withPipelineLog(log, async () => {
+  try {
+    const content = uploadContent(uploaded.id, imageUrls, caption);
+    log.runId = uploaded.id;
+    Object.assign(log.context, { uploadedImageId: uploaded.id, url: imageUrls[0] || null });
+    log.setRunInput({
+      platform: 'upload',
+      inputUrl: imageUrls[0] || null,
+      uploadedImageId: uploaded.id,
+      entrypoint: 'process-url:image-upload',
+      contentId: uploaded.id,
+      contentType: 'image',
+      caption,
+      metadata: { imageCount: imageUrls.length, fileNames },
+    });
+    plog('run', 'Image upload analysis started', { imageCount: imageUrls.length });
+    const media = await MediaEvidenceService.collect(content, content.rawApifyData, { persistAudio: false });
+    const evidence = AiEnrichmentService.buildEvidence(content, media);
+    recordPipelineEvidence(evidence.items);
+    const enrichment = await AiEnrichmentService.analyzeContent(content, content.rawApifyData, {
+      ocrFrames: media.ocrFrames,
+      visionFrames: media.visionFrames,
+      transcript: media.transcript,
+    });
+    const placesToSave = enrichment?.places || [];
+    const saveResults = await Promise.all(placesToSave.map(async (place) => {
+      const placeId = await DbService.savePlace(place, imageUrls[0] || '', 'upload', '', finalUserId || undefined);
+      if (placeId) await DbService.linkPlaceToUploadedImage(uploaded.id, placeId, place);
+      return { place, placeId };
+    }));
+    saveResults.forEach(({ place, placeId }, index) =>
+      recordPlaceCandidate(
+        `upload:${index}:${String(place.name || '').toLowerCase()}`,
+        place,
+        placeId ? 'accepted' : 'unresolved',
+        { placeId, reason: placeId ? 'Saved and linked to uploaded image.' : 'Could not save with a verified location.' },
+      ),
+    );
+    const savedPlaces = await DbService.getPlacesForUploadedImage(uploaded.id);
+    const savedKeys = new Set(savedPlaces.map((place: any) => `${String(place.name || '').trim().toLowerCase()}|${String(place.city || '').trim().toLowerCase()}`));
+    const unresolvedPlaces = saveResults
+      .filter((result) => !result.placeId)
+      .map((result) => result.place)
+      .filter((place) => !savedKeys.has(`${String(place.name || '').trim().toLowerCase()}|${String(place.city || '').trim().toLowerCase()}`));
+    const places = formatResponsePlaces([...savedPlaces, ...unresolvedPlaces], {
+      sourceUrl: imageUrls[0] || null,
+      platform: 'upload',
+    });
+    const warnings = [...new Set([
+      ...(media.warnings || []),
+      ...(enrichment?.warning ? [enrichment.warning] : []),
+      ...(unresolvedPlaces.length ? [`${unresolvedPlaces.length} place(s) could not be saved with a verified location.`] : []),
+    ])];
+    const gptTexts = [...new Set(media.visionFrames.flatMap((frame) => frame.texts || []))];
+    const ocrTexts = [...new Set(media.ocrFrames.flatMap((frame) => frame.texts || []))];
+    const result = {
+      success: true,
+      status: 'completed',
+      processing: false,
+      partial: warnings.length > 0,
+      error: warnings.length ? warnings.join(' ') : null,
+      warnings,
+      sourceType: 'uploaded_image',
+      uploadedImageId: uploaded.id,
+      suggested_title: enrichment?.analysis?.content?.suggested_title ?? null,
+      data: { id: uploaded.id, status: 'completed', image_urls: imageUrls, caption },
+      rawApifyData: content.rawApifyData,
+      places,
+      place: places[0] || null,
+      place_id: places[0]?.id || places[0]?.place_id || null,
+      placeIds: responsePlaceIds(places),
+      aiAnalysis: enrichment?.analysis || null,
+      transcript: media.transcriptText || null,
+      scrapedData: content,
+      ocrComparison: {
+        apifyOcr: { frames: media.ocrFrames, allTexts: ocrTexts, totalFramesProcessed: media.ocrFrames.length, processingTimeMs: 0 },
+        gptVision: { frames: media.visionFrames, allTexts: gptTexts, allBrands: [], allLocations: [], allPrices: [], allCtas: [], totalFramesProcessed: media.visionFrames.length, processingTimeMs: 0 },
+      },
+      audioUpload: null,
+    };
+    await DbService.completeUploadedImage(uploaded.id, {
+      ...(enrichment?.analysis || {}),
+      upload_processing: {
+        transcript: media.transcriptText || null,
+        warnings,
+        // Persist the complete response for job polling, including unresolved
+        // places and warnings, so polling never reruns extraction.
+        result,
+        ocr_frames: media.ocrFrames.map((frame) => ({
+          frameIndex: frame.frameIndex,
+          timestamp: frame.timestamp,
+          texts: frame.texts,
+          rawConfidence: frame.rawConfidence,
+          method: frame.method,
+          lines: frame.lines,
+          wordStats: frame.wordStats,
+        })),
+        vision_frames: media.visionFrames,
+      },
+    });
+    log.setResult({
+      returnedPlaceCount: placesToSave.length,
+      persistedPlaceCount: saveResults.filter((saved) => Boolean(saved.placeId)).length,
+      unresolvedPlaceCount: unresolvedPlaces.length,
+      imageCount: imageUrls.length,
+      visionFrameCount: media.visionFrames.length,
+      ocrFrameCount: media.ocrFrames.length,
+    }, warnings.length ? 'partial' : 'completed');
+    return NextResponse.json(result, { status: 200 });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Image upload processing failed';
+    log.fail(error, { uploadedImageId: uploaded.id, failedStage: 'image-upload' });
+    await DbService.failUploadedImage(uploaded.id, message);
+    return NextResponse.json({ success: false, error: message }, { status: 500 });
+  }
+  finally {
+    log.flush();
+    await log.flushDatabase();
+  }
+  });
 }
 
 /**
@@ -230,7 +565,9 @@ function ocrComparisonFromStoredPost(post: any) {
 function contentFromStoredPost(post: any): SocialContent {
   const raw = post?.raw_apify_data || {};
   const caption = post?.caption || raw?.description || '';
-  const platform = post?.platform === 'tiktok' ? 'tiktok' : 'instagram';
+  const platform = ['instagram', 'tiktok', 'youtube', 'facebook'].includes(post?.platform)
+    ? post.platform as SocialContent['platform']
+    : 'instagram';
   const contentType = ['post', 'reel', 'video'].includes(post?.content_type)
     ? post.content_type
     : 'post';
@@ -406,7 +743,7 @@ async function runSynchronousPipeline(origin: string, url: string, socialPostId:
       route: 'process-url', socialPostId, url, pipelineRunId, pipelineStartedAt,
     });
     failureLog.setRunInput({
-      platform: url.includes('tiktok.com') ? 'tiktok' : 'instagram',
+      platform: url.includes('tiktok.com') ? 'tiktok' : /(?:youtube\.com|youtu\.be)/i.test(url) ? 'youtube' : /(?:facebook\.com|fb\.watch)/i.test(url) ? 'facebook' : 'instagram',
       inputUrl: url,
       socialPostId,
       entrypoint: 'process-url',
@@ -433,6 +770,9 @@ export async function POST(request: Request) {
     // 1. Optionally resolve user ID — process-url is PUBLIC (no auth required).
     //    Mobile sends clerk_user_id; a verified Clerk token can provide it instead.
     const authUser = await getAuthUser(request);
+    if ((request.headers.get('content-type') || '').toLowerCase().includes('multipart/form-data')) {
+      return await handleImageUpload(request, authUser);
+    }
     const headerUserId = request.headers.get('x-user-id');
     const body = await request.json();
     const {
@@ -487,7 +827,41 @@ export async function POST(request: Request) {
       // reel as one source while still allowing other users to have jobs.
       const existingJob = await UrlProcessingJobsService.getJobForUserAndSource(finalUserId, canonicalSourceKey);
       if (existingJob) {
-        const workerScheduled = ['queued', 'waiting'].includes(existingJob.status);
+        let recoveredLegacyYoutubeMedia = false;
+        if (existingJob.status === 'completed' && existingJob.social_post_id) {
+          const { data: existingPost, error: postError } = await supabaseAdmin
+            .from('social_posts')
+            .select('*')
+            .eq('id', existingJob.social_post_id)
+            .maybeSingle();
+          if (postError) throw new Error(`Unable to read existing social post: ${postError.message}`);
+          if (needsLegacyYouTubeMediaRecovery(existingPost)) {
+            const { error: postRecoveryError } = await supabaseAdmin
+              .from('social_posts')
+              .update({ status: 'pending', error_message: null })
+              .eq('id', existingPost.id);
+            if (postRecoveryError) throw new Error(`Unable to recover incomplete YouTube media: ${postRecoveryError.message}`);
+
+            const { error: jobRecoveryError } = await supabaseAdmin
+              .from('social_post_accesses')
+              .update({
+                status: 'queued',
+                result: null,
+                last_error: null,
+                attempt_count: 0,
+                run_after: new Date().toISOString(),
+              })
+              .eq('id', existingJob.id)
+              .eq('event', 'job');
+            if (jobRecoveryError) throw new Error(`Unable to requeue incomplete YouTube media: ${jobRecoveryError.message}`);
+            recoveredLegacyYoutubeMedia = true;
+          }
+        }
+        const jobStatus = recoveredLegacyYoutubeMedia ? 'queued' : existingJob.status;
+        const failure = jobStatus === 'failed'
+          ? processingErrorDetails(existingJob.last_error)
+          : null;
+        const workerScheduled = recoveredLegacyYoutubeMedia || ['queued', 'waiting'].includes(existingJob.status);
         if (workerScheduled) {
           const workerId = `repeat-${uuidv4()}`;
           after(async () => {
@@ -499,17 +873,21 @@ export async function POST(request: Request) {
           });
         }
         return NextResponse.json({
-          success: true,
+          success: jobStatus !== 'failed',
           reused: true,
           jobId: existingJob.id,
           socialPostId: existingJob.social_post_id,
-          status: existingJob.status,
+          status: jobStatus,
+          processing: ['queued', 'processing', 'waiting'].includes(jobStatus),
+          error: failure?.message ?? null,
+          code: failure?.code ?? null,
+          retryable: failure?.retryable ?? null,
           suggested_title: typeof existingJob.result?.suggested_title === 'string'
             ? existingJob.result.suggested_title
             : null,
           workerScheduled,
           warning: null,
-        }, { status: 202 });
+        }, { status: failure?.httpStatus ?? 202 });
       }
 
       const claimed = await claimSocialPostForMobileJob(cleanUrl, platform, canonicalSourceKey, finalUserId);
@@ -612,11 +990,12 @@ export async function POST(request: Request) {
 
       // A completed post is a cache hit. Return only the persisted result: do
       // not scrape, run OCR, call AI, or write a recovery result on this path.
-      const places = formatResponsePlaces(savedPlaces, {
+      const responsePlaces = formatResponsePlaces(savedPlaces, {
         authorUsername: cachedContent.authorUsername,
         sourceUrl: existingPost.post_url,
         platform: cachedContent.platform,
       });
+      const places = orderResponsePlaces(responsePlaces, await placeSequenceForResponse(existingPost.id, responsePlaces));
       const firstPlace = places.length > 0 ? places[0] : null;
       const responseData = {
         ...existingPost,
@@ -780,11 +1159,12 @@ export async function POST(request: Request) {
       const key = `${String(place?.name || '').trim().toLowerCase()}|${String(place?.city || '').trim().toLowerCase()}`;
       return Boolean(place?.name) && !savedPlaceKeys.has(key);
     });
-    const places = formatResponsePlaces([...savedPlaces, ...responseOnlyPlaces], {
+    const responsePlaces = formatResponsePlaces([...savedPlaces, ...responseOnlyPlaces], {
       authorUsername: authorUsernameFromPost(completedPost),
       sourceUrl: completedPost.post_url,
       platform: completedPost.platform,
     });
+    const places = orderResponsePlaces(responsePlaces, await placeSequenceForResponse(completedPost.id, responsePlaces));
     const firstPlace = places.length > 0 ? places[0] : null;
 
     return NextResponse.json({
@@ -808,11 +1188,30 @@ export async function POST(request: Request) {
     });
   } catch (error: any) {
     console.error('[Process URL API] Error:', error);
+    const details = processingErrorDetails(error);
     return NextResponse.json({
       success: false,
-      error: error.message || 'Processing failed'
-    }, { status: 500 });
+      error: details.message,
+      code: details.code,
+      retryable: details.retryable,
+    }, { status: details.httpStatus });
   }
+}
+
+async function uploadedImageResponse(request: Request, uploadedImageId: string) {
+  const user = await getAuthUser(request);
+  const userId = user && await resolveProfileId({ clerkId: user.clerkId, userIdInput: user.id, email: user.email });
+  const job = userId && await ImageProcessingJobsService.getJobForUser(uploadedImageId, userId);
+  if (!job) return NextResponse.json({ success: false, error: 'Post not found' }, { status: 404 });
+
+  return NextResponse.json(job.result || {
+    success: job.status !== 'failed',
+    status: job.status,
+    processing: job.status === 'processing',
+    sourceType: job.sourceType,
+    uploadedImageId: job.uploadedImageId,
+    error: job.error,
+  }, { headers: { 'Cache-Control': 'private, no-store' } });
 }
 
 export async function GET(request: Request) {
@@ -820,6 +1219,9 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url);
     const id = searchParams.get('id');
     const url = searchParams.get('url');
+    const uploadedImageId = searchParams.get('uploadedImageId');
+
+    if (uploadedImageId) return await uploadedImageResponse(request, uploadedImageId);
 
     if (!id && !url) {
       return NextResponse.json({ error: 'id or url is required' }, { status: 400 });
@@ -851,6 +1253,7 @@ export async function GET(request: Request) {
     }
 
     if (!posts || posts.length === 0) {
+      if (id) return await uploadedImageResponse(request, id);
       return NextResponse.json({ success: false, error: 'Post not found' }, { status: 404 });
     }
 
@@ -867,11 +1270,12 @@ export async function GET(request: Request) {
       post = canonicalPost;
     }
 
-    const places = formatResponsePlaces(await DbService.getPlacesForSocialPost(post.id, post.post_url), {
+    const responsePlaces = formatResponsePlaces(await DbService.getPlacesForSocialPost(post.id, post.post_url), {
       authorUsername: authorUsernameFromPost(post),
       sourceUrl: post.post_url,
       platform: post.platform,
     });
+    const places = orderResponsePlaces(responsePlaces, await placeSequenceForResponse(post.id, responsePlaces));
     const firstPlace = places.length > 0 ? places[0] : null;
 
     return NextResponse.json({

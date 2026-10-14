@@ -14,12 +14,13 @@ export async function POST(request: Request) {
         return NextResponse.json({ error: 'Missing required field: url' }, { status: 400 });
       }
 
-      log.setRunInput({ platform: url.includes('tiktok.com') ? 'tiktok' : 'instagram', inputUrl: url, entrypoint: 'scrape-initiate' });
+      const platform = url.includes('tiktok.com') ? 'tiktok' : /(?:youtube\.com|youtu\.be)/i.test(url) ? 'youtube' : /(?:facebook\.com|fb\.watch)/i.test(url) ? 'facebook' : 'instagram';
+      log.setRunInput({ platform, inputUrl: url, entrypoint: 'scrape-initiate' });
       const startedAt = new Date();
       const { runId, actorId } = await ScraperService.initiateScrape(url);
       recordPipelineOperation({
         stage: 'scrape', operation: 'start_actor', provider: 'apify', model: actorId,
-        startedAt, finishedAt: new Date(), requestSummary: { platform: url.includes('tiktok.com') ? 'tiktok' : 'instagram' },
+        startedAt, finishedAt: new Date(), requestSummary: { platform },
         resultSummary: { actorRunId: runId },
       });
 

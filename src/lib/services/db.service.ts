@@ -2,6 +2,7 @@ import { supabaseAdmin } from '../supabase';
 import { resolveProfileId } from '../auth';
 import type { SocialContent, AiAnalysisResult, ApifyOcrFrameResult, GptVisionFrameResult, PlaceExtraction, PlaceCategory } from '../types/social';
 import { LocationService, type GeocodeResult } from './location.service';
+import { isCountryName } from '@/lib/country';
 import { AiEnrichmentService } from './ai-enrichment.service';
 import { ScraperService } from './scraper.service';
 import { googleTypeConflict, reconcileCategoryWithGoogle } from './place-evidence.service';
@@ -269,7 +270,7 @@ export class DbService {
     try {
       let coords = await LocationService.geocodePlace(
         placeData.map_name || placeData.name,
-        city || '',
+        city || placeData.city || '',
         address,
         neighborhood,
         { kind: LocationService.kindForCategory(placeData.base_category || placeData.category) }
@@ -431,7 +432,7 @@ export class DbService {
 
     // Ensure the city is recorded in our cities table
     const cityName = LocationService.cleanCityName(city);
-    if (cityName) {
+    if (cityName && !isCountryName(cityName)) {
       try {
         // Query cities table first to avoid redundant geocoding & upsert
         const { data: existingCity } = await supabaseAdmin
@@ -551,6 +552,94 @@ export class DbService {
     }
   }
 
+  static async createUploadedImage(input: {
+    userId: string | null;
+    fileNames: string[];
+    storagePaths: string[];
+    imageUrls: string[];
+    caption: string;
+  }): Promise<{ id: string }> {
+    const { data, error } = await supabaseAdmin
+      .from('uploaded_images')
+      .insert({
+        user_id: input.userId,
+        file_names: input.fileNames,
+        storage_paths: input.storagePaths,
+        image_urls: input.imageUrls,
+        caption: input.caption,
+        status: 'pending',
+      })
+      .select('id')
+      .single();
+    if (error || !data) throw new Error(`Failed to create uploaded image record: ${error?.message || 'missing ID'}`);
+    return data;
+  }
+
+  static async completeUploadedImage(
+    id: string,
+    analysis: AiAnalysisResult | Record<string, unknown> | null,
+  ): Promise<void> {
+    const { error } = await supabaseAdmin
+      .from('uploaded_images')
+      .update({ status: 'completed', ai_analysis: analysis || {}, error_message: null, updated_at: new Date().toISOString() })
+      .eq('id', id);
+    if (error) throw new Error(`Failed to complete uploaded image record: ${error.message}`);
+  }
+
+  static async failUploadedImage(id: string, message: string): Promise<void> {
+    const { error } = await supabaseAdmin
+      .from('uploaded_images')
+      .update({ status: 'failed', error_message: message.slice(0, 2_000), updated_at: new Date().toISOString() })
+      .eq('id', id);
+    if (error) plog('db', 'Failed to record image-upload failure', { id, error: error.message }, 'warn');
+  }
+
+  static async linkPlaceToUploadedImage(uploadedImageId: string, placeId: string, place: PlaceInput): Promise<void> {
+    const { error } = await supabaseAdmin
+      .from('social_post_places')
+      .upsert({
+        social_post_id: null,
+        uploaded_image_id: uploadedImageId,
+        place_id: placeId,
+        confidence: Number(place.confidence) || null,
+        explanation: place.explanation || null,
+        evidence: {
+          ids: place.evidence_ids || [],
+          location_ids: place.location_evidence_ids || [],
+          sources: place.evidence_sources || [],
+          mention_type: place.mention_type || null,
+          snippets: place.evidence_snippets || [],
+        },
+      }, { onConflict: 'uploaded_image_id,place_id' });
+    if (error) throw new Error(`Failed to link place to uploaded image: ${error.message}`);
+  }
+
+  static async getPlacesForUploadedImage(uploadedImageId: string): Promise<any[]> {
+    const { data: links, error } = await supabaseAdmin
+      .from('social_post_places')
+      .select('place_id, confidence, explanation, evidence')
+      .eq('uploaded_image_id', uploadedImageId)
+      .order('created_at', { ascending: true });
+    if (error) throw new Error(`Failed to read uploaded image places: ${error.message}`);
+    const placeIds = (links || []).map((link: any) => link.place_id).filter(Boolean);
+    if (!placeIds.length) return [];
+    const { data: places, error: placesError } = await supabaseAdmin.from('places').select('*').in('id', placeIds);
+    if (placesError) throw new Error(`Failed to read uploaded image place rows: ${placesError.message}`);
+    const placesById = new Map((places || []).map((place: any) => [place.id, place]));
+    return (links || []).flatMap((link: any) => {
+      const place = placesById.get(link.place_id);
+      if (!place) return [];
+      return [{
+        ...place,
+        map_url: googleMapsUrl(place),
+        confidence: link.confidence === null ? undefined : Number(link.confidence),
+        explanation: link.explanation || undefined,
+        evidence_sources: link.evidence?.sources || undefined,
+        evidence_snippets: link.evidence?.snippets || undefined,
+      }];
+    });
+  }
+
   // ──────────────────────────────────────────────────────────────────
   // Get all places associated with a social post (junction + legacy)
   // ──────────────────────────────────────────────────────────────────
@@ -561,18 +650,39 @@ export class DbService {
 
     // Fetch ONLY via social_post_places junction table (scoped to current post)
     const withEvidence = await DbService.supportsColumns('social_post_places', 'confidence, explanation, evidence');
+    const withSequence = await DbService.supportsColumns(
+      'social_post_places',
+      'sequence_position, first_frame_index, first_seen_at_seconds'
+    );
     const { data: junctionRows } = await supabaseAdmin
       .from('social_post_places')
-      .select(withEvidence ? 'place_id, confidence, explanation, evidence' : 'place_id')
+      .select([
+        'place_id',
+        ...(withEvidence ? ['confidence', 'explanation', 'evidence'] : []),
+        ...(withSequence ? ['sequence_position', 'first_frame_index', 'first_seen_at_seconds'] : []),
+      ].join(', '))
       .eq('social_post_id', socialPostId);
 
-    const evidenceByPlace = new Map<string, { confidence: number | null; explanation: string | null; evidence: any }>();
+    const evidenceByPlace = new Map<string, {
+      confidence: number | null;
+      explanation: string | null;
+      evidence: any;
+    }>();
     for (const row of (junctionRows || []) as any[]) {
       if (withEvidence && row.place_id) {
-        evidenceByPlace.set(row.place_id, { confidence: row.confidence, explanation: row.explanation, evidence: row.evidence });
+        evidenceByPlace.set(row.place_id, {
+          confidence: row.confidence,
+          explanation: row.explanation,
+          evidence: row.evidence,
+        });
       }
     }
-    const junctionPlaceIds = (junctionRows as any[] | null)?.map((r) => r.place_id).filter(Boolean) || [];
+    const orderedJunctionRows = [...((junctionRows as any[] | null) || [])].sort((a, b) => {
+      const aPosition = Number.isInteger(a.sequence_position) ? a.sequence_position : Number.POSITIVE_INFINITY;
+      const bPosition = Number.isInteger(b.sequence_position) ? b.sequence_position : Number.POSITIVE_INFINITY;
+      return aPosition - bPosition;
+    });
+    const junctionPlaceIds = orderedJunctionRows.map((row) => row.place_id).filter(Boolean);
 
     if (junctionPlaceIds.length > 0) {
       const { data: junctionPlaces } = await supabaseAdmin
@@ -580,7 +690,8 @@ export class DbService {
         .select('*')
         .in('id', junctionPlaceIds);
       if (junctionPlaces) {
-        places.push(...junctionPlaces);
+        const placesById = new Map(junctionPlaces.map((place) => [place.id, place]));
+        places.push(...junctionPlaceIds.map((placeId) => placesById.get(placeId)).filter(Boolean));
       }
     }
 
@@ -669,6 +780,98 @@ export class DbService {
         } : {}),
       };
     });
+  }
+
+  /** Read the persisted visual order without changing the ordinary places list. */
+  static async getPlaceSequenceForSocialPost(socialPostId?: string | null): Promise<Array<{
+    sequence: number;
+    name: string;
+    place_id: string;
+    first_frame_index: number;
+    first_seen_at_seconds: number | null;
+  }>> {
+    if (!socialPostId || !(await this.supportsColumns(
+      'social_post_places',
+      'sequence_position, first_frame_index, first_seen_at_seconds'
+    ))) return [];
+
+    const { data: links, error } = await supabaseAdmin
+      .from('social_post_places')
+      .select('place_id, sequence_position, first_frame_index, first_seen_at_seconds')
+      .eq('social_post_id', socialPostId)
+      .not('sequence_position', 'is', null)
+      .order('sequence_position', { ascending: true });
+    if (error || !links?.length) {
+      if (error) plog('db', 'Failed to read place sequence', { socialPostId, error: error.message }, 'warn');
+      return [];
+    }
+
+    const placeIds = links.map((link: any) => link.place_id).filter(Boolean);
+    const { data: places, error: placesError } = await supabaseAdmin
+      .from('places')
+      .select('id, name')
+      .in('id', placeIds);
+    if (placesError) {
+      plog('db', 'Failed to read sequence place names', { socialPostId, error: placesError.message }, 'warn');
+      return [];
+    }
+    const namesById = new Map((places || []).map((place: any) => [place.id, place.name]));
+    return links.flatMap((link: any) => {
+      const name = namesById.get(link.place_id);
+      if (!name || !Number.isInteger(link.sequence_position) || !Number.isInteger(link.first_frame_index)) return [];
+      return [{
+        sequence: link.sequence_position,
+        name,
+        place_id: link.place_id,
+        first_frame_index: link.first_frame_index,
+        first_seen_at_seconds: link.first_seen_at_seconds === null ? null : Number(link.first_seen_at_seconds),
+      }];
+    });
+  }
+
+  /** Persist the earliest visual appearance once all candidate saves have settled. */
+  static async savePlaceSequence(
+    socialPostId: string | null | undefined,
+    entries: Array<{
+      placeId: string | null;
+      sequencePosition?: number;
+      frameEvidence?: PlaceExtraction['frame_evidence'];
+    }>
+  ): Promise<void> {
+    if (!socialPostId || !(await this.supportsColumns(
+      'social_post_places',
+      'sequence_position, first_frame_index, first_seen_at_seconds'
+    ))) return;
+
+    const earliestByPlace = new Map<string, {
+      sequence_position: number;
+      first_frame_index: number;
+      first_seen_at_seconds: number | null;
+    }>();
+    for (const entry of entries) {
+      const frame = entry.frameEvidence?.frame_indexes[0];
+      if (!entry.placeId || !entry.sequencePosition || typeof frame !== 'number' || !Number.isInteger(frame)) continue;
+      const candidate = {
+        sequence_position: entry.sequencePosition,
+        first_frame_index: frame,
+        first_seen_at_seconds: entry.frameEvidence?.timestamps_seconds[0] ?? null,
+      };
+      const existing = earliestByPlace.get(entry.placeId);
+      if (!existing || candidate.sequence_position < existing.sequence_position) {
+        earliestByPlace.set(entry.placeId, candidate);
+      }
+    }
+    const rows = [...earliestByPlace.entries()].map(([place_id, sequence]) => ({
+      social_post_id: socialPostId,
+      place_id,
+      ...sequence,
+    }));
+    if (!rows.length) return;
+
+    const { error } = await supabaseAdmin
+      .from('social_post_places')
+      .upsert(rows, { onConflict: 'social_post_id, place_id' });
+    if (error) plog('db', 'Failed to store place sequence', { socialPostId, error: error.message }, 'warn');
   }
 
   // ──────────────────────────────────────────────────────────────────

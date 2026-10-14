@@ -16,6 +16,89 @@ bun dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
+## Mobile image-upload authentication
+
+Image uploads require a verified user in deployed environments. URL submissions
+can proceed without verifying a Bearer token, so a successful URL submission does
+not confirm that the mobile token is accepted.
+
+When mobile and web use different Clerk instances, keep the existing web Clerk
+keys and explicitly trust the mobile instance with this server-only setting:
+
+```env
+CLERK_MOBILE_ISSUER=https://guiding-grub-3189.clerk.accounts.dev
+```
+
+This is the mobile issuer identified in the upload logs. Set the same variable in
+Vercel **Project Settings → Environment Variables** for **Production**, and for
+**Preview** if the app calls preview deployments, then redeploy. Local `.env`
+changes do not update Vercel. Environment changes apply to new deployments only:
+[Vercel environment variables](https://vercel.com/docs/environment-variables).
+
+The fallback accepts only tokens signed by the configured issuer, checks RS256,
+the issuer, expiration and activation time, and requires a Clerk user subject.
+It supports an explicitly configured HTTPS production Clerk domain as well;
+replace the value when mobile migrates to its production Clerk instance.
+The client must send a current Clerk session token in `Authorization: Bearer …`.
+
+Authenticated multipart image uploads store the images and return HTTP `202`
+with `success: true`, `status: "queued"`, `jobId`, and `uploadedImageId`. The upload
+record's ID is the image job ID. Apply
+`supabase/migration_v36_uploaded_image_accesses.sql` after v30/v31, the platform
+extension in v32, and v34. It adds `social_post_accesses.uploaded_image_id` as a
+foreign key to `uploaded_images.id` and backfills all existing uploads. Each image
+has one `event: "job"`, `platform: "upload"` row, with the same ID as the upload.
+Database triggers synchronize the owner, status, error, and complete saved result
+atomically when an upload is created or updated. Deleting an upload removes its
+access rows. Anonymous local uploads are recorded with a null owner and remain
+inaccessible through authenticated image-job APIs.
+Analysis runs after the response, independently of the URL worker; URL workers
+and URL lookups exclude image jobs. Image polling reads the shared job table,
+with a fallback for older uploads during migration rollout.
+
+Poll `GET /api/process-url/<jobId>` using the same Bearer token on every GET
+request. Only the verified upload owner can retrieve the image job. The mobile
+endpoint returns `jobId`, `status`, `uploadedImageId`, `sourceType: "uploaded_image"`, `suggested_title`, `error`,
+and `result`. A completed image job includes the extracted `places`, `placeIds`,
+and other result fields in `result`; failed jobs expose their error in `error`.
+The alternative `GET /api/url-jobs?id=<jobId>` continues to return those fields
+inside `job`. Polling does not rerun extraction.
+URL jobs use the same terminal contract: a failed poll returns `success: false`,
+`status: "failed"`, `processing: false`, and the user-facing `error`. Known
+non-public Facebook Reels also return `code: "facebook_reel_not_public"` and
+`retryable: false`; these jobs fail on the first attempt instead of remaining in
+the retry queue. The `/api/url-jobs?id=<jobId>` alternative exposes the same
+failure fields both at the top level and inside `job`.
+Completed mobile image polls also expose `data`, `places`, and the other saved
+result fields at the top level. Fetch an image result with
+`GET /api/process-url?uploadedImageId=<uploadedImageId>` and the same Bearer token;
+`GET /api/process-url?id=<uploadedImageId>` also resolves an owned image when no
+social post matches. Image responses omit `socialPostId` and `socialPostStatus`,
+including older saved results; URL responses retain those fields. Mobile code
+must preserve `uploadedImageId`, `sourceType`, `data`, `places`, and `result` when
+handling image jobs, rather than require an ID from `social_posts`.
+A pending production upload older than six minutes reports a timeout rather than
+leaving mobile polling indefinitely.
+The anonymous local Postman flow continues to return its result directly.
+
+Run the image-access database checks with:
+
+```powershell
+npm.cmd install --prefix tmp/image-job-db-check --no-save --package-lock=false @electric-sql/pglite
+node --test tests/image-accesses-db.test.mjs
+```
+
+These execute the migration, backfill, triggers, constraints, RLS, and worker
+claims in an isolated PostgreSQL runtime, with the actual services and polling
+routes. The test dependency stays under ignored `tmp`; production dependencies
+are unchanged. Apply v36 in the Supabase SQL Editor before redeploying the API.
+
+Run `npm run test:image-auth` for authentication and upload regression checks.
+They use real RSA signatures and JWKS verification, with provider and persistence
+fixtures rather than live Clerk sessions or database writes. After deploying,
+retry a real image upload, confirm the `[Auth] Clerk JWT verified with trusted
+mobile issuer` log, and poll its returned job ID until the result is completed.
+
 ## Google Maps setup
 
 Place resolution uses Google Maps only. Add a server-side key to `.env`:

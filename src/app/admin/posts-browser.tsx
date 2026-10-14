@@ -12,6 +12,7 @@ import Pagination from "./pagination";
 import PostsList from "./posts-list";
 import Thumbnail from "./post-thumbnail";
 import { EmptyState, buttonClass, cx, fmt, inputClass } from "./ui";
+import { AdminSelect } from "./ui-client";
 
 type Props = {
   posts: AdminPostSummary[];
@@ -213,49 +214,46 @@ export default function PostsBrowser({
           />
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <select
-            aria-label="Platform"
+          <AdminSelect
+            label="Platform"
             value={searchParams.get("platform") ?? ""}
-            onChange={(event) => update({ platform: event.target.value })}
-            className={inputClass}
-          >
-            <option value="">All platforms</option>
-            {platforms.map((platform) => (
-              <option key={platform} value={platform}>
-                {PLATFORM_LABELS[platform] ??
-                  platform.charAt(0).toUpperCase() + platform.slice(1)}
-              </option>
-            ))}
-          </select>
-          <select
-            aria-label="Format"
+            onChange={(platform) => update({ platform })}
+            options={[
+              { value: "", label: "All platforms" },
+              ...platforms.map((platform) => ({
+                value: platform,
+                label:
+                  PLATFORM_LABELS[platform] ??
+                  platform.charAt(0).toUpperCase() + platform.slice(1),
+              })),
+            ]}
+            className="min-w-30"
+          />
+          <AdminSelect
+            label="Format"
             value={searchParams.get("type") ?? ""}
-            onChange={(event) => update({ type: event.target.value })}
-            className={inputClass}
-          >
-            <option value="">All formats</option>
-            <option value="reel">Reel</option>
-            <option value="post">Post</option>
-            <option value="video">Video</option>
-          </select>
-          <select
-            aria-label="Sort"
+            onChange={(type) => update({ type })}
+            options={[
+              { value: "", label: "All formats" },
+              { value: "reel", label: "Reel" },
+              { value: "post", label: "Post" },
+              { value: "video", label: "Video" },
+            ]}
+            className="min-w-28"
+          />
+          <AdminSelect
+            label="Sort"
             value={sortValue}
-            onChange={(event) => {
-              const [sort, dir] = event.target.value.split(":");
+            onChange={(value) => {
+              const [sort, dir] = value.split(":");
               update({
                 sort: sort === "created_at" ? null : sort,
                 dir: dir === "asc" ? "asc" : null,
               });
             }}
-            className={inputClass}
-          >
-            {SORT_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
+            options={SORT_OPTIONS}
+            className="min-w-36"
+          />
           <div
             role="group"
             aria-label="Layout"
@@ -387,27 +385,28 @@ export default function PostsBrowser({
               ? `${fmt.number(first)}–${fmt.number(last)} of ${fmt.number(total)}`
               : "0 posts"}
           </span>
-          <label className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1.5">
             <span>Rows</span>
-            <select
-              value={pageSize}
-              onChange={(event) =>
+            <AdminSelect
+              label="Rows per page"
+              value={String(pageSize)}
+              onChange={(size) =>
                 update({
                   size:
-                    Number(event.target.value) === pageSizes[0]
+                    Number(size) === pageSizes[0]
                       ? null
-                      : event.target.value,
+                      : size,
                 })
               }
-              className={cx(inputClass, "h-7 px-1.5 text-xs")}
-            >
-              {pageSizes.map((size) => (
-                <option key={size} value={size}>
-                  {size}
-                </option>
-              ))}
-            </select>
-          </label>
+              options={pageSizes.map((size) => ({
+                value: String(size),
+                label: String(size),
+              }))}
+              className="w-16"
+              buttonClassName="h-7 px-1.5 text-xs"
+              placement="top"
+            />
+          </div>
         </div>
         <Pagination
           page={page}

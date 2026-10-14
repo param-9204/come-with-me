@@ -4,6 +4,7 @@ import { supabaseAdmin } from "@/lib/supabase";
 
 export type AdminPostSummary = {
   id: string;
+  source_type: "social_post" | "uploaded_image";
   user_id: string | null;
   user_name: string | null;
   user_phone: string | null;
@@ -354,6 +355,71 @@ const ELIGIBLE_POSTS = "content_id.is.null,content_id.not.ilike.%pending%";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 
+const isProcessingStatus = (status: string | null | undefined) =>
+  PROCESSING_STATUSES.includes((status || "").toLowerCase());
+
+/** Maps an uploaded-image record to the same safe display shape as a post. */
+function normalizeUploadedImage(upload: Json): AdminPostSummary {
+  const analysis = record(upload.ai_analysis);
+  const content = record(analysis.content);
+  const imageUrls = textList(upload.image_urls);
+
+  return {
+    id: String(upload.id),
+    source_type: "uploaded_image",
+    user_id: firstText(upload.user_id),
+    user_name: null,
+    user_phone: null,
+    location_name: null,
+    location_address: null,
+    platform: "upload",
+    content_type: "image",
+    author_username: "image-upload",
+    caption: firstText(upload.caption) || "",
+    display_url: imageUrls[0] || null,
+    image_urls: imageUrls,
+    post_url: null,
+    likes: null,
+    views: null,
+    comments: null,
+    primary_category: firstText(content.primary_category, analysis.primary_category),
+    short_code: null,
+    status: firstText(upload.status) || "pending",
+    created_at: firstText(upload.created_at),
+  };
+}
+
+function matchesUploadedImageFilters(
+  post: AdminPostSummary,
+  filters: AdminPostFilters,
+) {
+  if (filters.userId === "none" && post.user_id) return false;
+  if (filters.userId && filters.userId !== "none" && post.user_id !== filters.userId)
+    return false;
+  if (filters.platform && filters.platform !== post.platform) return false;
+  if (filters.contentType && filters.contentType !== post.content_type) return false;
+
+  const status = (post.status || "").toLowerCase();
+  if (filters.status === "processing" && !isProcessingStatus(status)) return false;
+  if (
+    filters.status &&
+    filters.status !== "all" &&
+    filters.status !== "processing" &&
+    status !== filters.status
+  )
+    return false;
+
+  const created = post.created_at || "";
+  if (filters.from && created < `${filters.from}T00:00:00Z`) return false;
+  if (filters.to && created >= `${nextDay(filters.to)}T00:00:00Z`) return false;
+
+  const term = searchTerm(filters.search).toLowerCase();
+  return !term ||
+    [post.caption, post.author_username, post.primary_category]
+      .filter((value): value is string => Boolean(value))
+      .some((value) => value.toLowerCase().includes(term));
+}
+
 /** Reads /admin URL params into filters; unknown values fall back to defaults. */
 export function parseAdminPostFilters(
   params: Record<string, string | string[] | undefined>,
@@ -481,13 +547,35 @@ function applyFilters(
   return next;
 }
 
+async function getUploadedImageSummaries(
+  filters: AdminPostFilters,
+): Promise<AdminPostSummary[]> {
+  const { data, error } = await supabaseAdmin
+    .from("uploaded_images")
+    .select("id, user_id, image_urls, caption, ai_analysis, status, created_at")
+    .order("created_at", { ascending: false });
+
+  // Keep the established social-post directory available if an environment has
+  // not yet applied the image-upload migration.
+  if (error) {
+    console.warn("[Admin] Unable to load uploaded images:", error.message);
+    return [];
+  }
+
+  return ((data ?? []) as Json[])
+    .map(normalizeUploadedImage)
+    .filter((post) => matchesUploadedImageFilters(post, filters));
+}
+
 /** Counts for the status tabs, using every active filter except status. */
 export async function getAdminPostStatusCounts(
   filters: AdminPostFilters = {},
 ): Promise<Record<AdminPostStatusFilter, number | null>> {
   const scope = await resolveScope(filters);
-  const counts = await Promise.all(
-    ADMIN_POST_STATUSES.map(async (status) => {
+  const baseFilters = { ...filters, status: "all" as const };
+  const [uploadedImages, counts] = await Promise.all([
+    getUploadedImageSummaries(baseFilters),
+    Promise.all(ADMIN_POST_STATUSES.map(async (status) => {
       const { count } = await applyFilters(
         supabaseAdmin
           .from("social_posts")
@@ -495,13 +583,24 @@ export async function getAdminPostStatusCounts(
         { ...filters, status },
         scope,
       );
-      return [status, count ?? null] as const;
-    }),
-  );
-  return Object.fromEntries(counts) as Record<
-    AdminPostStatusFilter,
-    number | null
-  >;
+      return [status, count] as const;
+    })),
+  ]);
+  const imageCounts = Object.fromEntries(
+    ADMIN_POST_STATUSES.map((status) => [
+      status,
+      uploadedImages.filter((post) =>
+        matchesUploadedImageFilters(post, { ...filters, status }),
+      ).length,
+    ]),
+  ) as Record<AdminPostStatusFilter, number>;
+
+  return Object.fromEntries(
+    counts.map(([status, count]) => [
+      status,
+      count === null ? null : count + imageCounts[status],
+    ]),
+  ) as Record<AdminPostStatusFilter, number | null>;
 }
 
 export async function getAdminPostList(): Promise<{
@@ -525,13 +624,16 @@ export async function getAdminPostPage(
   const sort =
     options.sort && SORTS.includes(options.sort) ? options.sort : "created_at";
   const scope = await resolveScope(options);
-  const { count, error: countError } = await applyFilters(
-    supabaseAdmin
-      .from("social_posts")
-      .select("id", { count: "exact", head: true }),
-    options,
-    scope,
-  );
+  const [{ count, error: countError }, uploadedImages] = await Promise.all([
+    applyFilters(
+      supabaseAdmin
+        .from("social_posts")
+        .select("id", { count: "exact", head: true }),
+      options,
+      scope,
+    ),
+    getUploadedImageSummaries(options),
+  ]);
 
   if (countError) {
     console.error("[Admin] Unable to count posts:", countError.message);
@@ -548,15 +650,17 @@ export async function getAdminPostPage(
   // Stable order for ties (equal like counts, identical timestamps).
   if (sort !== "created_at")
     pageQuery = pageQuery.order("created_at", { ascending: false });
+  // Read from the start because uploaded images and social posts are merged and
+  // sorted together below. This still reads only the rows needed for this page.
   const { data, error } = await pageQuery
     .order("id", { ascending: true })
-    .range(offset, offset + limit - 1);
+    .range(0, offset + limit - 1);
 
   if (error) {
     console.error("[Admin] Unable to load posts:", error.message);
     return {
       posts: [],
-      total: count ?? 0,
+      total: (count ?? 0) + uploadedImages.length,
       nextOffset: null,
       error: error.message,
     };
@@ -568,7 +672,7 @@ export async function getAdminPostPage(
   });
   const userIds = [
     ...new Set(
-      rows
+      [...rows, ...uploadedImages]
         .map((post) => post.user_id)
         .filter((id): id is string => typeof id === "string" && Boolean(id)),
     ),
@@ -600,7 +704,7 @@ export async function getAdminPostPage(
   const places = new Map(
     (placesResult.data ?? []).map((place) => [place.id, place]),
   );
-  const posts = rows.map((post) => {
+  const socialPosts = rows.map((post) => {
     const normalized = normalizeAdminPost(post);
     const profile =
       typeof post.user_id === "string" ? profiles.get(post.user_id) : null;
@@ -608,6 +712,7 @@ export async function getAdminPostPage(
       typeof post.place_id === "string" ? places.get(post.place_id) : null;
     return {
       id: post.id,
+      source_type: "social_post" as const,
       ...normalized,
       user_name: profile?.display_name ?? null,
       user_phone: profile?.phone ?? null,
@@ -619,7 +724,28 @@ export async function getAdminPostPage(
         : normalized.location_address,
     };
   }) as AdminPostSummary[];
-  const resolvedTotal = count ?? posts.length;
+  const posts = [...socialPosts, ...uploadedImages]
+    .map((post) => {
+      const profile = post.user_id ? profiles.get(post.user_id) : null;
+      return profile
+        ? { ...post, user_name: profile.display_name ?? null, user_phone: profile.phone ?? null }
+        : post;
+    })
+    .sort((left, right) => {
+      const leftValue = sort === "created_at" ? left.created_at : left[sort];
+      const rightValue = sort === "created_at" ? right.created_at : right[sort];
+      if (leftValue === null || leftValue === undefined)
+        return rightValue === null || rightValue === undefined ? 0 : 1;
+      if (rightValue === null || rightValue === undefined) return -1;
+      if (leftValue !== rightValue) {
+        const result = leftValue < rightValue ? -1 : 1;
+        return options.ascending ? result : -result;
+      }
+      return (right.created_at || "").localeCompare(left.created_at || "") ||
+        left.id.localeCompare(right.id);
+    })
+    .slice(offset, offset + limit);
+  const resolvedTotal = (count ?? 0) + uploadedImages.length;
   const nextOffset =
     offset + posts.length < resolvedTotal ? offset + posts.length : null;
 

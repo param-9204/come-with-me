@@ -1,6 +1,7 @@
 import { executeAICall, supportsTemperature } from './ai-client';
 import { LocationService } from './location.service';
 import { plog } from './pipeline-log';
+import { isCountryName, stripCountryFromCity } from '@/lib/country';
 import {
   BASE_CATEGORIES, GENERIC_NAMES, buildEvidence, formatEvidenceForPrompt, mergeSameEntities, normalizeForMatch, resolveHiddenGem,
   sanitizeCandidateLocation, scoreAndFilterCandidates,
@@ -191,14 +192,14 @@ METHOD — work through these steps in order
 4. FIELDS. Split each candidate's text into fields:
    - name: the venue's own name only, as written. Remove words that are not part of the name: cuisine or type tags ("Hangawi-korean" → "Hangawi", "Uptown thai- Thai" → "Uptown thai"), notes and rules ("Indian accent - children under 10 not allowed" → "Indian accent", "NY dosas - food cart" → "NY dosas"), prices, hours, ratings, numbering, emoji, pins, "@", and a trailing phrase that only repeats the city ("Salswee in NYC" → "Salswee"). Keep words that belong to the name ("Tamarind Tribeca", "Joe's Pizza", "Franchia Vegan"). Put the removed descriptive words in "description".
    - address: a street address written with the place (same line, list item, slide or moment), copied exactly ("140 N. 2nd", "209 Chestnut St"). A line that is only an address is never a place: attach it to the venue on the same line, slide or moment. A street sign in the scene ("W 23 St") is not an address.
-   - neighborhood and city: from step 2, in this order: the place's own line, then its section, then the whole post. When the place's own line names another town, state or country ("📍 Weehawken NJ Waterfront"), that is its city, even in a post about a different city.
+   - neighborhood and city: from step 2, in this order: the place's own line, then its section, then the whole post. When the place's own line names another town or city ("📍 Weehawken Waterfront"), that is its city. NEVER put a country name (e.g. "China", "United States", "France", "Japan") in the city field.
 5. ROLE. featured = shown, visited, reviewed · recommended = suggested but not shown · mentioned_only = comparison, joke, "better than X", passing reference, other people's suggestions · background = visible but not the subject (a logo on a cup, a passing sign, a photo credit). Every entry of the creator's own guide, list or itinerary is featured or recommended, never mentioned_only ("Day 2 - Evening plans @brasseriecognac", "SHOPS: Vowels, PHOS").
 6. CHECK. Count the list items and venue labels you found in step 3 and make sure every one is in "places"; a venue listed twice is returned once. Never stop early, summarise, or trust a stated count ("top 5" with 7 entries → 7).
 
 WHAT IS A PLACE
 A specific, named, physical location someone can visit: restaurant, cafe, bar, club, shop, market, food cart or truck, hotel, museum, gallery, park, beach, trail, viewpoint, landmark, street, or a town/island that is itself the destination.
 Not places: people, the creator, DJs/artists, the audio track, brands or products with no specific location (a drink brand, an app), dishes, events without a venue, generic phrases ("this cafe", "the best pizza spot"), website addresses and watermarks.
-A city, state, or country that only says WHERE the other places are is location context: put it in those places' "city" field instead of returning it as a place.
+A city or neighborhood that only says WHERE the other places are is location context: put the city name in those places' "city" field instead of returning it as a place. NEVER put a country name in the "city" field; if only a country is mentioned with no city, leave "city" as "".
 
 NAME
 - Fix an OCR letter error only when another line confirms the spelling (O3 "CAFE LUMIFRE" + A1 "Café Lumière" → "Café Lumière").
@@ -332,6 +333,53 @@ function validSuggestedTitle(value: unknown): string | null {
   return words.length >= 4 && words.length <= 5 ? title : null;
 }
 
+/**
+ * A model may omit the optional title even after it has returned grounded,
+ * accepted places. Keep the title contract useful in that case without
+ * inventing a venue, category, or location: the fallback states only the
+ * verified geographic focus when available, otherwise the place count and,
+ * when it is unambiguous, their shared city.
+ */
+function suggestedTitleFromVerifiedPlaces(places: PlaceExtraction[], geographicFocus: unknown): string | null {
+  const accepted = places.filter((place) => Boolean(str(place.name)));
+  if (accepted.length === 0) return null;
+
+  const focuses = new Map<string, string>();
+  for (const value of strList(geographicFocus)) {
+    const focus = value.replace(/\s+/g, ' ');
+    focuses.set(focus.toLocaleLowerCase(), focus);
+  }
+  if (focuses.size === 1) {
+    const focus = [...focuses.values()][0];
+    const focusWords = focus.match(/[\p{L}\p{N}]+(?:['-][\p{L}\p{N}]+)*/gu) || [];
+    if (focusWords.length <= 2) {
+      const focusedTitle = validSuggestedTitle(`${focus} Travel Destinations Guide`);
+      if (focusedTitle) return focusedTitle;
+    }
+  }
+
+  const cityCounts = new Map<string, { city: string; count: number }>();
+  for (const place of accepted) {
+    const rawCity = str(place.city).replace(/\s+/g, ' ');
+    const stripped = stripCountryFromCity(rawCity);
+    const city = isCountryName(stripped) ? '' : stripped;
+    const key = city.toLocaleLowerCase();
+    if (!key || isCountryName(key)) continue;
+    const entry = cityCounts.get(key);
+    cityCounts.set(key, { city, count: (entry?.count || 0) + 1 });
+  }
+  const commonCity = [...cityCounts.values()]
+    .sort((a, b) => b.count - a.count)[0];
+  const cityWords = commonCity?.city.match(/[\p{L}\p{N}]+(?:['â€™-][\p{L}\p{N}]+)*/gu) || [];
+  const hasSharedShortCity = Boolean(commonCity && commonCity.count === accepted.length && cityWords.length <= 2);
+  const placeWord = accepted.length === 1 ? 'Place' : 'Places';
+  const title = hasSharedShortCity
+    ? `${accepted.length} ${commonCity!.city} ${placeWord} Guide`
+    : `${accepted.length} Featured ${placeWord} Guide`;
+
+  return validSuggestedTitle(title);
+}
+
 function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
   const candidate = str(value) as T;
   return allowed.includes(candidate) ? candidate : fallback;
@@ -421,13 +469,16 @@ export function parseCandidates(raw: string): RawPlaceCandidate[] {
     // matching the venue ("Hangawi-korean" vs Google's "Hangawi").
     const { name, note } = splitNameDescriptor(cleanedName, str(value.city));
     const description = str(value.description) || note;
+    const rawCity = str(value.city);
+    const cleanedCity = stripCountryFromCity(rawCity);
+    const candidateCity = isCountryName(cleanedCity) ? '' : cleanedCity;
     candidates.push({
       name,
       mention_type: oneOf(value.mention_type, MENTION_TYPES, 'explicit'),
       role: oneOf(value.role, ROLES, 'featured'),
       name_evidence: strList(value.name_evidence),
       location_evidence: strList(value.location_evidence),
-      city: str(value.city),
+      city: candidateCity,
       neighborhood: str(value.neighborhood),
       address: str(value.address),
       base_category: base,
@@ -715,8 +766,10 @@ function applySharedGeoContext(
 
   const cityCounts = new Map<string, { display: string; count: number }>();
   for (const place of places) {
-    const city = (place.city || '').trim();
-    if (!city) continue;
+    const rawCity = (place.city || '').trim();
+    const stripped = stripCountryFromCity(rawCity);
+    const city = isCountryName(stripped) ? '' : stripped;
+    if (!city || isCountryName(city)) continue;
     const key = city.toLowerCase();
     const prev = cityCounts.get(key);
     cityCounts.set(key, { display: prev?.display || city, count: (prev?.count || 0) + 1 });
@@ -1223,6 +1276,10 @@ function visualTextKey(text: string): string {
 /** Fewest distinct venue cards before on-screen text is treated as a card guide. */
 const MIN_VISUAL_CARDS = 3;
 
+/** A named venue sign plus dining language is a single physical venue, not a guide. */
+const HOSPITALITY_CONTEXT_RE = /\b(?:dine|dining|restaurant|cafe|cafÃ©|coffee|breakfast|brunch|lunch|dinner|menu|garden)\b/i;
+const HOSPITALITY_COPY_RE = /\b(?:dine|dining|garden|breakfast|brunch|lunch|dinner|coffee|cafe|cafÃ©|menu|open|hours?|only)\b/i;
+
 /** Website addresses and watermarks: "thenomadic.com", "www.x.co". */
 const WEB_ADDRESS_RE = /(?:^|\s)(?:www\.|https?:\/\/)|\b[\p{L}\p{N}-]+\.(?:com|net|org|co|io|in|uk|me|app|shop|store|tv)\b/iu;
 /**
@@ -1340,6 +1397,55 @@ export function generateVisualGuideCandidates(
   // behind the creator, a cup logo) are not a guide; the model call already
   // covers single labels.
   return candidates.length >= MIN_VISUAL_CARDS ? candidates : [];
+}
+
+/**
+ * A Reel can show one venue rather than a multi-card guide. When Vision marks
+ * a repeated named sign as scene text and the same frames contain dining
+ * language, retain that venue for normal evidence validation and geocoding.
+ */
+function generateSingleHospitalityVenueCandidates(bundle: EvidenceBundle): RawPlaceCandidate[] {
+  const screenItems = bundle.items.filter((item) => item.source === 'vision_ocr');
+  const contextFrames = new Set(
+    screenItems
+      .filter((item) => HOSPITALITY_CONTEXT_RE.test(item.text))
+      .flatMap((item) => item.frames || [])
+  );
+  if (contextFrames.size === 0) return [];
+
+  const candidates = screenItems
+    .filter((item) => item.scene === true && (item.frames || []).length >= 2)
+    .filter((item) => (item.frames || []).some((frame) => contextFrames.has(frame)))
+    .map((item) => ({ item, name: item.text.trim() }))
+    .filter(({ name }) => {
+      const key = visualTextKey(name);
+      const words = name.split(/\s+/).filter(Boolean);
+      return key.length >= 5 && words.length >= 2 && words.length <= 6 &&
+        !GENERIC_NAMES.has(key) && !HOSPITALITY_COPY_RE.test(name);
+    });
+
+  const unique = new Map<string, typeof candidates[number]>();
+  for (const candidate of candidates) {
+    const key = visualTextKey(candidate.name);
+    if (!unique.has(key)) unique.set(key, candidate);
+  }
+  if (unique.size !== 1) return [];
+
+  const { item, name } = [...unique.values()][0];
+  return [{
+    name,
+    mention_type: 'explicit',
+    role: 'featured',
+    name_evidence: [item.id],
+    location_evidence: [],
+    city: '',
+    neighborhood: '',
+    address: '',
+    base_category: 'RESTAURANTS',
+    category: 'RESTAURANTS',
+    description: '',
+    search_query: '',
+  }];
 }
 
 function generateFallbackAnalysis(content: SocialContent, bundle: EvidenceBundle, places: PlaceExtraction[]): Record<string, any> {
@@ -1475,6 +1581,22 @@ export class AiEnrichmentService {
               added,
               places: outcome.places.map((place) => place.name),
             }, 'info');
+          }
+        }
+
+        if (outcome.places.length === 0) {
+          const singleVenueCandidates = generateSingleHospitalityVenueCandidates(bundle);
+          if (singleVenueCandidates.length > 0) {
+            const singleVenueOutcome = await finalizeCandidates(singleVenueCandidates, bundle, content.authorUsername);
+            outcome = {
+              places: mergeSameEntities([...outcome.places, ...singleVenueOutcome.places], bundle),
+              rejected: [...outcome.rejected, ...singleVenueOutcome.rejected],
+            };
+            if (singleVenueOutcome.places.length > 0) {
+              plog('model', 'Recovered source-backed single hospitality venue from Vision frames', {
+                places: singleVenueOutcome.places.map((place) => place.name),
+              }, 'info');
+            }
           }
         }
 
@@ -1616,6 +1738,13 @@ export class AiEnrichmentService {
     const ocrAvailable = bundle.items.some((item) => item.source === 'ocr' || item.source === 'vision_ocr');
     const transcriptItems = bundle.items.filter((item) => item.source === 'speech');
     const transcriptText = transcriptItems.map((item) => item.text).join(' ');
+    const suggestedTitle = validSuggestedTitle(parsed.suggested_title) || suggestedTitleFromVerifiedPlaces(places, parsed.geographic_focus);
+    if (!validSuggestedTitle(parsed.suggested_title) && suggestedTitle) {
+      plog('model', 'Used verified-place suggested title fallback', {
+        title: suggestedTitle,
+        placeCount: places.length,
+      });
+    }
 
     const analysis: AiAnalysisResult = {
       platform: content.platform,
@@ -1630,7 +1759,7 @@ export class AiEnrichmentService {
         dimensions: content.dimensions
           ? { ...content.dimensions, orientation: content.dimensions.height > content.dimensions.width ? 'vertical' : 'horizontal' }
           : null,
-        suggested_title: validSuggestedTitle(parsed.suggested_title),
+        suggested_title: suggestedTitle,
         summary: parsed.summary || '',
         primary_category: parsed.primary_category || '',
         secondary_categories: [],

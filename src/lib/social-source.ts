@@ -1,10 +1,10 @@
 export type CanonicalSocialSource = {
-  platform: 'instagram' | 'tiktok';
+  platform: 'instagram' | 'tiktok' | 'youtube' | 'facebook';
   cleanUrl: string;
   key: string;
 };
 
-function isPlatformHost(host: string, platform: 'instagram' | 'tiktok'): boolean {
+function isPlatformHost(host: string, platform: 'instagram' | 'tiktok' | 'facebook'): boolean {
   return host === `${platform}.com` || host.endsWith(`.${platform}.com`);
 }
 
@@ -18,10 +18,12 @@ export function canonicalizeSocialSource(url: string): CanonicalSocialSource {
   const host = parsed.hostname.toLowerCase().replace(/^(?:www\.|m\.)/, '');
   const path = (parsed.pathname.replace(/\/{2,}/g, '/').replace(/\/+$/, '') || '/');
 
-  let platform: 'instagram' | 'tiktok';
+  let platform: CanonicalSocialSource['platform'];
   if (isPlatformHost(host, 'instagram')) platform = 'instagram';
   else if (isPlatformHost(host, 'tiktok')) platform = 'tiktok';
-  else throw new Error('Only Instagram and TikTok URLs are supported');
+  else if (isPlatformHost(host, 'facebook') || host === 'fb.watch') platform = 'facebook';
+  else if (host === 'youtube.com' || host.endsWith('.youtube.com') || host === 'youtu.be') platform = 'youtube';
+  else throw new Error('Only Instagram, TikTok, YouTube, and Facebook URLs are supported');
 
   const instagramCode = platform === 'instagram'
     ? path.match(/^\/(?:p|reel|reels|tv)\/([^/]+)/i)?.[1]
@@ -29,13 +31,30 @@ export function canonicalizeSocialSource(url: string): CanonicalSocialSource {
   const tiktokVideoId = platform === 'tiktok'
     ? path.match(/\/video\/(\d+)/i)?.[1]
     : null;
+  const youtubeVideoId = platform === 'youtube'
+    ? (host === 'youtu.be' ? path.match(/^\/([^/]+)/)?.[1] : path.match(/^\/(?:shorts|watch)\/([^/?]+)/i)?.[1] || parsed.searchParams.get('v'))
+    : null;
+  const facebookReelId = platform === 'facebook'
+    ? path.match(/^\/(?:reel|reels)\/([^/]+)/i)?.[1] || path.match(/\/videos\/([^/]+)/i)?.[1] || parsed.searchParams.get('v')
+    : null;
   const key = instagramCode
     ? `instagram:${instagramCode}`
     : tiktokVideoId
       ? `tiktok:${tiktokVideoId}`
-      : `${platform}:${host}${path}`;
+      : youtubeVideoId
+        ? `youtube:${youtubeVideoId}`
+        : facebookReelId
+          ? `facebook:${facebookReelId}`
+          : `${platform}:${host}${path}`;
 
-  return { platform, cleanUrl: `https://${host}${path}`, key };
+  // `v` is not optional for a YouTube /watch URL. Keep an actor-runnable
+  // canonical URL while still using the stable content ID as the cache key.
+  const cleanUrl = youtubeVideoId
+    ? `https://www.youtube.com/watch?v=${encodeURIComponent(youtubeVideoId)}`
+    : platform === 'facebook' && parsed.searchParams.get('v')
+      ? `https://${host}${path}?v=${encodeURIComponent(parsed.searchParams.get('v')!)}`
+      : `https://${host}${path}`;
+  return { platform, cleanUrl, key };
 }
 
 /**

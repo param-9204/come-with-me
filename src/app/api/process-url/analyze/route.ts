@@ -9,6 +9,7 @@ import { WhisperService } from '@/lib/services/whisper.service';
 import { mergeSameEntities, normalizeForMatch } from '@/lib/services/place-evidence.service';
 import { PipelineLog, plog, recordPipelineEvidence, recordPlaceCandidate, withPipelineLog } from '@/lib/services/pipeline-log';
 import { googleMapsUrl } from '@/lib/maps-url';
+import { buildPlaceSequence, frameEvidenceForPlace } from '@/lib/services/place-sequence.service';
 import type { PlaceExtraction, TranscriptResult, TranscriptSegment } from '@/lib/types/social';
 
 export const maxDuration = 300;
@@ -64,6 +65,20 @@ function isSamePlace(a: PlaceExtraction, b: PlaceExtraction): boolean {
   const bCity = (b.city || '').trim().toLowerCase();
 
   return namesMatch && (!aCity || !bCity || aCity === bCity);
+}
+
+/** Keep the public places array in visual order without exposing frame metadata per row. */
+function orderPlacesBySequence<T extends { id?: string | null; place_id?: string | null; name?: string | null }>(
+  places: T[],
+  sequence: ReturnType<typeof buildPlaceSequence>
+): T[] {
+  const orderById = new Map(sequence.filter((item) => item.place_id).map((item) => [item.place_id!, item.sequence]));
+  const orderByName = new Map(sequence.map((item) => [normalizedPlaceName(item.name), item.sequence]));
+  return [...places].sort((a, b) => {
+    const aOrder = orderById.get(a.id || a.place_id || '') ?? orderByName.get(normalizedPlaceName(a.name)) ?? Number.POSITIVE_INFINITY;
+    const bOrder = orderById.get(b.id || b.place_id || '') ?? orderByName.get(normalizedPlaceName(b.name)) ?? Number.POSITIVE_INFINITY;
+    return aOrder - bOrder;
+  });
 }
 
 export async function POST(request: Request) {
@@ -189,8 +204,22 @@ async function handleAnalyze(request: Request, log: PipelineLog) {
     // 4. Save places to DB (bounded concurrency: Google lookups + inserts)
     let placeIds: string[] = [];
     let unresolvedPlaces: PlaceExtraction[] = [];
+    let placeSequence: ReturnType<typeof buildPlaceSequence> = [];
+    let sequenceEntries: Array<{
+      placeId: string | null;
+      sequencePosition?: number;
+      frameEvidence?: PlaceExtraction['frame_evidence'];
+    }> = [];
     if (placeAnalysis && placeAnalysis.length > 0) {
-      const uniquePlaces = mergeSameEntities(placeAnalysis.filter((place) => !!place.name), evidenceBundle);
+      const placesWithFrameEvidence = mergeSameEntities(placeAnalysis.filter((place) => !!place.name), evidenceBundle)
+        .map((place) => ({ ...place, frame_evidence: frameEvidenceForPlace(place, evidenceBundle) || undefined }));
+      const sequenceByName = new Map(
+        buildPlaceSequence(placesWithFrameEvidence).map((item) => [normalizeForMatch(item.name), item.sequence])
+      );
+      const uniquePlaces = placesWithFrameEvidence.map((place) => ({
+        ...place,
+        sequence_position: sequenceByName.get(normalizeForMatch(place.name)),
+      }));
 
       const savePlace = async (place: PlaceExtraction, index: number) => {
         const candidateKey = `accepted-${index}`;
@@ -223,6 +252,16 @@ async function handleAnalyze(request: Request, log: PipelineLog) {
       });
       placeIds =[...new Set(saveResults.map((result) => result.id).filter(Boolean) as string[])];
       unresolvedPlaces = saveResults.filter((result) => !result.id).map((result) => result.place);
+      placeSequence = buildPlaceSequence(saveResults.map(({ place, id }) => ({
+        name: place.name,
+        place_id: id,
+        frame_evidence: place.frame_evidence,
+      })));
+      sequenceEntries = saveResults.map(({ place, id }) => ({
+        placeId: id,
+        sequencePosition: place.sequence_position,
+        frameEvidence: place.frame_evidence,
+      }));
       if (unresolvedPlaces.length > 0) {
         plog('run', `${unresolvedPlaces.length} place(s) not saved (no verified location); returned without coordinates`, {
           places: unresolvedPlaces.map((place) => place.name),
@@ -257,6 +296,7 @@ async function handleAnalyze(request: Request, log: PipelineLog) {
     // audit flush happens after this handler, so attach the persisted ID now
     // and every audit child row receives the same social_post_id.
     log.setRunInput({ socialPostId });
+    await DbService.savePlaceSequence(socialPostId, sequenceEntries);
 
     // 6. Link Audio Upload to Social Post
     let linkedAudio = null;
@@ -327,14 +367,14 @@ async function handleAnalyze(request: Request, log: PipelineLog) {
       (unresolved) => !savedPlaces.some((saved) => isSamePlace(saved, unresolved))
     );
     const placesSource = [...savedPlaces, ...responseOnlyPlaces];
-    const finalPlaces = placesSource.map((p: any) => ({
+    const finalPlaces = orderPlacesBySequence(placesSource.map((p: any) => ({
       ...p,
       place_id: p.id || p.place_id,
       map_url: googleMapsUrl(p),
       author_username: finalAuthorUsername,
       creator_handle: finalCreatorHandle,
       creators: finalCreatorHandle ? [{ creator_handle: finalCreatorHandle, post_url: url, platform: content?.platform }] : [],
-    }));
+    })), placeSequence);
     plog('run', `Analysis finished: ${finalPlaces.length} place(s)`, {
       socialPostId,
       places: finalPlaces.map((p: any) => ({

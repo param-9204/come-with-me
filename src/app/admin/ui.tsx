@@ -66,7 +66,7 @@ export const buttonClass = (
   cx(
     "inline-flex shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-md font-medium whitespace-nowrap transition-colors disabled:cursor-not-allowed disabled:opacity-50",
     size === "sm" ? "h-7 px-2.5 text-xs" : "h-8 px-3 text-[13px]",
-    variant === "primary" && "bg-ink text-canvas hover:bg-ink-2",
+    variant === "primary" && "bg-accent text-canvas hover:opacity-90",
     variant === "secondary" &&
       "border border-line-strong bg-surface text-ink hover:bg-subtle",
     variant === "ghost" && "text-ink-2 hover:bg-subtle hover:text-ink",

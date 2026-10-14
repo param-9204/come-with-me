@@ -1,5 +1,6 @@
 import * as stringSimilarity from 'string-similarity';
 import { LocationService } from './location.service';
+import { isCountryName, stripCountryFromCity } from '@/lib/country';
 import { plog } from './pipeline-log';
 import type {
   ApifyOcrFrameResult, EvidenceItem, EvidenceSource, GptVisionFrameResult,
@@ -750,9 +751,31 @@ function isCreatorOrAudio(name: string, bundle: EvidenceBundle): string | null {
  */
 function creatorOwnLocationLines(bundle: EvidenceBundle, places: ScorablePlace[], self: ScorablePlace): EvidenceItem[] {
   const others = places.filter((place) => place !== self && place.name && compact(place.name) !== compact(self.name || ''));
+  // A business can identify itself and show its pin entirely on-screen. Require
+  // both signals in the same frame so a creator watermark cannot use an
+  // unrelated location pin as venue evidence.
+  const selfNameFrames = new Set(
+    bundle.items
+      .filter((item) => isScreenText(item) && itemSupportsName(self.name || '', item))
+      .flatMap((item) => item.frames || [])
+  );
+  const isPhysicalVenueLocation = (item: EvidenceItem) =>
+    isScreenText(item) &&
+    /\b(?:shopping\s+(?:centre|center)|mall|plaza|market|square|(?:street|st|road|rd|avenue|ave|boulevard|blvd))\b/i.test(item.text);
   return bundle.items.filter((item) =>
     ((item.source === 'caption' || item.source === 'comment_creator') &&
       PIN_RE.test(item.text) &&
+      !others.some((place) => itemSupportsName(place.name || '', item))) ||
+    (isScreenText(item) &&
+      PIN_RE.test(item.text) &&
+      (item.frames || []).some((frame) => selfNameFrames.has(frame)) &&
+      !others.some((place) => itemSupportsName(place.name || '', item))) ||
+    // A static business advert may write its branch location without a pin
+    // ("Platinum Square Shopping Centre, Rustenburg"). When it shares frames
+    // with the business name, it is equivalent to an explicit own-location
+    // signal, not a creator watermark.
+    (isPhysicalVenueLocation(item) &&
+      (item.frames || []).some((frame) => selfNameFrames.has(frame)) &&
       !others.some((place) => itemSupportsName(place.name || '', item))) ||
     // A geotag naming the account itself is the business posting from its own
     // premises ("jawn.supply" tagged at "Jawn Supply", Dd4K-gwkVu2). A blogger's
@@ -804,6 +827,10 @@ export function sanitizeCandidateLocation<T extends { city: string; neighborhood
   // statements about where a place is.
   const items = bundle.items.filter((item) => item.source !== 'account');
 
+  if (next.city.trim()) {
+    const strippedCity = stripCountryFromCity(next.city);
+    next.city = isCountryName(strippedCity) ? '' : strippedCity;
+  }
   if (next.city.trim()) {
     const supporting = items.filter((item) => cityMentionedIn(next.city, item));
     if (supporting.length) supporting.forEach((item) => groundedLocationIds.add(item.id));
@@ -1064,7 +1091,7 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
       const otherVenues = places.filter((other) => other !== place && !!other.name && !isCityName(other.name)).length;
       const otherRepeated = repeatedVenues.size - (repeatedVenues.has(place) ? 1 : 0);
       const staticScreen = otherRepeated >= 3 && otherRepeated * 2 >= otherVenues;
-      if (visualGuideHeading && otherVenues > 0 && !staticScreen && support.every(isScreenText) && !support.some(isListItem) &&
+      if (visualGuideHeading && otherVenues > 0 && !staticScreen && ownVenueLocations.length === 0 && support.every(isScreenText) && !support.some(isListItem) &&
         repeatedFrames >= repeatedFrameMin) {
         reject('repeated visual guide title or watermark'); continue;
       }
@@ -1190,7 +1217,13 @@ export function mergeSameEntities(places: PlaceExtraction[], bundle: EvidenceBun
     const combined: PlaceExtraction = {
       ...existing,
       name: preferredName(existing, place),
-      city: existing.city || place.city,
+      city: (() => {
+        const c1 = stripCountryFromCity(existing.city);
+        const valid1 = isCountryName(c1) ? '' : c1;
+        if (valid1) return valid1;
+        const c2 = stripCountryFromCity(place.city);
+        return isCountryName(c2) ? '' : c2;
+      })(),
       neighborhood: existing.neighborhood || place.neighborhood,
       address: existing.address || place.address,
       description: existing.description || place.description,
