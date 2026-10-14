@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { ScraperService } from '@/lib/services/scraper.service';
 import { PipelineLog, recordPipelineOperation, withPipelineLog } from '@/lib/services/pipeline-log';
+import { processingErrorDetails } from '@/lib/processing-error';
 
 export async function GET(request: Request) {
   const log = new PipelineLog(`scrape-status-${Date.now()}`, { route: 'scrape-status' });
@@ -65,10 +66,13 @@ export async function GET(request: Request) {
     });
   } catch (error: any) {
     log.fail(error);
+    const details = processingErrorDetails(error);
     return NextResponse.json({
       success: false,
-      error: error.message || 'Failed to get scrape status',
-    }, { status: 500 });
+      error: details.message,
+      code: details.code,
+      retryable: details.retryable,
+    }, { status: details.httpStatus });
     } finally {
       log.flush();
       await log.flushDatabase();

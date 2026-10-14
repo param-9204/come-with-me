@@ -1,4 +1,5 @@
 import { supabaseAdmin } from '@/lib/supabase';
+import { processingErrorDetails } from '@/lib/processing-error';
 
 export type UrlProcessingJobStatus = 'queued' | 'processing' | 'waiting' | 'completed' | 'failed';
 
@@ -27,10 +28,6 @@ type CreateJobInput = Pick<UrlProcessingJob, 'source_url' | 'canonical_source_ke
 };
 
 const JOB_COLUMNS = 'id, user_id, source_url, canonical_source_key, platform, social_post_id, status, attempt_count, max_attempts, run_after, locked_at, locked_by, last_error, result, created_at, updated_at';
-
-function errorMessage(value: unknown): string {
-  return value instanceof Error ? value.message : String(value || 'Processing failed');
-}
 
 function retryAt(attempt: number): string {
   const minutes = Math.min(15, Math.max(1, 2 ** Math.max(0, attempt - 1)));
@@ -176,8 +173,8 @@ export class UrlProcessingJobsService {
       }
       throw new Error(payload?.error || `Processor returned HTTP ${response.status}`);
     } catch (error) {
-      const message = errorMessage(error);
-      const terminal = job.attempt_count >= job.max_attempts;
+      const details = processingErrorDetails(error);
+      const terminal = !details.retryable || job.attempt_count >= job.max_attempts;
       const { error: updateError } = await supabaseAdmin
         .from('social_post_accesses')
         .update({
@@ -185,7 +182,7 @@ export class UrlProcessingJobsService {
           run_after: terminal ? new Date().toISOString() : retryAt(job.attempt_count),
           locked_at: null,
           locked_by: null,
-          last_error: message.slice(0, 2_000),
+          last_error: details.message.slice(0, 2_000),
         })
         .eq('id', job.id)
         .eq('event', 'job')

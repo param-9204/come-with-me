@@ -63,6 +63,12 @@ and `result`. A completed image job includes the extracted `places`, `placeIds`,
 and other result fields in `result`; failed jobs expose their error in `error`.
 The alternative `GET /api/url-jobs?id=<jobId>` continues to return those fields
 inside `job`. Polling does not rerun extraction.
+URL jobs use the same terminal contract: a failed poll returns `success: false`,
+`status: "failed"`, `processing: false`, and the user-facing `error`. Known
+non-public Facebook Reels also return `code: "facebook_reel_not_public"` and
+`retryable: false`; these jobs fail on the first attempt instead of remaining in
+the retry queue. The `/api/url-jobs?id=<jobId>` alternative exposes the same
+failure fields both at the top level and inside `job`.
 Completed mobile image polls also expose `data`, `places`, and the other saved
 result fields at the top level. Fetch an image result with
 `GET /api/process-url?uploadedImageId=<uploadedImageId>` and the same Bearer token;

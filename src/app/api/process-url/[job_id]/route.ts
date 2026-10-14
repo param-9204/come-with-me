@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { getAuthUser, resolveProfileId } from '@/lib/auth';
 import { ImageProcessingJobsService } from '@/lib/services/image-processing-jobs.service';
 import { UrlProcessingJobsService } from '@/lib/services/url-processing-jobs.service';
+import { processingErrorDetails } from '@/lib/processing-error';
 
 /** Mobile polling endpoint: GET /api/process-url/{jobId}. */
 export async function GET(
@@ -42,14 +43,21 @@ export async function GET(
       }, { headers: { 'Cache-Control': 'private, no-store' } });
     }
 
+    const failure = job.status === 'failed'
+      ? processingErrorDetails(job.last_error)
+      : null;
+
     return NextResponse.json({
-      success: true,
+      success: job.status !== 'failed',
       jobId: job.id,
       status: job.status,
+      processing: ['queued', 'processing', 'waiting'].includes(job.status),
       socialPostId: job.social_post_id,
       attemptCount: job.attempt_count,
       maxAttempts: job.max_attempts,
-      error: job.status === 'failed' ? job.last_error : null,
+      error: failure?.message ?? null,
+      code: failure?.code ?? null,
+      retryable: failure?.retryable ?? null,
       suggested_title: typeof job.result?.suggested_title === 'string' ? job.result.suggested_title : null,
       result: job.result,
       createdAt: job.created_at,

@@ -13,6 +13,7 @@ import type { AudioUploadRef } from '@/lib/services/media-evidence.service';
 import { v4 as uuidv4 } from 'uuid';
 import { resolveCanonicalSocialSource } from '@/lib/social-source';
 import { UrlProcessingJobsService, type UrlProcessingJobStatus } from '@/lib/services/url-processing-jobs.service';
+import { processingErrorDetails } from '@/lib/processing-error';
 import { ImageProcessingJobsService } from '@/lib/services/image-processing-jobs.service';
 import { urlJobWorkerSecret } from '@/lib/url-job-worker';
 
@@ -857,6 +858,9 @@ export async function POST(request: Request) {
           }
         }
         const jobStatus = recoveredLegacyYoutubeMedia ? 'queued' : existingJob.status;
+        const failure = jobStatus === 'failed'
+          ? processingErrorDetails(existingJob.last_error)
+          : null;
         const workerScheduled = recoveredLegacyYoutubeMedia || ['queued', 'waiting'].includes(existingJob.status);
         if (workerScheduled) {
           const workerId = `repeat-${uuidv4()}`;
@@ -869,17 +873,21 @@ export async function POST(request: Request) {
           });
         }
         return NextResponse.json({
-          success: true,
+          success: jobStatus !== 'failed',
           reused: true,
           jobId: existingJob.id,
           socialPostId: existingJob.social_post_id,
           status: jobStatus,
+          processing: ['queued', 'processing', 'waiting'].includes(jobStatus),
+          error: failure?.message ?? null,
+          code: failure?.code ?? null,
+          retryable: failure?.retryable ?? null,
           suggested_title: typeof existingJob.result?.suggested_title === 'string'
             ? existingJob.result.suggested_title
             : null,
           workerScheduled,
           warning: null,
-        }, { status: 202 });
+        }, { status: failure?.httpStatus ?? 202 });
       }
 
       const claimed = await claimSocialPostForMobileJob(cleanUrl, platform, canonicalSourceKey, finalUserId);
@@ -1180,10 +1188,13 @@ export async function POST(request: Request) {
     });
   } catch (error: any) {
     console.error('[Process URL API] Error:', error);
+    const details = processingErrorDetails(error);
     return NextResponse.json({
       success: false,
-      error: error.message || 'Processing failed'
-    }, { status: 500 });
+      error: details.message,
+      code: details.code,
+      retryable: details.retryable,
+    }, { status: details.httpStatus });
   }
 }
 
