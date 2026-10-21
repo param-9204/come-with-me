@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
+import { redirect } from "next/navigation";
 
+import { getWebSessionFromCookies } from "@/lib/web-auth";
 import AdminNav from "./admin-nav";
 
 export const metadata: Metadata = {
@@ -7,11 +9,16 @@ export const metadata: Metadata = {
   robots: { index: false, follow: false },
 };
 
-export default function AdminLayout({
+export default async function AdminLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
+  const session = await getWebSessionFromCookies();
+  if (!session) {
+    redirect("/login?redirect=/admin");
+  }
+
   return (
     <div className="admin-root min-h-screen lg:grid lg:grid-cols-[208px_minmax(0,1fr)]">
       <AdminNav />
