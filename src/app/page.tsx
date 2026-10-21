@@ -1,6 +1,7 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import Link from "next/link";
 import type {
   SocialContent,
   AiAnalysisResult,
@@ -23,7 +24,7 @@ const Badge = ({
 }) => {
   const styles: Record<BadgeVariant, string> = {
     default:     "bg-zinc-800 text-zinc-300 border-zinc-700",
-    accent:      "bg-indigo-500/15 text-indigo-400 border-indigo-500/30",
+    accent:      "bg-[#7A1626]/20 text-[#e4a3af] border-[#7A1626]/40",
     success:     "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
     warn:        "bg-amber-500/15 text-amber-400 border-amber-500/30",
     destructive: "bg-red-500/15 text-red-400 border-red-500/30",
@@ -41,7 +42,7 @@ const ConfBar = ({ v }: { v: number }) => (
   <div className="flex items-center gap-2">
     <div className="flex-1 bg-zinc-800 rounded-full h-1">
       <div
-        className="h-1 rounded-full bg-indigo-500"
+        className="h-1 rounded-full bg-[#7A1626]"
         style={{ width: `${Math.round(v * 100)}%` }}
       />
     </div>
@@ -156,7 +157,7 @@ function OcrComparisonDemo({ ocr }: { ocr: OcrComparisonResult }) {
               onClick={() => setActiveTab(id)}
               className={`px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px ${
                 activeTab === id
-                  ? "text-zinc-100 border-indigo-500"
+                  ? "text-zinc-100 border-[#7A1626]"
                   : "text-zinc-500 border-transparent hover:text-zinc-300"
               }`}
             >
@@ -176,11 +177,11 @@ function OcrComparisonDemo({ ocr }: { ocr: OcrComparisonResult }) {
       <div className="grid grid-cols-2 gap-4">
         <div
           className={`rounded-lg p-4 border transition-colors bg-zinc-800/30 ${
-            activeTab === "gpt" ? "border-indigo-500/40" : "border-zinc-800 opacity-50"
+            activeTab === "gpt" ? "border-[#7A1626]/50" : "border-zinc-800 opacity-50"
           }`}
         >
           <div className="flex items-center gap-2 mb-3">
-            <div className="w-1.5 h-1.5 rounded-full bg-indigo-400 shrink-0" />
+            <div className="w-1.5 h-1.5 rounded-full bg-[#e4a3af] shrink-0" />
             <span className="text-xs font-semibold text-zinc-300">GPT-4o mini Vision</span>
           </div>
           <div className="grid grid-cols-2 gap-2">
@@ -403,7 +404,7 @@ function PlacesFound({ places }: { places: FoundPlace[] }) {
                 target="_blank"
                 rel="noopener noreferrer"
                 title="Open this location in Google Maps (new tab)"
-                className="inline-flex items-center gap-1.5 text-xs font-mono text-indigo-400 hover:text-indigo-300 hover:underline"
+                className="inline-flex items-center gap-1.5 text-xs font-mono text-[#e4a3af] hover:text-[#f2bac4] hover:underline"
               >
                 <IconMapPin />
                 {p.latitude!.toFixed(5)}, {p.longitude!.toFixed(5)}
@@ -465,7 +466,7 @@ function PipelineLogView({ phases }: { phases: LogPhase[] }) {
       <div className="flex flex-wrap items-center gap-2 text-xs">
         <button
           onClick={() => setOnlyProblems(false)}
-          className={`px-2 py-1 rounded-md border ${!onlyProblems ? "border-indigo-500 text-zinc-100" : "border-zinc-700 text-zinc-500"}`}
+          className={`px-2 py-1 rounded-md border ${!onlyProblems ? "border-[#7A1626] bg-[#7A1626]/20 text-zinc-100" : "border-zinc-700 text-zinc-500"}`}
         >
           All ({total})
         </button>
@@ -493,7 +494,7 @@ function PipelineLogView({ phases }: { phases: LogPhase[] }) {
                   <details key={index} className="px-2 py-1.5 group">
                     <summary className="cursor-pointer list-none flex items-baseline gap-2">
                       <span className="text-zinc-600 w-12 shrink-0 text-right tabular-nums">{(event.ms / 1000).toFixed(2)}s</span>
-                      <span className="text-indigo-400/80 w-20 shrink-0">{event.stage}</span>
+                      <span className="text-[#e4a3af]/90 w-20 shrink-0">{event.stage}</span>
                       <span className={`${LEVEL_STYLE[event.level]} break-words`}>{event.message}</span>
                       {event.data && <span className="text-zinc-600 ml-auto shrink-0 group-open:hidden">▸</span>}
                     </summary>
@@ -514,9 +515,32 @@ function PipelineLogView({ phases }: { phases: LogPhase[] }) {
 // ─── Main Page ─────────────────────────────────────────────────────────────────
 export default function Page() {
   const [url, setUrl] = useState("");
+  const [currentUserEmail, setCurrentUserEmail] = useState<string>("admin@example.com");
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [partialWarning, setPartialWarning] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetch("/api/auth/me")
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.authenticated && data.user?.email) {
+          setCurrentUserEmail(data.user.email);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  const handleLogout = async () => {
+    setIsLoggingOut(true);
+    try {
+      await fetch("/api/auth/logout", { method: "POST" });
+      window.location.href = "/login";
+    } catch {
+      window.location.href = "/login";
+    }
+  };
   const [activeSection, setActiveSection] = useState<string>("summary");
   const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
 
@@ -782,8 +806,50 @@ export default function Page() {
   ];
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-200 selection:bg-indigo-500/30">
+    <div className="min-h-screen bg-zinc-950 text-zinc-200 selection:bg-[#7A1626]/40">
       <div className="max-w-5xl mx-auto px-4 md:px-6 py-10 space-y-8">
+
+        {/* ── Top Navigation Bar ── */}
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800/80 pb-4">
+          <div className="flex items-center gap-2">
+            <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-sm shadow-emerald-500/50" />
+            <span className="text-xs font-semibold text-zinc-300 tracking-tight">
+              Come With Me <span className="text-zinc-500 font-normal">· Intelligence Portal</span>
+            </span>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <Link
+              href="/admin"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-1.5 text-xs font-medium text-zinc-300 hover:border-zinc-700 hover:text-zinc-100 transition-colors"
+            >
+              <span>Admin Console</span>
+              <svg className="w-3.5 h-3.5 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+              </svg>
+            </Link>
+
+            <div className="h-4 w-px bg-zinc-800" />
+
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-zinc-400 font-mono hidden sm:inline-block">
+                {currentUserEmail}
+              </span>
+              <button
+                type="button"
+                onClick={handleLogout}
+                disabled={isLoggingOut}
+                title="Sign out of Intelligence Scraper"
+                className="inline-flex items-center gap-1 rounded-lg border border-red-900/40 bg-red-950/20 px-2.5 py-1.5 text-xs font-medium text-red-400 hover:bg-red-950/50 hover:text-red-300 transition-colors cursor-pointer"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                </svg>
+                <span>{isLoggingOut ? "..." : "Sign Out"}</span>
+              </button>
+            </div>
+          </div>
+        </div>
 
         {/* ── Header ── */}
         <div className="space-y-6">
@@ -811,7 +877,7 @@ export default function Page() {
                 placeholder="Instagram, TikTok, YouTube Short, or Facebook Reel URL"
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
-                className="w-full pl-10 pr-4 py-2.5 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/50 transition-colors"
+                className="w-full pl-10 pr-4 py-2.5 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-[#7A1626] focus:ring-1 focus:ring-[#7A1626]/50 transition-colors"
                 required
               />
             </div>
@@ -885,7 +951,7 @@ export default function Page() {
                     }}
                     className={`px-4 py-3 text-sm font-medium whitespace-nowrap border-b-2 transition-colors ${
                       activeSection === s.id
-                        ? "text-zinc-100 border-indigo-500"
+                        ? "text-zinc-100 border-[#7A1626]"
                         : "text-zinc-500 border-transparent hover:text-zinc-300"
                     }`}
                   >
