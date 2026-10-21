@@ -1,9 +1,11 @@
 "use client";
 
-import { useState, useTransition, useEffect } from "react";
+import { Suspense, useState, useTransition, useEffect } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
-export default function LoginPage() {
+export const dynamic = "force-dynamic";
+
+function LoginFormContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const redirectTarget = searchParams.get("redirect") || "/";
@@ -54,12 +56,11 @@ export default function LoginPage() {
         }
 
         setIsSuccess(true);
-        // Clean navigation to target URL
         const safeDestination =
           redirectTarget.startsWith("/") && !redirectTarget.startsWith("/login")
             ? redirectTarget
             : "/";
-        
+
         setTimeout(() => {
           router.push(safeDestination);
           router.refresh();
@@ -353,7 +354,6 @@ export default function LoginPage() {
               )}
             </button>
           </form>
-
         </div>
 
         {/* Footer info note */}
@@ -362,5 +362,29 @@ export default function LoginPage() {
         </p>
       </div>
     </div>
+  );
+}
+
+function LoginLoadingFallback() {
+  return (
+    <div className="relative min-h-screen w-full bg-[#09090b] text-zinc-100 flex items-center justify-center p-4">
+      <div className="w-full max-w-md rounded-2xl border border-zinc-800/80 bg-zinc-900/60 p-7 sm:p-9 shadow-2xl backdrop-blur-xl animate-pulse">
+        <div className="h-8 w-44 bg-zinc-800 rounded mx-auto mb-3" />
+        <div className="h-4 w-60 bg-zinc-800/60 rounded mx-auto mb-8" />
+        <div className="space-y-4">
+          <div className="h-10 bg-zinc-800/50 rounded-xl" />
+          <div className="h-10 bg-zinc-800/50 rounded-xl" />
+          <div className="h-11 bg-[#7A1626]/50 rounded-xl" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={<LoginLoadingFallback />}>
+      <LoginFormContent />
+    </Suspense>
   );
 }
