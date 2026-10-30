@@ -322,6 +322,7 @@ export default function PostDetailView({
               post={{
                 id: postId,
                 display_url: optional(post.display_url),
+                thumbnail_url: optional(post.thumbnail_url),
                 image_urls: strings(post.images),
               }}
               className="h-12 w-10 shrink-0"
@@ -535,6 +536,23 @@ export default function PostDetailView({
                     >
                       Open ↗
                     </a>
+                  ) : null,
+                ],
+                [
+                  "Thumbnail URL",
+                  optional(post.thumbnail_url) ? (
+                    <div key="thumbnail" className="flex items-center gap-2">
+                      <a
+                        href={String(post.thumbnail_url)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="truncate max-w-40 text-accent hover:underline"
+                        title={String(post.thumbnail_url)}
+                      >
+                        Open ↗
+                      </a>
+                      <CopyButton value={String(post.thumbnail_url)} label="thumbnail URL" />
+                    </div>
                   ) : null,
                 ],
               ]}

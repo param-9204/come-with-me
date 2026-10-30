@@ -559,18 +559,33 @@ export class DbService {
     imageUrls: string[];
     caption: string;
   }): Promise<{ id: string }> {
-    const { data, error } = await supabaseAdmin
+    const thumbnailUrl = input.imageUrls?.[0] || null;
+    const payload: Record<string, unknown> = {
+      user_id: input.userId,
+      file_names: input.fileNames,
+      storage_paths: input.storagePaths,
+      image_urls: input.imageUrls,
+      thumbnail_url: thumbnailUrl,
+      caption: input.caption,
+      status: 'pending',
+    };
+
+    let { data, error } = await supabaseAdmin
       .from('uploaded_images')
-      .insert({
-        user_id: input.userId,
-        file_names: input.fileNames,
-        storage_paths: input.storagePaths,
-        image_urls: input.imageUrls,
-        caption: input.caption,
-        status: 'pending',
-      })
+      .insert(payload)
       .select('id')
       .single();
+
+    if (error && (error.code === '42703' || error.message?.includes('thumbnail_url'))) {
+      delete payload.thumbnail_url;
+      const retry = await supabaseAdmin
+        .from('uploaded_images')
+        .insert(payload)
+        .select('id')
+        .single();
+      data = retry.data;
+      error = retry.error;
+    }
     if (error || !data) throw new Error(`Failed to create uploaded image record: ${error?.message || 'missing ID'}`);
     return data;
   }
@@ -950,6 +965,7 @@ export class DbService {
       caption: content.caption,
       video_url: content.videoUrl || '',
       display_url: content.displayUrl || '',
+      thumbnail_url: content.thumbnailUrl || content.displayUrl || ScraperService.extractThumbnailUrl(rawApifyData) || null,
       first_comment: rawApifyData?.firstComment || null,
 
       // ── Metrics ─────────────────────────────────
@@ -1020,6 +1036,24 @@ export class DbService {
 
     if (error) {
       // Handle unique constraint duplicate violation by updating canonical row and resolving placeholder
+      // Gracefully handle unmigrated database missing thumbnail_url column (code 42703)
+      if (error.code === '42703' && error.message?.includes('thumbnail_url')) {
+        console.warn('[DB] thumbnail_url column does not exist yet in social_posts. Retrying without it...');
+        const payloadWithoutThumbnail = { ...finalPayload };
+        delete (payloadWithoutThumbnail as any).thumbnail_url;
+        const retryQuery = socialPostId
+          ? supabaseAdmin.from('social_posts').update(payloadWithoutThumbnail).eq('id', socialPostId)
+          : supabaseAdmin.from('social_posts').upsert(payloadWithoutThumbnail, { onConflict: 'platform, content_id' });
+        const { data: retryData, error: retryError } = await retryQuery.select('id').single();
+        if (!retryError) {
+          const finalPostId = retryData?.id || null;
+          if (finalPostId && placeIds.length > 0) {
+            await DbService.linkPlacesToSocialPost(finalPostId, placeIds);
+          }
+          return finalPostId;
+        }
+      }
+
       if (error.code === '23505' && socialPostId) {
         console.log(`[DB] Social post already exists. Merging payload into existing post...`);
         const { data: existingPost } = await supabaseAdmin
@@ -1107,6 +1141,7 @@ export class DbService {
         caption: post.caption || '',
         videoUrl: post.video_url || '',
         displayUrl: post.display_url || '',
+        thumbnailUrl: post.thumbnail_url || post.display_url || '',
         shortCode: post.short_code || '',
         hashtags: post.hashtags || [],
         mentions: post.mentions || [],

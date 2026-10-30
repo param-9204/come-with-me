@@ -57,22 +57,35 @@ export async function POST(request: Request) {
 
     // 3. Update database with basic card details and change status to 'scraped'
     console.log(`[Apify Webhook] Updating post ${socialPostId} in DB to 'scraped'...`);
-    const { error: updateError } = await supabaseAdmin
+    const updatePayload: Record<string, any> = {
+      status: 'scraped',
+      display_url: normalized.displayUrl || '',
+      thumbnail_url: normalized.thumbnailUrl || normalized.displayUrl || ScraperService.extractThumbnailUrl(raw) || '',
+      video_url: normalized.videoUrl || '',
+      caption: normalized.caption || '',
+      author_username: normalized.authorUsername || 'unknown',
+      owner_full_name: normalized.authorFullName || '',
+      likes: normalized.metrics.likes != null ? Math.round(Number(normalized.metrics.likes)) : 0,
+      comments: normalized.metrics.comments != null ? Math.round(Number(normalized.metrics.comments)) : 0,
+      content_type: normalized.contentType || 'reel',
+      content_id: normalized.contentId,
+      raw_apify_data: raw,
+    };
+
+    let { error: updateError } = await supabaseAdmin
       .from('social_posts')
-      .update({
-        status: 'scraped',
-        display_url: normalized.displayUrl || '',
-        video_url: normalized.videoUrl || '',
-        caption: normalized.caption || '',
-        author_username: normalized.authorUsername || 'unknown',
-        owner_full_name: normalized.authorFullName || '',
-        likes: normalized.metrics.likes != null ? Math.round(Number(normalized.metrics.likes)) : 0,
-        comments: normalized.metrics.comments != null ? Math.round(Number(normalized.metrics.comments)) : 0,
-        content_type: normalized.contentType || 'reel',
-        content_id: normalized.contentId,
-        raw_apify_data: raw,
-      })
+      .update(updatePayload)
       .eq('id', socialPostId);
+
+    if (updateError && updateError.code === '42703' && updateError.message?.includes('thumbnail_url')) {
+      console.warn('[Apify Webhook] thumbnail_url column missing, retrying update without it...');
+      delete updatePayload.thumbnail_url;
+      const retryResult = await supabaseAdmin
+        .from('social_posts')
+        .update(updatePayload)
+        .eq('id', socialPostId);
+      updateError = retryResult.error;
+    }
 
     if (updateError) {
       throw new Error(`Failed to update post status in DB: ${updateError.message}`);

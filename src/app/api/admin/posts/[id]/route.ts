@@ -657,6 +657,7 @@ async function uploadedImageDetail(id: string) {
       owner_full_name: null,
       caption: text(uploadRow.caption) || "",
       display_url: uploadedImageUrls[0] || null,
+      thumbnail_url: text(uploadRow.thumbnail_url) || uploadedImageUrls[0] || null,
       images: uploadedImageUrls,
       post_url: null,
       status: text(uploadRow.status) || "pending",

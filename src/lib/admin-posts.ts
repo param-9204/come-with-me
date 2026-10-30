@@ -15,6 +15,7 @@ export type AdminPostSummary = {
   author_username: string | null;
   caption: string | null;
   display_url: string | null;
+  thumbnail_url: string | null;
   image_urls: string[];
   post_url: string | null;
   likes: number | null;
@@ -181,6 +182,21 @@ export function normalizeAdminPost(post: Json) {
     rawVideo.dynamicCoverUrl,
     scrapedImages[0],
   );
+  const thumbnailUrl = firstText(
+    post.thumbnail_url,
+    raw.thumbnailUrl,
+    raw.thumbnail_url,
+    raw.thumbnail,
+    rawVideo.originalCoverUrl,
+    rawVideo.coverUrl,
+    rawVideo.dynamicCoverUrl,
+    raw.coverUrl,
+    raw.originalCoverUrl,
+    post.display_url,
+    raw.displayUrl,
+    raw.imageUrl,
+    scrapedImages[0],
+  );
   const imageUrls = urls(displayUrl, scrapedImages);
   const musicName = firstText(
     savedMusic.song_name,
@@ -226,6 +242,7 @@ export function normalizeAdminPost(post: Json) {
       rawVideo.playUrl,
     ),
     display_url: displayUrl,
+    thumbnail_url: thumbnailUrl,
     image_urls: imageUrls,
     images: imageUrls,
     likes: asNumber(
@@ -377,6 +394,7 @@ function normalizeUploadedImage(upload: Json): AdminPostSummary {
     author_username: "image-upload",
     caption: firstText(upload.caption) || "",
     display_url: imageUrls[0] || null,
+    thumbnail_url: firstText(upload.thumbnail_url, imageUrls[0]) || null,
     image_urls: imageUrls,
     post_url: null,
     likes: null,
@@ -550,10 +568,22 @@ function applyFilters(
 async function getUploadedImageSummaries(
   filters: AdminPostFilters,
 ): Promise<AdminPostSummary[]> {
-  const { data, error } = await supabaseAdmin
+  const primary = await supabaseAdmin
     .from("uploaded_images")
-    .select("id, user_id, image_urls, caption, ai_analysis, status, created_at")
+    .select("id, user_id, image_urls, thumbnail_url, caption, ai_analysis, status, created_at")
     .order("created_at", { ascending: false });
+
+  let rows: Json[] = (primary.data ?? []) as Json[];
+  let error = primary.error;
+
+  if (error && (error.code === '42703' || error.message?.includes('thumbnail_url'))) {
+    const fallback = await supabaseAdmin
+      .from("uploaded_images")
+      .select("id, user_id, image_urls, caption, ai_analysis, status, created_at")
+      .order("created_at", { ascending: false });
+    rows = (fallback.data ?? []) as Json[];
+    error = fallback.error;
+  }
 
   // Keep the established social-post directory available if an environment has
   // not yet applied the image-upload migration.
@@ -562,7 +592,7 @@ async function getUploadedImageSummaries(
     return [];
   }
 
-  return ((data ?? []) as Json[])
+  return rows
     .map(normalizeUploadedImage)
     .filter((post) => matchesUploadedImageFilters(post, filters));
 }
@@ -640,21 +670,28 @@ export async function getAdminPostPage(
     return { posts: [], total: 0, nextOffset: null, error: countError.message };
   }
 
-  const fields =
+  const fieldsWithThumbnail =
+    "id, user_id, place_id, platform, content_type, content_id, author_username, caption, display_url, thumbnail_url, post_url, likes, views, comments, primary_category, short_code, status, created_at, raw_apify_data";
+  const fieldsFallback =
     "id, user_id, place_id, platform, content_type, content_id, author_username, caption, display_url, post_url, likes, views, comments, primary_category, short_code, status, created_at, raw_apify_data";
-  let pageQuery = applyFilters(
-    supabaseAdmin.from("social_posts").select(fields),
-    options,
-    scope,
-  ).order(sort, { ascending: Boolean(options.ascending), nullsFirst: false });
-  // Stable order for ties (equal like counts, identical timestamps).
-  if (sort !== "created_at")
-    pageQuery = pageQuery.order("created_at", { ascending: false });
-  // Read from the start because uploaded images and social posts are merged and
-  // sorted together below. This still reads only the rows needed for this page.
-  const { data, error } = await pageQuery
-    .order("id", { ascending: true })
-    .range(0, offset + limit - 1);
+
+  const executePageQuery = async (fieldList: string) => {
+    let q = applyFilters(
+      supabaseAdmin.from("social_posts").select(fieldList),
+      options,
+      scope,
+    ).order(sort, { ascending: Boolean(options.ascending), nullsFirst: false });
+    if (sort !== "created_at")
+      q = q.order("created_at", { ascending: false });
+    return q.order("id", { ascending: true }).range(0, offset + limit - 1);
+  };
+
+  let { data, error } = await executePageQuery(fieldsWithThumbnail);
+  if (error && (error.code === "42703" || error.message?.includes("thumbnail_url"))) {
+    const fallbackRes = await executePageQuery(fieldsFallback);
+    data = fallbackRes.data;
+    error = fallbackRes.error;
+  }
 
   if (error) {
     console.error("[Admin] Unable to load posts:", error.message);
