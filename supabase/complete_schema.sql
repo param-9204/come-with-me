@@ -194,9 +194,16 @@ CREATE TABLE IF NOT EXISTS public.saved_places (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid REFERENCES public.profiles(id) ON DELETE CASCADE NOT NULL,
   place_id uuid REFERENCES public.places(id) ON DELETE CASCADE NOT NULL,
+  social_post_id uuid REFERENCES public.social_posts(id) ON DELETE CASCADE,
+  uploaded_image_id uuid REFERENCES public.uploaded_images(id) ON DELETE CASCADE,
   created_at timestamptz DEFAULT now(),
   UNIQUE(user_id, place_id)
 );
+ALTER TABLE public.saved_places ADD COLUMN IF NOT EXISTS social_post_id uuid REFERENCES public.social_posts(id) ON DELETE CASCADE;
+ALTER TABLE public.saved_places ADD COLUMN IF NOT EXISTS uploaded_image_id uuid REFERENCES public.uploaded_images(id) ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS idx_saved_places_social_post_id ON public.saved_places(social_post_id);
+CREATE INDEX IF NOT EXISTS idx_saved_places_uploaded_image_id ON public.saved_places(uploaded_image_id);
+
 
 -- 6. LISTS TABLE (strictly like Image 2)
 CREATE TABLE IF NOT EXISTS public.lists (

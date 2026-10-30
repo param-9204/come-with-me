@@ -45,12 +45,24 @@ export async function GET(request: Request) {
     const city = searchParams.get('city')?.trim() ?? '';
 
     // ── Fetch saved place IDs for user ──────────────────────────────
-    const { data: savedEntries, error: savedError, count } = await supabaseAdmin
+    let { data: savedEntries, error: savedError, count } = await supabaseAdmin
       .from('saved_places')
-      .select('created_at, place_id, social_post_id', { count: 'exact' })
+      .select('created_at, place_id, social_post_id, uploaded_image_id', { count: 'exact' })
       .eq('user_id', user.id)
       .order('created_at', { ascending })
       .range(offset, offset + limit - 1);
+
+    if (savedError && (savedError.code === '42703' || savedError.message?.includes('uploaded_image_id'))) {
+      const fallback = await supabaseAdmin
+        .from('saved_places')
+        .select('created_at, place_id, social_post_id', { count: 'exact' })
+        .eq('user_id', user.id)
+        .order('created_at', { ascending })
+        .range(offset, offset + limit - 1);
+      savedEntries = fallback.data as any;
+      savedError = fallback.error;
+      count = fallback.count;
+    }
 
     if (savedError) {
       console.error('[Saved Places GET] Query error:', savedError);
@@ -71,6 +83,9 @@ export async function GET(request: Request) {
     );
     const socialPostIdMap: Record<string, string | null> = Object.fromEntries(
       savedEntries.map((e: any) => [e.place_id, e.social_post_id || null])
+    );
+    const uploadedImageIdMap: Record<string, string | null> = Object.fromEntries(
+      savedEntries.map((e: any) => [e.place_id, (e as any).uploaded_image_id || null])
     );
 
     // ── Fetch full place details ─────────────────────────────────────
@@ -141,6 +156,8 @@ export async function GET(request: Request) {
         image_urls: Array.isArray(p?.image_urls) ? p.image_urls : [],
         image_attributions: Array.isArray(p?.image_attributions) ? p.image_attributions : [],
         social_post_id: socialPostIdMap[p.id] ?? null,
+        uploaded_image_id: uploadedImageIdMap[p.id] ?? null,
+        uploadedImageId: uploadedImageIdMap[p.id] ?? null,
         saved_at: savedAtMap[p.id] ?? null,
         author_username: rawAuthorUsername,
         creator_handle: effectiveHandle,
@@ -179,22 +196,43 @@ export async function POST(request: Request) {
     }
 
     const body = await request.json();
-    const { placeId, socialPostId, social_post_id } = body;
+    const { placeId, socialPostId, social_post_id, uploadedImageId, uploaded_image_id } = body;
     const finalSocialPostId = socialPostId || social_post_id || null;
+    const finalUploadedImageId = uploadedImageId || uploaded_image_id || null;
 
     if (!placeId) {
       return NextResponse.json({ error: 'Missing required field: placeId' }, { status: 400 });
     }
 
-    const { data, error } = await supabaseAdmin
+    const insertPayload: Record<string, any> = {
+      user_id: user.id,
+      place_id: placeId,
+      social_post_id: finalSocialPostId,
+    };
+    if (finalUploadedImageId) {
+      insertPayload.uploaded_image_id = finalUploadedImageId;
+    }
+
+    let insertResult = await supabaseAdmin
       .from('saved_places')
-      .insert({
-        user_id: user.id,
-        place_id: placeId,
-        social_post_id: finalSocialPostId,
-      })
+      .insert(insertPayload)
       .select('id')
       .single();
+
+    if (
+      insertResult.error &&
+      (insertResult.error.code === '42703' || insertResult.error.message?.includes('uploaded_image_id')) &&
+      insertPayload.uploaded_image_id
+    ) {
+      delete insertPayload.uploaded_image_id;
+      insertResult = await supabaseAdmin
+        .from('saved_places')
+        .insert(insertPayload)
+        .select('id')
+        .single();
+    }
+
+    const { data, error } = insertResult;
 
     if (error) {
       if (error.code === '23505') {

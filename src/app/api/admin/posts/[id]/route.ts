@@ -571,7 +571,7 @@ async function uploadedImageDetail(id: string) {
   const uploadProcessing = data(analysis.upload_processing);
   const uploadedImageUrls = words(uploadRow.image_urls);
 
-  const [profileResult, linksResult] = await Promise.all([
+  const [profileResult, linksResult, savedPlacesResult] = await Promise.all([
     text(uploadRow.user_id)
       ? supabaseAdmin
           .from("profiles")
@@ -582,6 +582,11 @@ async function uploadedImageDetail(id: string) {
     supabaseAdmin
       .from("social_post_places")
       .select("id, place_id, confidence, explanation, evidence, created_at")
+      .eq("uploaded_image_id", id)
+      .order("created_at", { ascending: false }),
+    supabaseAdmin
+      .from("saved_places")
+      .select("*")
       .eq("uploaded_image_id", id)
       .order("created_at", { ascending: false }),
   ]);
@@ -711,7 +716,12 @@ async function uploadedImageDetail(id: string) {
             first_requested_at: uploadRow.created_at,
           }]
         : [],
-      saves: { total: 0, users: 0, been_here: 0, want_to_go: 0 },
+      saves: {
+        total: (savedPlacesResult.data ?? []).length,
+        users: new Set((savedPlacesResult.data ?? []).map((save: any) => save.user_id)).size,
+        been_here: (savedPlacesResult.data ?? []).filter((save: any) => save.status === "BEEN_HERE").length,
+        want_to_go: (savedPlacesResult.data ?? []).filter((save: any) => save.status === "WANT_TO_GO").length,
+      },
       upload: {
         file_names: words(uploadRow.file_names),
         image_urls: uploadedImageUrls,
@@ -723,10 +733,11 @@ async function uploadedImageDetail(id: string) {
     },
     warnings: [
       linksResult.error, placesResult.error, profileResult.error,
+      savedPlacesResult.error,
       runsResult.error, summaryResult.error, stagesResult.error, eventsResult.error,
       candidatesResult.error, evidenceResult.error,
     ]
-      .filter(Boolean)
+      .filter((err) => err && !isMissingTableOrColumn(err as { code?: string; message?: string }))
       .map((error) => (error as { message: string }).message),
   });
 }
