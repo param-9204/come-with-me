@@ -81,6 +81,8 @@ export async function GET(
       message: 'Place details retrieved successfully',
       place: {
         ...place,
+        image_urls: Array.isArray(place?.image_urls) ? place.image_urls : [],
+        image_attributions: Array.isArray(place?.image_attributions) ? place.image_attributions : [],
         author_username: rawAuthorUsername,
         creator_handle: primaryCreatorHandle,
         creators,

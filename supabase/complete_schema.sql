@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS public.places (
   user_id uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
   audio_transcript text,
   social_post_id uuid, -- Foreign key constraint ensured safely below
+  image_urls text[] DEFAULT '{}',
+  image_attributions text[] DEFAULT '{}',
+  image_source text DEFAULT 'google',
+  image_fetched_at timestamptz DEFAULT now(),
   created_at timestamptz DEFAULT now()
 );
 

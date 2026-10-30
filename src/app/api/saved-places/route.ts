@@ -138,6 +138,8 @@ export async function GET(request: Request) {
 
       return {
         ...p,
+        image_urls: Array.isArray(p?.image_urls) ? p.image_urls : [],
+        image_attributions: Array.isArray(p?.image_attributions) ? p.image_attributions : [],
         social_post_id: socialPostIdMap[p.id] ?? null,
         saved_at: savedAtMap[p.id] ?? null,
         author_username: rawAuthorUsername,

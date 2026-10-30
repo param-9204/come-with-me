@@ -214,6 +214,9 @@ function formatResponsePlaces(
     place_id: place?.id || place?.place_id || null,
     latitude: place?.latitude ?? null,
     longitude: place?.longitude ?? null,
+    image_urls: Array.isArray(place?.image_urls) ? place.image_urls : [],
+    image_attributions: Array.isArray(place?.image_attributions) ? place.image_attributions : [],
+    image_source: place?.image_source || (Array.isArray(place?.image_urls) && place.image_urls.length > 0 ? 'google' : null),
     author_username: usableUsername(place?.author_username) || authorUsername,
     creator_handle: usableUsername(place?.creator_handle) ? `@${usableUsername(place.creator_handle)}` : creatorHandle,
     creators: Array.isArray(place?.creators) && place.creators.length > 0

@@ -371,6 +371,8 @@ async function handleAnalyze(request: Request, log: PipelineLog) {
       ...p,
       place_id: p.id || p.place_id,
       map_url: googleMapsUrl(p),
+      image_urls: Array.isArray(p?.image_urls) ? p.image_urls : [],
+      image_attributions: Array.isArray(p?.image_attributions) ? p.image_attributions : [],
       author_username: finalAuthorUsername,
       creator_handle: finalCreatorHandle,
       creators: finalCreatorHandle ? [{ creator_handle: finalCreatorHandle, post_url: url, platform: content?.platform }] : [],

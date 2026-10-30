@@ -375,55 +375,119 @@ type FoundPlace = {
   latitude?: number | null;
   longitude?: number | null;
   map_url?: string | null;
+  image_urls?: string[];
+  image_attributions?: string[];
+  image_source?: string | null;
 };
+
+function PlaceCard({ place: p, index }: { place: FoundPlace; index: number }) {
+  const images = Array.isArray(p.image_urls) ? p.image_urls.filter((url): url is string => typeof url === 'string' && url.trim().length > 0) : [];
+  const attributions = Array.isArray(p.image_attributions) ? p.image_attributions : [];
+  const [activeImgIndex, setActiveImgIndex] = useState(0);
+
+  const hasCoords = typeof p.latitude === "number" && typeof p.longitude === "number";
+  const currentImage = images[activeImgIndex] || images[0];
+  const currentAttribution = attributions[activeImgIndex] || attributions[0] || (images.length > 0 ? "Google Maps" : null);
+
+  return (
+    <div
+      key={p.id || p.place_id || `${p.name}-${index}`}
+      className="bg-zinc-800/60 rounded-md p-3 space-y-2 border border-zinc-700/50"
+    >
+      <div className="flex gap-3 items-start">
+        {images.length > 0 ? (
+          <div className="flex flex-col items-center gap-1.5 shrink-0">
+            <div className="relative w-20 h-20 sm:w-24 sm:h-24 rounded-lg overflow-hidden bg-zinc-900 border border-zinc-700/60 shadow-sm">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={currentImage}
+                alt={p.name}
+                loading="lazy"
+                referrerPolicy="no-referrer"
+                className="w-full h-full object-cover transition-opacity duration-200"
+              />
+              {images.length > 1 && (
+                <span className="absolute bottom-1 right-1 rounded bg-black/75 px-1 py-0.5 text-[9px] font-mono font-medium text-white shadow">
+                  {activeImgIndex + 1}/{images.length}
+                </span>
+              )}
+            </div>
+
+            {images.length > 1 && (
+              <div className="flex items-center gap-1">
+                {images.map((img, i) => (
+                  <button
+                    key={`${img}-${i}`}
+                    type="button"
+                    onClick={() => setActiveImgIndex(i)}
+                    className={`h-1.5 rounded-full transition-all ${
+                      i === activeImgIndex ? "w-4 bg-[#e4a3af]" : "w-1.5 bg-zinc-600 hover:bg-zinc-400"
+                    }`}
+                    title={`View photo ${i + 1}`}
+                    aria-label={`View photo ${i + 1}`}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="w-20 h-20 sm:w-24 sm:h-24 shrink-0 rounded-lg bg-zinc-800/80 border border-zinc-700/40 flex flex-col items-center justify-center text-zinc-500 gap-1">
+            <IconMapPin />
+            <span className="text-[10px] text-zinc-500">No Photo</span>
+          </div>
+        )}
+
+        <div className="flex-1 min-w-0">
+          <div className="flex items-start justify-between gap-2">
+            <h3 className="text-sm font-semibold text-zinc-100 truncate">{p.name}</h3>
+            {p.category && <Badge label={p.category} variant="success" />}
+          </div>
+          {(p.neighborhood || p.city) && (
+            <p className="text-xs text-zinc-400 mt-0.5">{[p.neighborhood, p.city].filter(Boolean).join(", ")}</p>
+          )}
+          {p.address && <p className="text-xs text-zinc-500 mt-0.5 truncate">{p.address}</p>}
+
+          {currentAttribution && (
+            <p className="text-[10px] text-zinc-500 mt-1 truncate" title={`Photo: ${currentAttribution}`}>
+              📷 Photo: {currentAttribution}
+            </p>
+          )}
+        </div>
+      </div>
+
+      {hasCoords && p.map_url ? (
+        <a
+          href={p.map_url}
+          target="_blank"
+          rel="noopener noreferrer"
+          title="Open this location in Google Maps (new tab)"
+          className="inline-flex items-center gap-1.5 text-xs font-mono text-[#e4a3af] hover:text-[#f2bac4] hover:underline"
+        >
+          <IconMapPin />
+          {p.latitude!.toFixed(5)}, {p.longitude!.toFixed(5)}
+          <span aria-hidden>↗</span>
+        </a>
+      ) : (
+        <p className="text-xs text-amber-400/80">No coordinates: not verified on Google Maps, so not saved to the map.</p>
+      )}
+
+      {p.explanation && <p className="text-xs text-zinc-400 leading-relaxed">{p.explanation}</p>}
+      <div className="flex items-center gap-2">
+        <span className="text-[11px] text-zinc-600">Confidence</span>
+        <div className="flex-1">
+          <ConfBar v={p.confidence || 0} />
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function PlacesFound({ places }: { places: FoundPlace[] }) {
   return (
     <div className="space-y-3">
-      {places.map((p, index) => {
-        const hasCoords = typeof p.latitude === "number" && typeof p.longitude === "number";
-        return (
-          <div
-            key={p.id || p.place_id || `${p.name}-${index}`}
-            className="bg-zinc-800/60 rounded-md px-3 py-3 space-y-2 border border-zinc-700/50"
-          >
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <h3 className="text-sm font-semibold text-zinc-100">{p.name}</h3>
-                {(p.neighborhood || p.city) && (
-                  <p className="text-xs text-zinc-400 mt-0.5">{[p.neighborhood, p.city].filter(Boolean).join(", ")}</p>
-                )}
-                {p.address && <p className="text-xs text-zinc-500 mt-0.5">{p.address}</p>}
-              </div>
-              {p.category && <Badge label={p.category} variant="success" />}
-            </div>
-
-            {hasCoords && p.map_url ? (
-              <a
-                href={p.map_url}
-                target="_blank"
-                rel="noopener noreferrer"
-                title="Open this location in Google Maps (new tab)"
-                className="inline-flex items-center gap-1.5 text-xs font-mono text-[#e4a3af] hover:text-[#f2bac4] hover:underline"
-              >
-                <IconMapPin />
-                {p.latitude!.toFixed(5)}, {p.longitude!.toFixed(5)}
-                <span aria-hidden>↗</span>
-              </a>
-            ) : (
-              <p className="text-xs text-amber-400/80">No coordinates: not verified on Google Maps, so not saved to the map.</p>
-            )}
-
-            {p.explanation && <p className="text-xs text-zinc-400 leading-relaxed">{p.explanation}</p>}
-            <div className="flex items-center gap-2">
-              <span className="text-[11px] text-zinc-600">Confidence</span>
-              <div className="flex-1">
-                <ConfBar v={p.confidence || 0} />
-              </div>
-            </div>
-          </div>
-        );
-      })}
+      {places.map((p, index) => (
+        <PlaceCard key={p.id || p.place_id || `${p.name}-${index}`} place={p} index={index} />
+      ))}
     </div>
   );
 }

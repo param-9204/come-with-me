@@ -189,6 +189,8 @@ export async function GET(request: Request) {
 
       return {
         ...p,
+        image_urls: Array.isArray(p?.image_urls) ? p.image_urls : [],
+        image_attributions: Array.isArray(p?.image_attributions) ? p.image_attributions : [],
         author_username: rawAuthorUsername,
         creator_handle: effectiveHandle,
         creators: creatorsList,

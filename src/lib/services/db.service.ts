@@ -1,7 +1,9 @@
 import { supabaseAdmin } from '../supabase';
 import { resolveProfileId } from '../auth';
 import type { SocialContent, AiAnalysisResult, ApifyOcrFrameResult, GptVisionFrameResult, PlaceExtraction, PlaceCategory } from '../types/social';
-import { LocationService, type GeocodeResult } from './location.service';
+import { randomUUID } from 'node:crypto';
+import { LocationService, type GeocodeResult, type PlacePhotoInfo } from './location.service';
+import { PlaceImageService } from './place-image.service';
 import { isCountryName } from '@/lib/country';
 import { AiEnrichmentService } from './ai-enrichment.service';
 import { ScraperService } from './scraper.service';
@@ -351,6 +353,10 @@ export class DbService {
     const existingByGoogleId = await DbService.findPlaceByGoogleId(geocode?.placeId);
     if (existingByGoogleId) {
       plog('db', `"${placeData.name}" already in database (same Google place)`, { placeId: existingByGoogleId, googlePlaceId: geocode?.placeId });
+      const googleApiKey = process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_PLACES_API_KEY || '';
+      if (geocode?.photos && geocode.photos.length > 0 && googleApiKey) {
+        DbService.backfillPlacePhotosIfMissing(existingByGoogleId, geocode.photos, googleApiKey).catch(() => {});
+      }
       await link(existingByGoogleId, { verified, ambiguous, provider: geocode?.provider });
       return existingByGoogleId;
     }
@@ -500,41 +506,120 @@ export class DbService {
       ? geocode!.matchedName!
       : placeData.name.trim().replace(/^\s*\d{1,3}\s*[.)]\s+/, '');
 
-    const { data: newPlace, error } = await supabaseAdmin
+    const newPlaceId = randomUUID();
+    let imageUrls: string[] = [];
+    let imageAttributions: string[] = [];
+    const googleApiKey = process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_PLACES_API_KEY || '';
+
+    if (geocode?.photos && geocode.photos.length > 0 && googleApiKey) {
+      try {
+        const photoResult = await PlaceImageService.uploadGooglePlacePhotos({
+          photos: geocode.photos,
+          placeId: newPlaceId,
+          apiKey: googleApiKey,
+        });
+        imageUrls = photoResult.imageUrls;
+        imageAttributions = photoResult.imageAttributions;
+      } catch (err: any) {
+        plog('db', `Failed to upload photos for "${displayName}": ${err.message}`, {}, 'warn');
+      }
+    }
+
+    const insertPayload: Record<string, unknown> = {
+      id: newPlaceId,
+      name: displayName,
+      address: address || '',
+      city: LocationService.cleanCityName(city),
+      neighborhood,
+      category,
+      description: placeData.description || '',
+      source: sourcePlatform,
+      source_url: sourceUrl || '',
+      audio_transcript: audioTranscript || '',
+      latitude: lat,
+      longitude: lng,
+      ...(supportsGoogleId && geocode?.placeId ? { google_place_id: geocode.placeId } : {}),
+      ...(imageUrls.length > 0 ? {
+        image_urls: imageUrls,
+        image_attributions: imageAttributions,
+        image_source: 'google',
+        image_fetched_at: new Date().toISOString(),
+      } : {}),
+    };
+
+    let { data: newPlace, error } = await supabaseAdmin
       .from('places')
-      .insert({
-        name: displayName,
-        address: address || '',
-        city: LocationService.cleanCityName(city),
-        neighborhood,
-        category,
-        description: placeData.description || '',
-        source: sourcePlatform,
-        source_url: sourceUrl || '',
-        audio_transcript: audioTranscript || '',
-        latitude: lat,
-        longitude: lng,
-        ...(supportsGoogleId && geocode?.placeId ? { google_place_id: geocode.placeId } : {}),
-      })
+      .insert(insertPayload)
       .select('id')
       .single();
 
-    if (error) {
+    if (error && (error.code === '42703' || error.message?.includes('image_urls'))) {
+      delete insertPayload.image_urls;
+      delete insertPayload.image_attributions;
+      delete insertPayload.image_source;
+      delete insertPayload.image_fetched_at;
+      const retry = await supabaseAdmin
+        .from('places')
+        .insert(insertPayload)
+        .select('id')
+        .single();
+      newPlace = retry.data;
+      error = retry.error;
+    }
+
+    if (error || !newPlace) {
       // A parallel save of the same Google place won the unique index race.
-      if (error.code === '23505' && geocode?.placeId) {
+      if (error && error.code === '23505' && geocode?.placeId) {
         const winner = await DbService.findPlaceByGoogleId(geocode.placeId);
         if (winner) {
           await link(winner, { verified, ambiguous, provider: geocode?.provider });
           return winner;
         }
       }
-      plog('db', `Insert failed for "${placeData.name}"`, { error: error.message, code: error.code }, 'error');
-      throw new Error(`Failed to save place: ${error.message}`);
+      plog('db', `Insert failed for "${placeData.name}"`, { error: error?.message || 'missing data', code: error?.code }, 'error');
+      throw new Error(`Failed to save place: ${error?.message || 'Insert returned no data'}`);
     }
 
     plog('db', `Saved new place "${displayName}"`, { placeId: newPlace.id, lat, lng, address, category, googlePlaceId: geocode?.placeId || null, verified });
     await link(newPlace.id, { verified, ambiguous, provider: geocode?.provider });
     return newPlace.id;
+  }
+
+  /**
+   * If an existing place lacks photos, downloads and attaches up to 3 photos from Google Places.
+   */
+  static async backfillPlacePhotosIfMissing(placeId: string, photos: PlacePhotoInfo[], apiKey: string): Promise<void> {
+    try {
+      const { data: existing, error } = await supabaseAdmin
+        .from('places')
+        .select('image_urls')
+        .eq('id', placeId)
+        .maybeSingle();
+
+      if (error || !existing || (Array.isArray(existing.image_urls) && existing.image_urls.length > 0)) {
+        return;
+      }
+
+      const { imageUrls, imageAttributions } = await PlaceImageService.uploadGooglePlacePhotos({
+        photos,
+        placeId,
+        apiKey,
+      });
+
+      if (imageUrls.length > 0) {
+        await supabaseAdmin
+          .from('places')
+          .update({
+            image_urls: imageUrls,
+            image_attributions: imageAttributions,
+            image_source: 'google',
+            image_fetched_at: new Date().toISOString(),
+          })
+          .eq('id', placeId);
+      }
+    } catch {
+      // Non-fatal background photo backfill
+    }
   }
   // ──────────────────────────────────────────────────────────────────
   static async linkPlacesToSocialPost(socialPostId: string, placeIds: string[]): Promise<void> {
