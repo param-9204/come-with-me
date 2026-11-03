@@ -146,6 +146,65 @@ export class ScraperService {
   }
 
   /**
+   * Extract thumbnail image URL from Apify raw payload across platforms.
+   */
+  static extractThumbnailUrl(raw: Record<string, any> | null | undefined): string | null {
+    if (!raw || typeof raw !== 'object') return null;
+
+    const direct = this.firstHttpsUrl(
+      raw.thumbnailUrl,
+      raw.thumbnail_url,
+      raw.thumbnail,
+      raw.videoMeta?.originalCoverUrl,
+      raw.videoMeta?.coverUrl,
+      raw.videoMeta?.dynamicCoverUrl,
+      raw.coverUrl,
+      raw.originalCoverUrl,
+      raw.displayUrl,
+      raw.imageUrl,
+      raw.imageURL,
+      raw.media_fallback?.thumbnailUrl,
+      raw.media_fallback?.coverUrl
+    );
+    if (direct) return direct;
+
+    if (Array.isArray(raw.images) && raw.images.length > 0) {
+      const firstImg = raw.images[0];
+      const url = typeof firstImg === 'string' ? firstImg : firstImg?.url || firstImg?.display_image?.url_list?.[0];
+      if (typeof url === 'string' && /^https:\/\//i.test(url.trim())) return url.trim();
+    }
+
+    if (Array.isArray(raw.thumbnails) && raw.thumbnails.length > 0) {
+      const firstThumb = raw.thumbnails[0];
+      const url = typeof firstThumb === 'string' ? firstThumb : firstThumb?.url;
+      if (typeof url === 'string' && /^https:\/\//i.test(url.trim())) return url.trim();
+    }
+
+    if (Array.isArray(raw.childPosts) && raw.childPosts.length > 0) {
+      const firstChild = raw.childPosts[0];
+      const url = firstChild?.displayUrl || firstChild?.url;
+      if (typeof url === 'string' && /^https:\/\//i.test(url.trim())) return url.trim();
+    }
+
+    if (Array.isArray(raw.thumbnail_resources) && raw.thumbnail_resources.length > 0) {
+      const src = raw.thumbnail_resources[0]?.src;
+      if (typeof src === 'string' && /^https:\/\//i.test(src.trim())) return src.trim();
+    }
+
+    if (Array.isArray(raw.display_resources) && raw.display_resources.length > 0) {
+      const src = raw.display_resources[0]?.src;
+      if (typeof src === 'string' && /^https:\/\//i.test(src.trim())) return src.trim();
+    }
+
+    const candidate = raw.image_versions2?.candidates?.[0]?.url;
+    if (typeof candidate === 'string' && /^https:\/\//i.test(candidate.trim())) {
+      return candidate.trim();
+    }
+
+    return null;
+  }
+
+  /**
    * Apify's video-download add-on returns a private KVS record URL. Convert
    * only that exact record shape into a record-scoped signed URL; never put
    * the account token in a browser-visible media URL.
@@ -390,6 +449,7 @@ export class ScraperService {
         raw.videoMeta?.dynamicCoverUrl,
         (raw as any).coverUrl,
       ),
+      thumbnailUrl: ScraperService.extractThumbnailUrl(raw) || undefined,
       images: images.length > 0 ? images : undefined,
       shortCode: raw.id || '',
       hashtags: (raw.hashtags || []).map((h: any) => h.name || h.title || h),
@@ -489,6 +549,7 @@ export class ScraperService {
       caption: raw.caption || '',
       videoUrl: raw.videoUrl || '',
       displayUrl: raw.displayUrl || '',
+      thumbnailUrl: ScraperService.extractThumbnailUrl(raw) || (raw.displayUrl || undefined),
       images: images,
       shortCode: raw.shortCode || '',
       hashtags: raw.hashtags || [],
@@ -529,6 +590,7 @@ export class ScraperService {
       platform: 'youtube', contentType: 'video', contentId, authorUsername,
       authorFullName: text(raw.channelName) || text(raw.authorName), caption, videoUrl,
       displayUrl: this.firstHttpsUrl(raw.thumbnailUrl, raw.thumbnail_url, raw.thumbnail, raw.imageUrl),
+      thumbnailUrl: ScraperService.extractThumbnailUrl(raw) || undefined,
       images: [], shortCode: contentId,
       hashtags: Array.isArray(raw.hashtags) ? raw.hashtags.map((tag: unknown) => text(tag).replace(/^#/, '')).filter(Boolean) : [],
       mentions: [], taggedUsers: [], musicInfo: null,
@@ -568,6 +630,7 @@ export class ScraperService {
       authorFullName: creatorName,
       caption: text(raw.caption) || text(raw.description) || text(raw.text), videoUrl,
       displayUrl: this.firstHttpsUrl(raw.thumbnailUrl, raw.thumbnail_url, raw.thumbnail, raw.coverUrl, raw.imageUrl),
+      thumbnailUrl: ScraperService.extractThumbnailUrl(raw) || undefined,
       images: [], shortCode: contentId,
       hashtags: Array.isArray(raw.hashtags) ? raw.hashtags.map((tag: unknown) => text(tag).replace(/^#/, '')).filter(Boolean) : [],
       mentions: [], taggedUsers: [], musicInfo: null,

@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import type { AdminPostSummary } from "@/lib/admin-posts";
 import Thumbnail from "./post-thumbnail";
 import { StatusBadge, cx, fmt } from "./ui";
+import { CopyButton } from "./ui-client";
 
 type SortKey = "created_at" | "views" | "likes" | "comments";
 type Props = {
@@ -81,6 +82,9 @@ export default function PostsList({
             </th>
             <th scope="col" className="hidden px-3 py-2 font-medium xl:table-cell">
               Category
+            </th>
+            <th scope="col" className="hidden px-3 py-2 font-medium lg:table-cell">
+              Thumbnail URL
             </th>
             <SortHeader
               sort={sort}
@@ -172,6 +176,27 @@ export default function PostsList({
                 </td>
                 <td className="hidden max-w-40 truncate px-3 py-2 text-ink-2 capitalize xl:table-cell">
                   {post.primary_category?.toLowerCase() || (
+                    <span className="text-ink-3">—</span>
+                  )}
+                </td>
+                <td className="hidden max-w-44 px-3 py-2 lg:table-cell">
+                  {post.thumbnail_url ? (
+                    <div
+                      className="flex items-center gap-1.5"
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      <a
+                        href={post.thumbnail_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        title={post.thumbnail_url}
+                        className="max-w-36 truncate font-mono text-xs text-accent hover:underline inline-block"
+                      >
+                        {post.thumbnail_url}
+                      </a>
+                      <CopyButton value={post.thumbnail_url} label="thumbnail URL" />
+                    </div>
+                  ) : (
                     <span className="text-ink-3">—</span>
                   )}
                 </td>

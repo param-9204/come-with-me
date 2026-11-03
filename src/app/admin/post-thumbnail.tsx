@@ -13,12 +13,12 @@ export default function Thumbnail({
   post,
   className,
 }: {
-  post: Pick<AdminPostSummary, "id" | "display_url" | "image_urls">;
+  post: Pick<AdminPostSummary, "id" | "display_url" | "thumbnail_url" | "image_urls">;
   className?: string;
 }) {
   const urls = [
     ...new Set(
-      [post.display_url, ...post.image_urls].filter(
+      [post.thumbnail_url, post.display_url, ...post.image_urls].filter(
         (url): url is string => typeof url === "string" && url.length > 0,
       ),
     ),

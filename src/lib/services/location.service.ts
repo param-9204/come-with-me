@@ -33,6 +33,24 @@ export type GeocodeResult = {
    * correct spelling ("Greenwich Village", "Lower East Side").
    */
   spellingCorrected?: boolean;
+  /** Up to 3 Google Places photos (resource name and attribution) */
+  photos?: PlacePhotoInfo[];
+};
+
+export type PlacePhotoInfo = {
+  name: string;
+  attribution?: string | null;
+};
+
+export type GooglePhotoMeta = {
+  name: string;
+  widthPx?: number;
+  heightPx?: number;
+  authorAttributions?: Array<{
+    displayName: string;
+    uri?: string;
+    photoUri?: string;
+  }>;
 };
 
 /**
@@ -126,6 +144,7 @@ type GooglePlace = {
   formattedAddress?: string;
   location?: { latitude?: number; longitude?: number };
   addressComponents?: GoogleAddressComponent[];
+  photos?: GooglePhotoMeta[];
 };
 
 type ProviderPlace = GooglePlace;
@@ -603,7 +622,7 @@ export class LocationService {
         'Content-Type': 'application/json',
         'X-Goog-Api-Key': apiKey,
         // id/types/primaryType enable place-id dedup and category verification.
-        'X-Goog-FieldMask': 'places.id,places.types,places.primaryType,places.displayName,places.formattedAddress,places.location,places.addressComponents',
+        'X-Goog-FieldMask': 'places.id,places.types,places.primaryType,places.displayName,places.formattedAddress,places.location,places.addressComponents,places.photos',
       },
       body: JSON.stringify({
         textQuery: query,
@@ -634,6 +653,13 @@ export class LocationService {
     const lng = place.location?.longitude;
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) return this.emptyResult();
     const city = this.googlePlaceCity(place) || this.cleanCityName(fallbackCity) || null;
+    const rawPhotos = Array.isArray(place.photos) ? place.photos.slice(0, 3) : [];
+    const photos: PlacePhotoInfo[] = rawPhotos
+      .filter((p) => p && typeof p.name === 'string')
+      .map((p) => ({
+        name: p.name,
+        attribution: p.authorAttributions?.[0]?.displayName || null,
+      }));
     return {
       lat: lat as number,
       lng: lng as number,
@@ -646,6 +672,7 @@ export class LocationService {
       types: Array.isArray(place.types) ? place.types : [],
       matchedName: place.displayName?.text || null,
       provider: place.provider || 'google',
+      photos,
     };
   }
 

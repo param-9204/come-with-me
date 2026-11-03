@@ -40,11 +40,20 @@ export async function GET(_: Request, { params }: Params) {
   const { id } = await params;
   if (!UUID.test(id)) return new Response(null, { status: 404 });
 
-  const { data: post } = await supabaseAdmin
+  let query = await supabaseAdmin
     .from("social_posts")
-    .select("platform, short_code, post_url, display_url")
+    .select("platform, short_code, post_url, display_url, thumbnail_url")
     .eq("id", id)
     .maybeSingle();
+
+  if (query.error && query.error.code === "42703") {
+    query = await supabaseAdmin
+      .from("social_posts")
+      .select("platform, short_code, post_url, display_url")
+      .eq("id", id)
+      .maybeSingle();
+  }
+  const post = query.data;
   if (!post) return new Response(null, { status: 404 });
 
   const candidates: string[] = [];
@@ -57,10 +66,15 @@ export async function GET(_: Request, { params }: Params) {
     null;
   if (shortCode && /^[A-Za-z0-9_-]+$/.test(shortCode))
     candidates.push(`https://www.instagram.com/p/${shortCode}/media/?size=m`);
-  // The stored URL may still be valid but blocked by the browser's CORP check.
-  if (typeof post.display_url === "string") {
+  // Check stored thumbnail_url and display_url
+  const storedUrls = [
+    (post as any).thumbnail_url,
+    post.display_url,
+  ].filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+
+  for (const stored of storedUrls) {
     try {
-      const url = new URL(post.display_url);
+      const url = new URL(stored);
       if (url.protocol === "https:" && MEDIA_HOST.test(url.hostname))
         candidates.push(url.toString());
     } catch {

@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS public.places (
   user_id uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
   audio_transcript text,
   social_post_id uuid, -- Foreign key constraint ensured safely below
+  image_urls text[] DEFAULT '{}',
+  image_attributions text[] DEFAULT '{}',
+  image_source text DEFAULT 'google',
+  image_fetched_at timestamptz DEFAULT now(),
   created_at timestamptz DEFAULT now()
 );
 
@@ -77,6 +81,7 @@ CREATE TABLE IF NOT EXISTS public.social_posts (
   engagement_rate numeric(8,4),
   ocr_combined_text text,
   display_url text,
+  thumbnail_url text,
   first_comment text,
   niche text,
   target_audience text,
@@ -97,6 +102,7 @@ CREATE TABLE IF NOT EXISTS public.uploaded_images (
   file_names text[] NOT NULL DEFAULT '{}',
   storage_paths text[] NOT NULL DEFAULT '{}',
   image_urls text[] NOT NULL DEFAULT '{}',
+  thumbnail_url text,
   caption text NOT NULL DEFAULT '',
   ai_analysis jsonb NOT NULL DEFAULT '{}'::jsonb,
   status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed', 'failed')),
@@ -188,9 +194,16 @@ CREATE TABLE IF NOT EXISTS public.saved_places (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid REFERENCES public.profiles(id) ON DELETE CASCADE NOT NULL,
   place_id uuid REFERENCES public.places(id) ON DELETE CASCADE NOT NULL,
+  social_post_id uuid REFERENCES public.social_posts(id) ON DELETE CASCADE,
+  uploaded_image_id uuid REFERENCES public.uploaded_images(id) ON DELETE CASCADE,
   created_at timestamptz DEFAULT now(),
   UNIQUE(user_id, place_id)
 );
+ALTER TABLE public.saved_places ADD COLUMN IF NOT EXISTS social_post_id uuid REFERENCES public.social_posts(id) ON DELETE CASCADE;
+ALTER TABLE public.saved_places ADD COLUMN IF NOT EXISTS uploaded_image_id uuid REFERENCES public.uploaded_images(id) ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS idx_saved_places_social_post_id ON public.saved_places(social_post_id);
+CREATE INDEX IF NOT EXISTS idx_saved_places_uploaded_image_id ON public.saved_places(uploaded_image_id);
+
 
 -- 6. LISTS TABLE (strictly like Image 2)
 CREATE TABLE IF NOT EXISTS public.lists (

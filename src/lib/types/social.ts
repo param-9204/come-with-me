@@ -155,6 +155,7 @@ export interface SocialContent {
   caption: string;
   videoUrl?: string;
   displayUrl?: string;
+  thumbnailUrl?: string;
   images?: string[];
   shortCode?: string;
   ocrText?: string[];
