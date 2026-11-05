@@ -361,11 +361,22 @@ export class DbService {
       return existingByGoogleId;
     }
 
-    // GATE: Do not save places with no resolved address
-    if (!address || !address.trim()) {
-      plog('db', `Not saved: "${placeData.name}" has no verified location`, { reason: 'no Google match and no address in the evidence' }, 'warn');
+    // GATE: a place is saved only under the name a map listing gives it (Google,
+    // or Mapbox when Google has nothing), never under text from the post. With
+    // no listing name (no match, or matched by street address only) it is not
+    // saved: text such as "And the address is in the captio" must never become
+    // a place name. User decision 2026-11-05.
+    const mapName = geocode?.matchedName?.trim() || '';
+    if (lat === null || lng === null || !mapName || !address || !address.trim()) {
+      plog('db', `Not saved: "${placeData.name}" has no map listing`, {
+        reason: lat === null || lng === null ? 'no Google or Mapbox match'
+          : !mapName ? 'located by street address only; no listing name from Google or Mapbox'
+            : 'listing has no address',
+        address: address || null,
+      }, 'warn');
       return null;
     }
+    const displayName = mapName;
 
     // A source post may omit the city. Once Google Maps verifies it, check the
     // canonical name/city pair before creating a duplicate record.
@@ -373,7 +384,7 @@ export class DbService {
       const { data: resolvedCityRows } = await supabaseAdmin
         .from('places')
         .select('id')
-        .ilike('name', escapeLike(placeData.name.trim()))
+        .ilike('name', escapeLike(displayName))
         .ilike('city', escapeLike(city.trim()))
         .limit(1);
       const existingWithResolvedCity = resolvedCityRows?.[0];
@@ -424,7 +435,7 @@ export class DbService {
         .lte('longitude', lng + margin)
         .limit(10);
 
-      const normalizedName = placeData.name.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+      const normalizedName = displayName.toLowerCase().replace(/[^a-z0-9]/g, '');
       const samePlaceAtCoordinates = (existingByCoords || []).find((candidate) =>
         (candidate.name || '').toLowerCase().replace(/[^a-z0-9]/g, '') === normalizedName
       );
@@ -486,25 +497,6 @@ export class DbService {
     if (category !== placeData.category) {
       plog('db', `Category for "${placeData.name}" set from Google type`, { extracted: placeData.category, saved: category, googleType: geocode?.primaryType });
     }
-
-    // Google's listing gives the canonical spelling ("LUCALI" → "Lucali",
-    // "Joes Pizza" → "Joe's Pizza") — used only when it is the same name.
-    // An OCR misspelling or abbreviation matched to a listing ("Greenwhich
-    // Vilage" → "Greenwich Village", "LES" → "Lower East Side") is saved
-    // under the provider's correct spelling.
-    // Once a non-ambiguous provider location wins the similarity ranking, use
-    // that provider's canonical business name with its address/coordinates.
-    // This prevents an OCR/list label such as "1. Cafe Carmellini" from being
-    // saved while the actual provider result was "Café Carmellini".
-    // A Google result is always saved under Google's name.
-    const useProviderName = Boolean(
-      geocode?.matchedName &&
-      (geocode.provider === 'google' || (typeof geocode.similarity === 'number' && geocode.similarity >= 0.5)) &&
-      lat !== null && lng !== null && geocode.formattedAddress
-    );
-    const displayName = useProviderName
-      ? geocode!.matchedName!
-      : placeData.name.trim().replace(/^\s*\d{1,3}\s*[.)]\s+/, '');
 
     const newPlaceId = randomUUID();
     let imageUrls: string[] = [];

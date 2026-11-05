@@ -61,6 +61,9 @@ export type GooglePhotoMeta = {
  */
 export type PlaceKind = 'area' | 'venue' | 'street';
 
+/** A Google top result or Mapbox listing whose name matches the searched name below this is rejected (geocodeWithGoogle, verifyCandidates). */
+export const GOOGLE_MIN_NAME_SIMILARITY = 0.3;
+
 /** Provider result types that denote an area rather than a venue. */
 const AREA_RESULT_TYPES = new Set([
   'neighborhood', 'sublocality', 'sublocality_level_1', 'sublocality_level_2', 'locality', 'postal_town',
@@ -944,7 +947,11 @@ export class LocationService {
       if (cleanName && area && kind !== 'venue' && name.score < 0.85 && this.isAcronymOf(cleanName, resultName)) {
         name = { score: 0.9, how: 'acronym' };
       }
-      const addressIdentity = !!cleanAddress && this.addressesMatch(cleanAddress, [resultAddress]); const identityMatches = cleanName ? name.score > 0 || addressIdentity : cleanAddress ? addressIdentity : true;
+      const addressIdentity = !!cleanAddress && this.addressesMatch(cleanAddress, [resultAddress]);
+      // Same floor as Google: any word overlap ("Your" → a "Your …" shop) is not
+      // the place. Names with no Latin letters score 0 against Latin listings.
+      const nameFloor = /[a-z]/i.test(cleanName) ? GOOGLE_MIN_NAME_SIMILARITY : 0;
+      const identityMatches = cleanName ? (name.score > 0 && name.score >= nameFloor) || addressIdentity : cleanAddress ? addressIdentity : true;
       const country = this.googlePlaceCountry(place);
       const resultNeighborhood = this.googlePlaceNeighborhood(place);
       const reason: string | null =
@@ -1033,29 +1040,38 @@ export class LocationService {
    * and its city. The same results are checked with the neighbourhood first
    * and then without it (it may describe the post's section, not the place),
    * so dropping it never costs another request. A street address from the
-   * post is looked up only when no listing matched. Returns null when Google
-   * found nothing verified or failed (quota, rate limit, network), so the
-   * caller can fall back to Mapbox.
+   * post is looked up only when no listing matched. `result` is null when
+   * Google answered with nothing usable; `failed` is true only when Google
+   * could not answer (error, quota, rate limit, network), the one case the
+   * caller falls back to Mapbox.
    */
-  private static async geocodeWithGoogle(lookups: PreparedLookup[], apiKey: string): Promise<GeocodeResult | null> {
+  private static async geocodeWithGoogle(lookups: PreparedLookup[], apiKey: string): Promise<{ result: GeocodeResult | null; failed: boolean }> {
     const [first] = lookups;
     try {
       // City-only lookup (cities table): only an area-typed result counts as
       // the city centre, never an arbitrary venue in that city.
-      if (!first.cleanName && !first.cleanAddress && first.cityInfo.name) return await this.lookupCity(first.cityInfo, apiKey);
+      if (!first.cleanName && !first.cleanAddress && first.cityInfo.name) return { result: await this.lookupCity(first.cityInfo, apiKey), failed: false };
 
       const places = (await this.textSearch(first.query, apiKey, first.cityInfo.country))
         .map((place) => ({ ...place, provider: 'google' as const }));
-      // Google's answer is final: its top result is the place, under Google's
-      // name, with no city/type/name checks. Measured on 36 rejected Google
-      // answers (2026-10-02): the checks discarded ~27 correct places (Tudor City
-      // Bridge under a wrong "Washington, DC", Saks Fifth Avenue, Ithaca under
-      // "New York") against 2 wrong ones caused by bad input. Mapbox is used
-      // only when Google returns nothing.
+      // Google's top result is the place, under Google's name, with no
+      // city/type checks (2026-10-02: those checks discarded ~27 correct places
+      // of 36). The one check is a low name-similarity floor: a name below
+      // 30% is not that place (TikTok 7703588384089935118: subtitle lines saved
+      // as 20 unrelated businesses at 0–29%, e.g. "Don't Have To" → "The
+      // Newsroom Philly" 8%). Higher floors drop correct places ("Obvio" →
+      // "Obvio Cocktail Bar - Midtown" 31%). Names with no Latin letters
       const top = places.find((place) => Number.isFinite(place.location?.latitude) && Number.isFinite(place.location?.longitude));
-      if (top) {
+      const similarity = top && first.cleanName ? this.nameSimilarity(first.cleanName, top.displayName?.text || '') : 0;
+      const tooDifferent = !!top && !!first.cleanName && /[a-z]/i.test(first.cleanName) && similarity < GOOGLE_MIN_NAME_SIMILARITY;
+      if (tooDifferent) {
+        plog('geocode', `Google Maps search "${first.query}": top result "${top.displayName?.text}" rejected, name match ${Math.round(similarity * 100)}% is below ${GOOGLE_MIN_NAME_SIMILARITY * 100}%`, {
+          results: places.length,
+          rejected: { name: top.displayName?.text, address: top.formattedAddress },
+        }, 'warn');
+      }
+      if (top && !tooDifferent) {
         const result = this.resultFromPlace(top, first.cityInfo.name);
-        const similarity = first.cleanName ? this.nameSimilarity(first.cleanName, top.displayName?.text || '') : 0;
         result.similarity = similarity;
         result.identity = similarity === 1 ? 'exact_name' : 'fuzzy';
         result.candidateCount = places.length;
@@ -1063,7 +1079,7 @@ export class LocationService {
           results: places.length,
           chosen: { name: top.displayName?.text, address: top.formattedAddress, type: top.primaryType || top.types?.[0], similarity: Math.round(similarity * 100) / 100 },
         });
-        return result;
+        return { result, failed: false };
       }
 
       // A source-provided street address still resolves when a small venue is
@@ -1072,15 +1088,16 @@ export class LocationService {
         const result = await this.lookupAddress(first.cleanAddress, first.cityInfo, apiKey);
         if (result) {
           plog('geocode', 'Verified by street address on Google (venue not listed)', { place: first.cleanName, address: result.formattedAddress, lat: result.lat, lng: result.lng });
-          return result;
+          return { result, failed: false };
         }
       }
     } catch (error) {
       // Quota errors are already reported once; avoid a stack trace per place.
       if ((error as { status?: number } | null)?.status === 429) plog('geocode', `Google skipped "${first.query}" (quota)`, { error: (error as Error).message }, 'warn');
       else plog('geocode', `Google lookup failed for "${first.query}"`, { error: (error as Error)?.message || String(error) }, 'error');
+      return { result: null, failed: true };
     }
-    return null;
+    return { result: null, failed: false };
   }
 
   /** Mapbox business search, with one short retry when a burst of lookups returns nothing. */
@@ -1200,8 +1217,8 @@ export class LocationService {
 
   /**
    * Resolve a place to verified coordinates. Google Places is tried first;
-   * Mapbox only when Google is not configured, is over its daily quota,
-   * fails, or finds no verified match. `kind` says whether the place is an
+   * Mapbox only when Google is not configured, is over its daily quota, or
+   * fails (error, network). A Google answer with no usable match is final. `kind` says whether the place is an
    * area (neighbourhood, town) or a venue, so each resolves to its own kind.
    */
   static async geocodePlace(
@@ -1248,17 +1265,26 @@ export class LocationService {
     if (lookup.cleanNeighborhood && lookup.cityInfo.name) lookups.push({ ...lookup, cleanNeighborhood: '' });
     const tried: string[] = [];
 
+    // Provider order (user decision 2026-11-05): only a Google key → Google;
+    // only a Mapbox token → Mapbox; both → Google, and Mapbox only when Google
+    // could not answer (error, quota, network). When Google answers with no
+    // usable listing (nothing found, or rejected by the name floor), Mapbox is
+    // not asked: it pinned subtitle text ("Your") to unrelated businesses.
     const apiKey = this.apiKey();
+    let googleAnswered = false;
     if (apiKey && !this.placesQuotaExhausted()) {
       tried.push('Google');
-      const result = await this.geocodeWithGoogle(lookups, apiKey);
+      const { result, failed } = await this.geocodeWithGoogle(lookups, apiKey);
       if (result?.lat !== null && result?.lat !== undefined) return finish(result);
       if (result && lookup.cleanName && !lookup.cityInfo.name && !lookup.cleanAddress) return finish(result, 'partial'); // name-only ambiguity is final
+      googleAnswered = !failed;
     } else if (apiKey) {
       plog('geocode', `Google skipped for "${lookup.query}" (daily quota exhausted); using Mapbox`, undefined, 'warn');
     }
 
-    if (MapboxService.isConfigured()) {
+    if (googleAnswered) {
+      plog('geocode', `No Google match for "${lookup.query}"; Mapbox is used only when Google fails`, undefined, 'warn');
+    } else if (MapboxService.isConfigured()) {
       tried.push('Mapbox');
       const result = await this.geocodeWithMapbox(lookups);
       if (result?.lat !== null && result?.lat !== undefined) return finish(result);

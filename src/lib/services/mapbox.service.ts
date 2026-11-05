@@ -62,8 +62,8 @@ function parseFeature(feature: any): MapboxFeature | null {
 
 /**
  * Mapbox geocoding, used when Google Places is not configured, out of quota,
- * or finds no verified match. Every result still goes through the same
- * name / city / address checks as Google results.
+ * or fails (error, network); not when Google answers with no match. Every
+ * result still goes through the same name / city / address checks.
  */
 export class MapboxService {
   private static unavailableUntil = 0;
