@@ -735,6 +735,74 @@ function isGenericName(name: string): boolean {
   return GENERIC_NAMES.has(withoutArticle(normalizeForMatch(name)));
 }
 
+/**
+ * Words of spoken sentences, rare in venue names. Apostrophes are already
+ * stripped by normalizeForMatch ("don't" → "dont", "we're" → "were").
+ */
+const NARRATION_WORDS = new Set([
+  'i', 'im', 'ive', 'id', 'ill', 'me', 'my', 'you', 'youre', 'youve', 'youll', 'your', 'we', 'were', 'weve', 'our',
+  'they', 'theyre', 'their', 'them', 'he', 'she', 'it', 'its', 'is', 'are', 'was', 'been', 'have', 'has', 'had',
+  'will', 'would', 'can', 'could', 'should', 'dont', 'didnt', 'cant', 'havent', 'wont', 'just', 'also', 'really',
+  'so', 'think', 'thats', 'this', 'that', 'if', 'because', 'gonna', 'actually', 'definitely', 'oh', 'guys', 'everything',
+  'who',
+]);
+
+/**
+ * A line of the creator's narration (or its burned-in subtitle) returned as a
+ * place name: "You know when you move somewher", "We had the cinnamon roll
+ * latte", "Pesto mozzarella,". Google always returns some business for such
+ * text and its top result is accepted, so these must stop here (TikTok
+ * 7703588384089935118: 20 of 21 saved places were subtitle lines).
+ *
+ * Only when the name has no evidence beyond speech and plain screen text (no
+ * caption, location tag, pin or list line) and a spoken sentence starts with
+ * it; then it must also read as speech: cut mid-word, clause punctuation, or
+ * sentence words. A name introduced mid-sentence ("an exhibit called You
+ * Should Be Dancing") is kept.
+ */
+export function isNarrationFragment(name: string, support: EvidenceItem[], bundle: EvidenceBundle): boolean {
+  const subtitleOnly = support.every((item) =>
+    item.source === 'speech' || item.source === 'account' || item.source === 'hashtags' ||
+    (isScreenText(item) && !PIN_RE.test(item.text) && !LIST_ITEM_RE.test(item.text)));
+  if (!subtitleOnly) return false;
+  const nameNorm = normalizeForMatch(name);
+  if (!nameNorm) return false;
+  const words = nameNorm.split(' ');
+  // The whole name, or its first 3+ words when the model joined a subtitle
+  // line to another screen line ("Everything is homemade and the quali Pure Life").
+  const heads = words.map((_, index) => words.slice(0, words.length - index).join(' '))
+    .filter((head, index) => index === 0 || head.split(' ').length >= 3);
+  // Spoken sentences that start with the name (after an optional article).
+  // Prefix match, so a subtitle cut mid-word ("you kn") still finds "you know".
+  const matches = bundle.items
+    .filter((item) => item.source === 'speech')
+    // From each sentence start to the segment end: a name can run past a full stop ("sauce. Oh my god").
+    .flatMap((item) => [0, ...[...item.text.matchAll(/[.!?]\s+/g)].map((match) => match.index! + match[0].length)]
+      .map((start) => item.text.slice(start)))
+    .map((sentence) => normalizeForMatch(sentence))
+    .flatMap((sentence) => [sentence, withoutArticle(sentence)])
+    .flatMap((sentence) => {
+      const head = heads.find((candidate) => sentence.startsWith(candidate));
+      return head ? [{ sentence, head }] : [];
+    });
+  if (matches.length === 0) return false;
+
+  const cutMidWord = matches.some(({ sentence, head }) => {
+    const next = sentence.charAt(head.length);
+    return head.split(' ').length >= 2 && !!next && next !== ' ';
+  });
+  const raw = name.trim();
+  // A comma before a lowercase or sentence word: the model may title-case the
+  // line ("Your Coffee Spot, Your"), so the case alone is not enough.
+  const commaClause = [...raw.matchAll(/,\s*(\p{L}[\p{L}'’]*)/gu)]
+    .some((match) => /^\p{Ll}/u.test(match[1]) || NARRATION_WORDS.has(normalizeForMatch(match[1])));
+  const clausePunctuation = /[,;]$/.test(raw) || commaClause || /[.!?]\s+\p{L}/u.test(raw) || /\p{L}{4}[.!?]$/u.test(raw);
+  const narrationWords = new Set(words.filter((word) => NARRATION_WORDS.has(word))).size;
+  // One word that is only a pronoun or filler ("Your", "That's").
+  const loneNarrationWord = words.length === 1 && narrationWords === 1;
+  return cutMidWord || clausePunctuation || loneNarrationWord || narrationWords >= 2 || (words.length >= 5 && narrationWords >= 1);
+}
+
 function isCreatorOrAudio(name: string, bundle: EvidenceBundle): string | null {
   const nameCompact = compact(name.replace(/^@/, ''));
   const { creatorUsername, creatorFullName, musicArtist, musicSong } = bundle.context;
@@ -1063,6 +1131,7 @@ export function scoreAndFilterCandidates(places: ScorablePlace[], bundle: Eviden
       support = [...support, ...handleLines, ...ownVenueLocations.filter((item) => !support.includes(item))];
       if (support.length === 0) { reject('name not found in evidence'); continue; }
       if (support.every((item) => item.source === 'creator_bio')) { reject('only in creator bio'); continue; }
+      if (isNarrationFragment(name, support, bundle)) { reject('spoken sentence or subtitle, not a name'); continue; }
       // On a business's own post, a caption name with no pin or address of its
       // own is what the business sells ("80s Pinstripe Jacket" on Jawn Supply's
       // post), not another place. Branches carry pins (MIAM Café) and are kept.
